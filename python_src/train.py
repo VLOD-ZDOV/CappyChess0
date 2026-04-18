@@ -356,7 +356,7 @@ def train(cfg: Config = None):
     )
 
     # GradScaler для стабильности BF16
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
 
     # LR Scheduler: линейный прогрев 5 итераций, затем косинусное затухание.
     # T_0=50 — один цикл на 50 итераций, разумно для долгого обучения.

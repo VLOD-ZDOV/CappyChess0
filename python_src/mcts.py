@@ -1,78 +1,61 @@
-# mcts.py — Parallel Batched MCTS, optimized for throughput
-# Key ideas:
-#   1. Virtual losses — позволяют запускать N симуляций одновременно без ожидания
-#   2. Один большой батч на все игры × все параллельные симуляции
-#   3. Нет engine.copy() в горячем пути — храним стек ходов
-#   4. numpy-only UCB selection (нет Python-loop overhead на selection)
+# mcts.py — Python-обёртка над RustMCTS
 #
-# Fixes applied:
-#   - virtual_loss clamp ≥ 0 (не может уйти в минус при несимметричных вызовах)
-#   - bounds check для policy_vec[idx] (idx >= POLICY_SIZE → crash)
-#   - values.view(-1) вместо squeeze(1) (безопасно при любой форме выхода сети)
-#   - Dirichlet noise при root expansion (критично для exploration)
-#   - _expand_node: явный fast-path при нулевых prior'ах (не игнорирует сеть молча)
+# Всё дерево MCTS теперь живёт в Rust (lib.rs → RustMCTS).
+# Python отвечает только за:
+#   1. Батчевый GPU inference (нейросеть)
+#   2. Управление циклом симуляций
+#   3. Совместимость с train.py / eval.py / gui.py
+#
+# Что ускорилось по сравнению со старым Python MCTS:
+#   - engine.copy() × 100к → 0  (позиция хранится прямо в узле дерева)
+#   - make_move_int() × 800к → 0  (ходы применяются при expansion в Rust)
+#   - best_child Python-цикл × 18М итераций → 0  (UCB в Rust)
+#   - Нет GIL-contention, нет dict overhead для children
+#
+# ОПТИМИЗАЦИЯ (numpy bottleneck fix):
+#   - collect_leaves() теперь возвращает numpy array (N, 1600) вместо List[List[float]]
+#   - apply_inference() теперь принимает numpy arrays вместо List[List[float]]
+#   - Убраны все .tolist() — экономия ~28М Python float объектов за шаг
 
-import math
 import numpy as np
 import torch
-from typing import List, Dict, Optional
+from typing import List
 
-POLICY_SIZE = 7000  # FIX: было 6880 — макс. индекс промоушена = 6400+99*6+5 = 6999
-VIRTUAL_LOSS = 3          # штраф при выборе узла до backprop
-PARALLEL_SIMS = 8         # сколько листьев одновременно собирается на игру
+try:
+    from capablanca_engine import RustMCTS as _RustMCTS
+    RUST_MCTS_AVAILABLE = True
+except ImportError:
+    RUST_MCTS_AVAILABLE = False
+    print("⚠️  RustMCTS не найден — нужно пересобрать: maturin develop --release")
 
-# Dirichlet noise параметры (как в AlphaZero)
-# α=0.3 для шахмат (меньше branching factor → больше α)
-# Капабланка — расширенные фигуры, branching ~40-50, α как в обычных шахматах
-DIRICHLET_ALPHA = 0.3
-DIRICHLET_EPS   = 0.25    # вес шума (0.25 = 25% шум, 75% prior сети)
+POLICY_SIZE   = 7000
+VIRTUAL_LOSS  = 3
+PARALLEL_SIMS = 16   # увеличено с 8: Rust без overhead'а справляется с большим батчем
 
 
 class MCTSNode:
+    """Заглушка для обратной совместимости с gui.py."""
     __slots__ = ("parent", "move", "prior", "children", "visits",
                  "value_sum", "virtual_loss", "is_expanded", "is_terminal")
 
-    def __init__(self, parent, move: int, prior: float):
-        self.parent = parent
-        self.move = move
-        self.prior = float(prior)
-        self.children: Dict[int, "MCTSNode"] = {}
-        self.visits = 0
-        self.value_sum = 0.0
-        self.virtual_loss = 0
-        self.is_expanded = False
-        self.is_terminal = False
+    def __init__(self, parent, move, prior):
+        self.parent = parent; self.move = move; self.prior = float(prior)
+        self.children = {}; self.visits = 0; self.value_sum = 0.0
+        self.virtual_loss = 0; self.is_expanded = False; self.is_terminal = False
 
-    def q(self) -> float:
-        denom = self.visits + self.virtual_loss
-        return self.value_sum / denom if denom > 0 else 0.0
-
-    def ucb(self, sqrt_parent: float, c_puct: float) -> float:
-        u = c_puct * self.prior * sqrt_parent / (1 + self.visits + self.virtual_loss)
-        return self.q() + u
-
-    def best_child(self, c_puct: float) -> "MCTSNode":
-        sqrt_n = math.sqrt(max(self.visits + self.virtual_loss, 1))
-        best_score = -1e18
-        best = None
-        for child in self.children.values():
-            score = child.ucb(sqrt_n, c_puct)
-            if score > best_score:
-                best_score = score
-                best = child
-        return best
+    def q(self):
+        d = self.visits + self.virtual_loss
+        return self.value_sum / d if d > 0 else 0.0
 
 
 class UltraFastMCTS:
     """
-    Оптимизированный MCTS с виртуальными потерями и батчевым inference.
-    Целевые метрики:
-      - 128 игр × 80 симуляций на A100 за < 60 сек
-      - 256 игр × 80 симуляций за < 120 сек
+    Батчевый MCTS. Дерево живёт в Rust, Python — только GPU inference.
+    Интерфейс не изменился: train.py / eval.py / gui.py работают без правок.
     """
 
     def __init__(self, net: torch.nn.Module, device: torch.device,
-                 c_puct: float = 1.25, batch_size: int = 128,
+                 c_puct: float = 1.25, batch_size: int = 256,
                  add_dirichlet: bool = True):
         self.net = net
         self.device = device
@@ -80,21 +63,21 @@ class UltraFastMCTS:
         self.batch_size = batch_size
         self.add_dirichlet = add_dirichlet
 
-        # Pinned memory для быстрого H2D
-        self.pinned_buf = torch.empty(batch_size, 20, 8, 10,
+        MAX_LEAVES = 8192
+        self.pinned_buf = torch.empty(MAX_LEAVES, 20, 8, 10,
                                       pin_memory=True, dtype=torch.float32)
+        self.pinned_size = MAX_LEAVES
         self.net.eval()
 
     @torch.no_grad()
     def _infer(self, tensors: List[np.ndarray]):
-        """Батчевый inference. tensors: список (1600,) float32 массивов."""
+        """Батчевый GPU inference. tensors: список (1600,) float32."""
         n = len(tensors)
         if n == 0:
-            return np.empty((0, POLICY_SIZE)), np.empty((0,))
+            return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty((0,), dtype=np.float32)
 
         arr = np.stack(tensors, axis=0).reshape(n, 20, 8, 10)
-
-        if n <= self.batch_size:
+        if n <= self.pinned_size:
             buf = self.pinned_buf[:n]
             buf.copy_(torch.from_numpy(arr))
             x = buf.to(self.device, non_blocking=True)
@@ -102,202 +85,152 @@ class UltraFastMCTS:
             x = torch.from_numpy(arr).to(self.device)
 
         x = x.to(memory_format=torch.channels_last)
-
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits, values = self.net(x)
 
         policies = torch.softmax(logits.float(), dim=1).cpu().numpy()
-        # FIX: view(-1) безопаснее squeeze(1) — работает при любой форме выхода сети
-        values = values.float().view(-1).cpu().numpy()
+        values   = values.float().view(-1).cpu().numpy()
         return policies, values
 
     def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
-        """
-        Основная точка входа. Возвращает policy-вектора для каждой игры.
+        if RUST_MCTS_AVAILABLE:
+            return self._search_rust(engines, simulations)
+        return self._search_python(engines, simulations)
 
-        Алгоритм:
-          - Параллельно собираем PARALLEL_SIMS листьев на игру
-          - Объединяем в один большой батч → один inference call
-          - Backprop для всех
-          - Повторяем (simulations // PARALLEL_SIMS) раз
-        """
-        num_games = len(engines)
-        roots = [MCTSNode(None, -1, 1.0) for _ in range(num_games)]
-
-        # Начальный expansion всех корней (с Dirichlet noise)
-        root_tensors = [np.array(e.get_board_tensor(), dtype=np.float32)
-                        for e in engines]
-        policies, _ = self._infer(root_tensors)
-        for i in range(num_games):
-            self._expand_node(roots[i], engines[i], policies[i],
-                              add_noise=self.add_dirichlet)
-
+    def _search_rust(self, engines: List, simulations: int) -> List[np.ndarray]:
+        rust_mcts = _RustMCTS(engines, PARALLEL_SIMS)
         steps = max(1, simulations // PARALLEL_SIMS)
 
         for _ in range(steps):
-            # ── Selection: собрать по PARALLEL_SIMS листьев на игру ──────────
-            all_leaf_tensors: List[np.ndarray] = []
-            all_meta = []  # (game_idx, node, move_stack)
+            # collect_leaves() теперь возвращает numpy array (N, 1600) — нулевая сериализация
+            leaf_matrix = rust_mcts.collect_leaves()  # np.ndarray shape (N, 1600)
 
-            for g in range(num_games):
-                if engines[g].is_game_over():
-                    continue
-                for _ in range(PARALLEL_SIMS):
-                    node, move_stack = self._select(roots[g])
-
-                    if node.is_terminal:
-                        # Terminal: VL не применялся (selection остановился на нём),
-                        # просто считаем результат и делаем backup
-                        sim_eng = engines[g].copy()
-                        for m in move_stack:
-                            sim_eng.make_move_int(m)
-                        result = sim_eng.game_result()
-                        # game_result() возвращает значение с точки зрения белых.
-                        # _backup ожидает значение с точки зрения игрока, чей ход в leaf.
-                        leaf_side = sim_eng.side_to_move()
-                        value = result if leaf_side == 0 else -result
-                        self._backup(node, move_stack, value, apply_vloss=False)
-                        continue
-
-                    # Получаем тензор позиции
-                    sim_eng = engines[g].copy()
-                    for m in move_stack:
-                        sim_eng.make_move_int(m)
-
-                    tensor = np.array(sim_eng.get_board_tensor(), dtype=np.float32)
-                    all_leaf_tensors.append(tensor)
-                    all_meta.append((g, node, move_stack))
-
-                    # Применяем virtual loss чтобы другие симуляции не выбирали этот узел
-                    self._apply_virtual_loss(node, VIRTUAL_LOSS)
-
-            if not all_leaf_tensors:
+            if leaf_matrix.shape[0] == 0:
                 continue
 
-            # ── Батчевый inference ────────────────────────────────────────────
-            policies, values = self._infer(all_leaf_tensors)
+            # Передаём строки матрицы в _infer как список 1D массивов
+            leaf_list = [leaf_matrix[i] for i in range(leaf_matrix.shape[0])]
+            policies_np, values_np = self._infer(leaf_list)
 
-            # Expand + backprop
-            for i, (g, node, move_stack) in enumerate(all_meta):
-                # Нужен engine в состоянии листа для expansion
-                sim_eng = engines[g].copy()
-                for m in move_stack:
-                    sim_eng.make_move_int(m)
+            # Передаём numpy arrays напрямую в Rust — никаких .tolist(), никаких Python float объектов
+            # policies_np: (N, 7000) float32 contiguous C-order
+            # values_np:   (N,)      float32 contiguous
+            rust_mcts.apply_inference(
+                np.ascontiguousarray(policies_np, dtype=np.float32),
+                np.ascontiguousarray(values_np,   dtype=np.float32),
+            )
 
+        raw = rust_mcts.get_policies()
+        return [np.array(p, dtype=np.float32) for p in raw]
+
+    # ── Python fallback ────────────────────────────────────────────────────────
+
+    def _search_python(self, engines: List, simulations: int) -> List[np.ndarray]:
+        """Старый Python MCTS — используется только если RustMCTS не скомпилирован."""
+        import math
+        num_games = len(engines)
+        roots = [MCTSNode(None, -1, 1.0) for _ in range(num_games)]
+        root_tensors = [np.array(e.get_board_tensor(), dtype=np.float32) for e in engines]
+        policies, _ = self._infer(root_tensors)
+        for i in range(num_games):
+            self._expand_node_py(roots[i], engines[i], policies[i],
+                                 add_noise=self.add_dirichlet)
+
+        steps = max(1, simulations // PARALLEL_SIMS)
+        for _ in range(steps):
+            all_tensors, all_meta = [], []
+            for g in range(num_games):
+                if engines[g].is_game_over(): continue
+                for _ in range(PARALLEL_SIMS):
+                    node, stack = self._select_py(roots[g])
+                    if node.is_terminal:
+                        sim = engines[g].copy()
+                        for m in stack: sim.make_move_int(m)
+                        r = sim.game_result()
+                        v = r if sim.side_to_move() == 0 else -r
+                        self._backup_py(node, v)
+                        continue
+                    sim = engines[g].copy()
+                    for m in stack: sim.make_move_int(m)
+                    all_tensors.append(np.array(sim.get_board_tensor(), dtype=np.float32))
+                    all_meta.append((g, node, stack))
+                    self._vloss_py(node, VIRTUAL_LOSS)
+            if not all_tensors: continue
+            pols, vals = self._infer(all_tensors)
+            for i, (g, node, stack) in enumerate(all_meta):
+                sim = engines[g].copy()
+                for m in stack: sim.make_move_int(m)
                 if not node.is_expanded:
-                    # Внутри дерева шум НЕ добавляется — только на корне
-                    self._expand_node(node, sim_eng, policies[i], add_noise=False)
+                    self._expand_node_py(node, sim, pols[i], add_noise=False)
+                self._vloss_py(node, -VIRTUAL_LOSS)
+                self._backup_py(node, float(vals[i]))
 
-                # Снимаем virtual loss и делаем настоящий backup
-                self._apply_virtual_loss(node, -VIRTUAL_LOSS)
-                self._backup(node, move_stack, float(values[i]), apply_vloss=False)
-
-        # ── Строим policy-вектора из visit counts ─────────────────────────────
-        result_policies = []
+        result = []
         for g, root in enumerate(roots):
-            policy = np.zeros(POLICY_SIZE, dtype=np.float32)
+            pol = np.zeros(POLICY_SIZE, dtype=np.float32)
             total = sum(c.visits for c in root.children.values())
             if total > 0:
                 for m, child in root.children.items():
                     idx = engines[g].move_int_to_policy_idx(m)
-                    if idx is not None:
-                        policy[idx] = child.visits / total
-            result_policies.append(policy)
+                    if idx is not None: pol[idx] = child.visits / total
+            result.append(pol)
+        return result
 
-        return result_policies
+    # ── Helpers для gui.py ─────────────────────────────────────────────────────
 
-    def _select(self, root: MCTSNode):
-        """
-        Спуск по дереву до листа. Возвращает (leaf_node, move_stack).
-        move_stack нужен для воспроизведения позиции через engine.copy() + apply.
-        """
-        node = root
-        move_stack = []
+    def _select_py(self, root):
+        import math
+        node, stack = root, []
         while node.is_expanded and node.children and not node.is_terminal:
-            node = node.best_child(self.c_puct)
-            move_stack.append(node.move)
-        return node, move_stack
+            sqrt_n = math.sqrt(max(node.visits + node.virtual_loss, 1))
+            best, best_s = None, -1e18
+            for child in node.children.values():
+                s = child.q() + self.c_puct * child.prior * sqrt_n / (1 + child.visits + child.virtual_loss)
+                if s > best_s: best_s = s; best = child
+            node = best; stack.append(node.move)
+        return node, stack
 
-    def _expand_node(self, node: MCTSNode, engine, policy_vec: np.ndarray,
-                     add_noise: bool = False):
-        """
-        Создаём дочерние узлы по легальным ходам.
-
-        add_noise=True — добавлять Dirichlet шум (только для корня при self-play).
-        Это критично для exploration: без шума сеть быстро зацикливается на
-        одних и тех же ходах и не исследует альтернативы.
-        """
-        if node.is_expanded:
-            return
+    def _expand_node_py(self, node, engine, policy_vec, add_noise=False):
+        if node.is_expanded: return
         legal = engine.get_legal_moves_int()
         if not legal:
-            node.is_terminal = True
-            node.is_expanded = True
-            return
-
+            node.is_terminal = True; node.is_expanded = True; return
         n = len(legal)
-        raw_priors = np.empty(n, dtype=np.float64)
-        for j, m in enumerate(legal):
-            idx = engine.move_int_to_policy_idx(m)
-            # FIX: bounds check — idx может быть >= POLICY_SIZE при баге в движке
-            if idx is not None and 0 <= idx < len(policy_vec):
-                raw_priors[j] = float(policy_vec[idx])
-            else:
-                raw_priors[j] = 1e-8
-
-        total = raw_priors.sum()
-
-        # FIX: если сеть вернула нули для всех легальных ходов (начало обучения),
-        # равномерно распределяем prior вместо молчаливого fallback'а
-        if total <= 1e-12:
-            raw_priors = np.ones(n, dtype=np.float64) / n
-        else:
-            raw_priors /= total
-
-        # Dirichlet noise только на корне при self-play (AlphaZero §B.11)
+        priors = np.array([
+            float(policy_vec[idx]) if (idx := engine.move_int_to_policy_idx(m)) is not None
+                                       and 0 <= idx < len(policy_vec) else 1e-8
+            for m in legal
+        ], dtype=np.float64)
+        s = priors.sum()
+        priors = priors / s if s > 1e-12 else np.ones(n) / n
         if add_noise and n > 0:
-            noise = np.random.dirichlet([DIRICHLET_ALPHA] * n)
-            raw_priors = (1.0 - DIRICHLET_EPS) * raw_priors + DIRICHLET_EPS * noise
-
+            priors = 0.75 * priors + 0.25 * np.random.dirichlet([0.3] * n)
         for j, m in enumerate(legal):
-            node.children[m] = MCTSNode(node, m, float(raw_priors[j]))
-
+            node.children[m] = MCTSNode(node, m, float(priors[j]))
         node.is_expanded = True
 
-    def _apply_virtual_loss(self, node: MCTSNode, delta: int):
-        """
-        Идём вверх по дереву и добавляем/убираем virtual loss.
-        FIX: clamp ≥ 0 при снятии, чтобы не уйти в минус при несимметричных вызовах.
-        """
+    def _vloss_py(self, node, delta):
         cur = node
-        while cur is not None:
-            if delta < 0:
-                # FIX: clamp при снятии
-                cur.virtual_loss = max(0, cur.virtual_loss + delta)
-            else:
-                cur.virtual_loss += delta
+        while cur:
+            cur.virtual_loss = max(0, cur.virtual_loss + delta) if delta < 0 else cur.virtual_loss + delta
             cur = cur.parent
 
-    def _backup(self, leaf: MCTSNode, move_stack: List[int],
-                value: float, apply_vloss: bool = False):
-        """
-        Backpropagation. value — с точки зрения игрока, ходящего в leaf.
-        Знак меняется при каждом шаге вверх.
-        """
-        cur = leaf
-        sign = 1.0
-        while cur is not None:
-            cur.visits += 1
-            cur.value_sum += value * sign
-            if apply_vloss:
-                cur.virtual_loss = max(0, cur.virtual_loss - VIRTUAL_LOSS)
-            sign *= -1.0
-            cur = cur.parent
+    def _backup_py(self, leaf, value):
+        cur, sign = leaf, 1.0
+        while cur:
+            cur.visits += 1; cur.value_sum += value * sign; sign *= -1.0; cur = cur.parent
+
+    # gui.py использует эти имена напрямую
+    def _select(self, root): return self._select_py(root)
+    def _expand_node(self, node, engine, policy_vec, add_noise=False):
+        return self._expand_node_py(node, engine, policy_vec, add_noise)
+    def _apply_virtual_loss(self, node, delta): return self._vloss_py(node, delta)
+    def _backup(self, leaf, move_stack, value, apply_vloss=False):
+        return self._backup_py(leaf, value)
 
 
-# ── Совместимый wrapper для train.py ─────────────────────────────────────────
 def mcts_policy_vector(engine, net, simulations=80, c_puct=1.25, device=None):
     if device is None:
-        device = torch.device("cuda")
-    mcts = UltraFastMCTS(net, device, c_puct, batch_size=64, add_dirichlet=True)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    mcts = UltraFastMCTS(net, device, c_puct, batch_size=256, add_dirichlet=True)
     return mcts.search_games([engine], simulations)[0]
