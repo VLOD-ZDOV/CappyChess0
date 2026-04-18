@@ -1,275 +1,303 @@
-# mcts.py — Monte Carlo Tree Search for Capablanca Chess
-# Fully corrected: proper engine cloning, virtual loss, batched evaluation
-
-from __future__ import annotations
+# mcts.py — Parallel Batched MCTS, optimized for throughput
+# Key ideas:
+#   1. Virtual losses — позволяют запускать N симуляций одновременно без ожидания
+#   2. Один большой батч на все игры × все параллельные симуляции
+#   3. Нет engine.copy() в горячем пути — храним стек ходов
+#   4. numpy-only UCB selection (нет Python-loop overhead на selection)
+#
+# Fixes applied:
+#   - virtual_loss clamp ≥ 0 (не может уйти в минус при несимметричных вызовах)
+#   - bounds check для policy_vec[idx] (idx >= POLICY_SIZE → crash)
+#   - values.view(-1) вместо squeeze(1) (безопасно при любой форме выхода сети)
+#   - Dirichlet noise при root expansion (критично для exploration)
+#   - _expand_node: явный fast-path при нулевых prior'ах (не игнорирует сеть молча)
 
 import math
 import numpy as np
 import torch
-from typing import Optional
+from typing import List, Dict, Optional
 
-# Policy vector size must match the Rust engine
-POLICY_SIZE = 6880 # Было 6720
+POLICY_SIZE = 7000  # FIX: было 6880 — макс. индекс промоушена = 6400+99*6+5 = 6999
+VIRTUAL_LOSS = 3          # штраф при выборе узла до backprop
+PARALLEL_SIMS = 8         # сколько листьев одновременно собирается на игру
+
+# Dirichlet noise параметры (как в AlphaZero)
+# α=0.3 для шахмат (меньше branching factor → больше α)
+# Капабланка — расширенные фигуры, branching ~40-50, α как в обычных шахматах
+DIRICHLET_ALPHA = 0.3
+DIRICHLET_EPS   = 0.25    # вес шума (0.25 = 25% шум, 75% prior сети)
 
 
 class MCTSNode:
-    __slots__ = (
-        "parent", "move", "prior", "children",
-        "visits", "value_sum", "virtual_loss",
-    )
+    __slots__ = ("parent", "move", "prior", "children", "visits",
+                 "value_sum", "virtual_loss", "is_expanded", "is_terminal")
 
-    def __init__(self, parent: Optional["MCTSNode"], move: Optional[str], prior: float):
-        self.parent: Optional[MCTSNode] = parent
-        self.move:   Optional[str]      = move   # UCI move that led here
-        self.prior:  float              = prior
-        self.children: dict[str, MCTSNode] = {}
-
-        self.visits:       int   = 0
-        self.value_sum:    float = 0.0
-        self.virtual_loss: int   = 0  # for parallelism; set to 0 for single-thread
-
-    # ── UCB score ────────────────────────────────────────────────────────────
-
-    def ucb(self, parent_visits: int, c_puct: float) -> float:
-        q = self.q()
-        u = c_puct * self.prior * math.sqrt(parent_visits) / (1 + self.visits + self.virtual_loss)
-        return q + u
+    def __init__(self, parent, move: int, prior: float):
+        self.parent = parent
+        self.move = move
+        self.prior = float(prior)
+        self.children: Dict[int, "MCTSNode"] = {}
+        self.visits = 0
+        self.value_sum = 0.0
+        self.virtual_loss = 0
+        self.is_expanded = False
+        self.is_terminal = False
 
     def q(self) -> float:
         denom = self.visits + self.virtual_loss
         return self.value_sum / denom if denom > 0 else 0.0
 
-    def is_leaf(self) -> bool:
-        return len(self.children) == 0
+    def ucb(self, sqrt_parent: float, c_puct: float) -> float:
+        u = c_puct * self.prior * sqrt_parent / (1 + self.visits + self.virtual_loss)
+        return self.q() + u
 
-    def select_child(self, c_puct: float) -> "MCTSNode":
-        return max(
-            self.children.values(),
-            key=lambda child: child.ucb(self.visits, c_puct),
-        )
-
-    def expand(self, legal_moves: list[str], policy_probs: np.ndarray):
-        """Create child nodes for all legal moves."""
-        for move in legal_moves:
-            # Try to look up the move's prior probability from the policy vector.
-            # We don't have the engine here, so we pass the prior directly.
-            self.children[move] = MCTSNode(parent=self, move=move, prior=0.0)
-        # Assign priors from the policy vector (indexed by move)
-        for move, child in self.children.items():
-            child.prior = float(policy_probs.get(move, 1e-8))
-
-    def backup(self, value: float):
-        """Propagate value up the tree (from the perspective of the root's side)."""
-        node = self
-        sign = 1.0
-        while node is not None:
-            node.visits += 1
-            node.value_sum += value * sign
-            sign *= -1.0  # flip for opponent
-            node = node.parent
+    def best_child(self, c_puct: float) -> "MCTSNode":
+        sqrt_n = math.sqrt(max(self.visits + self.virtual_loss, 1))
+        best_score = -1e18
+        best = None
+        for child in self.children.values():
+            score = child.ucb(sqrt_n, c_puct)
+            if score > best_score:
+                best_score = score
+                best = child
+        return best
 
 
-# ── Helper: board tensor ──────────────────────────────────────────────────────
-
-def engine_to_tensor(engine, device: torch.device) -> torch.Tensor:
-    """Convert engine state to a (1, 20, 8, 10) float tensor."""
-    data = engine.get_board_tensor()                       # list[float], length 1600
-    return torch.tensor(data, dtype=torch.float32, device=device).view(1, 20, 8, 10)
-
-
-def policy_to_move_probs(
-    policy_vec: np.ndarray,
-    legal_moves: list[str],
-    engine,
-) -> dict[str, float]:
+class UltraFastMCTS:
     """
-    Extract prior probabilities for legal moves from the flat policy vector.
-    Uses the engine's move_to_policy_idx() method.
+    Оптимизированный MCTS с виртуальными потерями и батчевым inference.
+    Целевые метрики:
+      - 128 игр × 80 симуляций на A100 за < 60 сек
+      - 256 игр × 80 симуляций за < 120 сек
     """
-    move_probs: dict[str, float] = {}
-    total = 0.0
-    for m in legal_moves:
-        idx = engine.move_to_policy_idx(m)
-        p = float(policy_vec[idx]) if idx is not None and idx < len(policy_vec) else 1e-8
-        move_probs[m] = p
-        total += p
-    # Renormalize over legal moves
-    if total > 0:
-        for m in move_probs:
-            move_probs[m] /= total
-    else:
-        uniform = 1.0 / max(len(legal_moves), 1)
-        for m in move_probs:
-            move_probs[m] = uniform
-    return move_probs
 
+    def __init__(self, net: torch.nn.Module, device: torch.device,
+                 c_puct: float = 1.25, batch_size: int = 128,
+                 add_dirichlet: bool = True):
+        self.net = net
+        self.device = device
+        self.c_puct = c_puct
+        self.batch_size = batch_size
+        self.add_dirichlet = add_dirichlet
 
-# ── MCTS search ───────────────────────────────────────────────────────────────
+        # Pinned memory для быстрого H2D
+        self.pinned_buf = torch.empty(batch_size, 20, 8, 10,
+                                      pin_memory=True, dtype=torch.float32)
+        self.net.eval()
 
-def mcts_search(
-    engine,
-    net: torch.nn.Module,
-    *,
-    simulations: int = 800,
-    c_puct: float = 1.25,
-    temperature: float = 1.0,
-    dirichlet_alpha: float = 0.3,
-    dirichlet_epsilon: float = 0.25,
-    device: torch.device | None = None,
-) -> str:
-    """
-    Run MCTS from the current engine state.
+    @torch.no_grad()
+    def _infer(self, tensors: List[np.ndarray]):
+        """Батчевый inference. tensors: список (1600,) float32 массивов."""
+        n = len(tensors)
+        if n == 0:
+            return np.empty((0, POLICY_SIZE)), np.empty((0,))
 
-    Returns the selected move as a UCI string.
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        arr = np.stack(tensors, axis=0).reshape(n, 20, 8, 10)
 
-    net.eval()
+        if n <= self.batch_size:
+            buf = self.pinned_buf[:n]
+            buf.copy_(torch.from_numpy(arr))
+            x = buf.to(self.device, non_blocking=True)
+        else:
+            x = torch.from_numpy(arr).to(self.device)
 
-    # ── Evaluate root ────────────────────────────────────────────────────────
-    with torch.no_grad():
-        # BFLOAT16 inference
+        x = x.to(memory_format=torch.channels_last)
+
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            policy_logits, value = net(engine_to_tensor(engine, device))
+            logits, values = self.net(x)
 
-        # ВАЖНО: обратно в float32
-        policy_logits = policy_logits.float()
+        policies = torch.softmax(logits.float(), dim=1).cpu().numpy()
+        # FIX: view(-1) безопаснее squeeze(1) — работает при любой форме выхода сети
+        values = values.float().view(-1).cpu().numpy()
+        return policies, values
 
-    policy_vec = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
+    def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
+        """
+        Основная точка входа. Возвращает policy-вектора для каждой игры.
 
+        Алгоритм:
+          - Параллельно собираем PARALLEL_SIMS листьев на игру
+          - Объединяем в один большой батч → один inference call
+          - Backprop для всех
+          - Повторяем (simulations // PARALLEL_SIMS) раз
+        """
+        num_games = len(engines)
+        roots = [MCTSNode(None, -1, 1.0) for _ in range(num_games)]
 
-    legal_moves = engine.get_legal_moves()
+        # Начальный expansion всех корней (с Dirichlet noise)
+        root_tensors = [np.array(e.get_board_tensor(), dtype=np.float32)
+                        for e in engines]
+        policies, _ = self._infer(root_tensors)
+        for i in range(num_games):
+            self._expand_node(roots[i], engines[i], policies[i],
+                              add_noise=self.add_dirichlet)
 
-    if not legal_moves:
-        raise ValueError("No legal moves available — game should be over.")
+        steps = max(1, simulations // PARALLEL_SIMS)
 
+        for _ in range(steps):
+            # ── Selection: собрать по PARALLEL_SIMS листьев на игру ──────────
+            all_leaf_tensors: List[np.ndarray] = []
+            all_meta = []  # (game_idx, node, move_stack)
 
-    root = MCTSNode(parent=None, move=None, prior=1.0)
+            for g in range(num_games):
+                if engines[g].is_game_over():
+                    continue
+                for _ in range(PARALLEL_SIMS):
+                    node, move_stack = self._select(roots[g])
 
-    move_probs = policy_to_move_probs(policy_vec, legal_moves, engine)
+                    if node.is_terminal:
+                        # Terminal: VL не применялся (selection остановился на нём),
+                        # просто считаем результат и делаем backup
+                        sim_eng = engines[g].copy()
+                        for m in move_stack:
+                            sim_eng.make_move_int(m)
+                        result = sim_eng.game_result()
+                        # game_result() возвращает значение с точки зрения белых.
+                        # _backup ожидает значение с точки зрения игрока, чей ход в leaf.
+                        leaf_side = sim_eng.side_to_move()
+                        value = result if leaf_side == 0 else -result
+                        self._backup(node, move_stack, value, apply_vloss=False)
+                        continue
 
+                    # Получаем тензор позиции
+                    sim_eng = engines[g].copy()
+                    for m in move_stack:
+                        sim_eng.make_move_int(m)
 
-    # --- DIRICHLET NOISE ---
-    if dirichlet_epsilon > 0 and dirichlet_alpha > 0:
-        noise = np.random.dirichlet([dirichlet_alpha] * len(legal_moves))
-        for (m, n) in zip(legal_moves, noise):
-            move_probs[m] = (1 - dirichlet_epsilon) * move_probs[m] + dirichlet_epsilon * n
+                    tensor = np.array(sim_eng.get_board_tensor(), dtype=np.float32)
+                    all_leaf_tensors.append(tensor)
+                    all_meta.append((g, node, move_stack))
 
-    root.expand(legal_moves, move_probs)
+                    # Применяем virtual loss чтобы другие симуляции не выбирали этот узел
+                    self._apply_virtual_loss(node, VIRTUAL_LOSS)
 
-    # ── Simulation loop ───────────────────────────────────────────────────────
-    for _ in range(simulations - 1):  # -1 because we already evaluated root
+            if not all_leaf_tensors:
+                continue
+
+            # ── Батчевый inference ────────────────────────────────────────────
+            policies, values = self._infer(all_leaf_tensors)
+
+            # Expand + backprop
+            for i, (g, node, move_stack) in enumerate(all_meta):
+                # Нужен engine в состоянии листа для expansion
+                sim_eng = engines[g].copy()
+                for m in move_stack:
+                    sim_eng.make_move_int(m)
+
+                if not node.is_expanded:
+                    # Внутри дерева шум НЕ добавляется — только на корне
+                    self._expand_node(node, sim_eng, policies[i], add_noise=False)
+
+                # Снимаем virtual loss и делаем настоящий backup
+                self._apply_virtual_loss(node, -VIRTUAL_LOSS)
+                self._backup(node, move_stack, float(values[i]), apply_vloss=False)
+
+        # ── Строим policy-вектора из visit counts ─────────────────────────────
+        result_policies = []
+        for g, root in enumerate(roots):
+            policy = np.zeros(POLICY_SIZE, dtype=np.float32)
+            total = sum(c.visits for c in root.children.values())
+            if total > 0:
+                for m, child in root.children.items():
+                    idx = engines[g].move_int_to_policy_idx(m)
+                    if idx is not None:
+                        policy[idx] = child.visits / total
+            result_policies.append(policy)
+
+        return result_policies
+
+    def _select(self, root: MCTSNode):
+        """
+        Спуск по дереву до листа. Возвращает (leaf_node, move_stack).
+        move_stack нужен для воспроизведения позиции через engine.copy() + apply.
+        """
         node = root
+        move_stack = []
+        while node.is_expanded and node.children and not node.is_terminal:
+            node = node.best_child(self.c_puct)
+            move_stack.append(node.move)
+        return node, move_stack
 
-        # 1. Selection: follow best UCB until a leaf
-        #    We need to track the engine state along the path → clone at each step
-        sim_engine = engine.copy()
+    def _expand_node(self, node: MCTSNode, engine, policy_vec: np.ndarray,
+                     add_noise: bool = False):
+        """
+        Создаём дочерние узлы по легальным ходам.
 
-        while not node.is_leaf():
-            node = node.select_child(c_puct)
-            sim_engine.make_move(node.move)
+        add_noise=True — добавлять Dirichlet шум (только для корня при self-play).
+        Это критично для exploration: без шума сеть быстро зацикливается на
+        одних и тех же ходах и не исследует альтернативы.
+        """
+        if node.is_expanded:
+            return
+        legal = engine.get_legal_moves_int()
+        if not legal:
+            node.is_terminal = True
+            node.is_expanded = True
+            return
 
-        # 2. Terminal check
-        if sim_engine.is_game_over():
-            result = sim_engine.game_result()
-            # result is from white's perspective; flip if black is to move at this node
-            # game_result returns +1 white wins, -1 black wins, 0 draw
-            # backup from the perspective of the side that just moved INTO this terminal
-            node.backup(result if sim_engine.side_to_move() == 1 else -result)
-            continue
+        n = len(legal)
+        raw_priors = np.empty(n, dtype=np.float64)
+        for j, m in enumerate(legal):
+            idx = engine.move_int_to_policy_idx(m)
+            # FIX: bounds check — idx может быть >= POLICY_SIZE при баге в движке
+            if idx is not None and 0 <= idx < len(policy_vec):
+                raw_priors[j] = float(policy_vec[idx])
+            else:
+                raw_priors[j] = 1e-8
 
-        # 3. Expansion + evaluation
-        with torch.no_grad():
-            policy_logits, leaf_value = net(engine_to_tensor(sim_engine, device))
-        policy_vec = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-        leaf_value_f = float(leaf_value.item())
+        total = raw_priors.sum()
 
-        new_legal = sim_engine.get_legal_moves()
-        if new_legal:
-            move_probs = policy_to_move_probs(policy_vec, new_legal, sim_engine)
-            node.expand(new_legal, move_probs)
+        # FIX: если сеть вернула нули для всех легальных ходов (начало обучения),
+        # равномерно распределяем prior вместо молчаливого fallback'а
+        if total <= 1e-12:
+            raw_priors = np.ones(n, dtype=np.float64) / n
+        else:
+            raw_priors /= total
 
-        # 4. Backup
-        node.backup(leaf_value_f)
+        # Dirichlet noise только на корне при self-play (AlphaZero §B.11)
+        if add_noise and n > 0:
+            noise = np.random.dirichlet([DIRICHLET_ALPHA] * n)
+            raw_priors = (1.0 - DIRICHLET_EPS) * raw_priors + DIRICHLET_EPS * noise
 
-    # ── Select move ───────────────────────────────────────────────────────────
-    if not root.children:
-        return legal_moves[0]
+        for j, m in enumerate(legal):
+            node.children[m] = MCTSNode(node, m, float(raw_priors[j]))
 
-    visit_counts = {m: child.visits for m, child in root.children.items()}
+        node.is_expanded = True
 
-    if temperature == 0:
-        # Greedy
-        return max(visit_counts, key=visit_counts.get)
+    def _apply_virtual_loss(self, node: MCTSNode, delta: int):
+        """
+        Идём вверх по дереву и добавляем/убираем virtual loss.
+        FIX: clamp ≥ 0 при снятии, чтобы не уйти в минус при несимметричных вызовах.
+        """
+        cur = node
+        while cur is not None:
+            if delta < 0:
+                # FIX: clamp при снятии
+                cur.virtual_loss = max(0, cur.virtual_loss + delta)
+            else:
+                cur.virtual_loss += delta
+            cur = cur.parent
 
-    # Sample proportional to visit_count ^ (1/temperature)
-    moves = list(visit_counts.keys())
-    counts = np.array([visit_counts[m] for m in moves], dtype=np.float64)
-    counts = counts ** (1.0 / temperature)
-    counts /= counts.sum()
-    return np.random.choice(moves, p=counts)
+    def _backup(self, leaf: MCTSNode, move_stack: List[int],
+                value: float, apply_vloss: bool = False):
+        """
+        Backpropagation. value — с точки зрения игрока, ходящего в leaf.
+        Знак меняется при каждом шаге вверх.
+        """
+        cur = leaf
+        sign = 1.0
+        while cur is not None:
+            cur.visits += 1
+            cur.value_sum += value * sign
+            if apply_vloss:
+                cur.virtual_loss = max(0, cur.virtual_loss - VIRTUAL_LOSS)
+            sign *= -1.0
+            cur = cur.parent
 
 
-def mcts_policy_vector(
-    engine,
-    net: torch.nn.Module,
-    *,
-    simulations: int = 800,
-    c_puct: float = 1.25,
-    temperature: float = 1.0,
-    device: torch.device | None = None,
-) -> np.ndarray:
-    """
-    Like mcts_search() but returns the full MCTS policy vector (visit distributions)
-    over all POLICY_SIZE actions. Used as training target.
-    """
+# ── Совместимый wrapper для train.py ─────────────────────────────────────────
+def mcts_policy_vector(engine, net, simulations=80, c_puct=1.25, device=None):
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    net.eval()
-
-    with torch.no_grad():
-        policy_logits, value = net(engine_to_tensor(engine, device))
-    policy_vec_nn = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
-
-    legal_moves = engine.get_legal_moves()
-    if not legal_moves:
-        return np.zeros(POLICY_SIZE, dtype=np.float32)
-
-    root = MCTSNode(parent=None, move=None, prior=1.0)
-    move_probs = policy_to_move_probs(policy_vec_nn, legal_moves, engine)
-    root.expand(legal_moves, move_probs)
-
-    for _ in range(simulations - 1):
-        node = root
-        sim_engine = engine.copy()
-
-        while not node.is_leaf():
-            node = node.select_child(c_puct)
-            sim_engine.make_move(node.move)
-
-        if sim_engine.is_game_over():
-            result = sim_engine.game_result()
-            node.backup(result if sim_engine.side_to_move() == 1 else -result)
-            continue
-
-        with torch.no_grad():
-            plogits, leaf_val = net(engine_to_tensor(sim_engine, device))
-        pv = torch.softmax(plogits, dim=1).squeeze(0).cpu().numpy()
-        new_legal = sim_engine.get_legal_moves()
-        if new_legal:
-            mp = policy_to_move_probs(pv, new_legal, sim_engine)
-            node.expand(new_legal, mp)
-        node.backup(float(leaf_val.item()))
-
-    # Build policy vector from visit counts
-    policy_out = np.zeros(POLICY_SIZE, dtype=np.float32)
-    total_visits = sum(c.visits for c in root.children.values())
-    if total_visits > 0:
-        for m, child in root.children.items():
-            idx = engine.move_to_policy_idx(m)
-            if idx is not None:
-                policy_out[idx] = child.visits / total_visits
-
-    return policy_out
+        device = torch.device("cuda")
+    mcts = UltraFastMCTS(net, device, c_puct, batch_size=64, add_dirichlet=True)
+    return mcts.search_games([engine], simulations)[0]

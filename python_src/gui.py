@@ -1,248 +1,482 @@
 import sys
 import torch
 import traceback
+import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QPushButton, QLabel, QFileDialog, QListWidget)
-from PyQt5.QtGui import QPainter, QColor, QFont, QPen
-from PyQt5.QtCore import Qt, QRect
+                             QHBoxLayout, QPushButton, QLabel, QFileDialog,
+                             QListWidget, QSpinBox, QButtonGroup, QRadioButton,
+                             QGroupBox)
+from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QPolygonF
+from PyQt5.QtCore import Qt, QRect, QPointF, QThread, pyqtSignal
 
-# Импорт движка и модели
 try:
     from capablanca_engine import CapablancaEngine
     from model import CapablancaNet
+    from mcts import UltraFastMCTS, MCTSNode, VIRTUAL_LOSS
 except ImportError as e:
-    print(f"Ошибка импорта! Убедитесь, что движок собран и model.py рядом.\n{e}")
+    print(f"Ошибка импорта! {e}")
+    traceback.print_exc()
     sys.exit(1)
 
-# Цвета доски
-COLOR_LIGHT = QColor("#D3D3D3")
-COLOR_DARK = QColor("#808080")
-COLOR_HIGHLIGHT = QColor(255, 255, 0, 100)
-COLOR_HINT = QColor(0, 255, 0, 150)
-
-# Фигуры
 PIECE_CHARS = {
-    # (Цвет: 0-белые, 1-черные), (Тип: 0-P, 1-N, 2-B, 3-R, 4-Q, 5-A, 6-C, 7-K)
     (0, 0): '♙', (0, 1): '♘', (0, 2): '♗', (0, 3): '♖', (0, 4): '♕',
     (0, 5): 'A', (0, 6): 'C', (0, 7): '♔',
-
     (1, 0): '♟', (1, 1): '♞', (1, 2): '♝', (1, 3): '♜', (1, 4): '♛',
-    (1, 5): 'a', (1, 6): 'c', (1, 7): '♚',
+    (1, 5): 'a', (1, 6): 'c', (1, 7): '♚'
 }
 
-def uci_to_sq(uci_str):
-    f = ord(uci_str[0]) - ord('a')
-    r = int(uci_str[1]) - 1
-    return f, r
 
-def sq_to_uci(f, r):
-    return f"{chr(ord('a') + f)}{r + 1}"
+def decode_move(m_int):
+    p_val = m_int & 0b111
+    to_sq = (m_int >> 3) & 0x7F
+    from_sq = (m_int >> 10) & 0x7F
+    promo = ['q', 'r', 'b', 'n', 'a', 'c'][p_val - 1] if p_val > 0 else None
+    return from_sq, to_sq, promo
+
+
+def move_to_uci(m_int):
+    f, t, p = decode_move(m_int)
+    def sq_u(s):
+        return f"{chr(ord('a') + (s % 10))}{(s // 10) + 1}"
+    return sq_u(f) + sq_u(t) + (p if p else "")
+
+
+class MCTSThread(QThread):
+    """
+    Поток GPU-MCTS. НЕ делает ходы — только накапливает дерево и шлёт статистику.
+    analyze_for: 0 = белые, 1 = чёрные, -1 = всегда (оба цвета)
+    """
+    update_signal = pyqtSignal(list, float, int)   # [(move, prob)], value, sims
+
+    def __init__(self, move_history, net, device, batch_size=64,
+                 max_sims=100_000, analyze_for=-1):
+        super().__init__()
+        self.move_history = move_history.copy()
+        self.net = net
+        self.device = device
+        self.batch_size = batch_size
+        self.running = True
+        self.max_sims = max_sims
+        self.analyze_for = analyze_for  # -1=все, 0=белые, 1=чёрные
+
+    def run(self):
+        try:
+            # --- Восстанавливаем позицию в локальном движке ---
+            engine = CapablancaEngine()
+            for m in self.move_history:
+                engine.make_move_int(m)
+
+            # --- Проверяем чей ход — нужно ли анализировать ---
+            current_side = engine.side_to_move()  # 0=белые, 1=чёрные
+            if self.analyze_for != -1 and self.analyze_for != current_side:
+                # Не наш ход — ждём пока не остановят
+                while self.running:
+                    self.msleep(100)
+                return
+
+            # --- MCTS ---
+            mcts = UltraFastMCTS(self.net, self.device,
+                                 c_puct=1.25, batch_size=self.batch_size)
+            root = MCTSNode(None, -1, 1.0)
+
+            # Начальный expansion корня (1 инференс)
+            tensor = np.array(engine.get_board_tensor(), dtype=np.float32)
+            policy, _ = mcts._infer([tensor])
+            mcts._expand_node(root, engine, policy[0])
+
+            total_sims = 0
+            report_every = 200   # чаще обновлять GUI
+
+            while self.running and total_sims < self.max_sims:
+                tensors = []   # батч тензоров для GPU
+                metas = []     # (node, move_stack)
+
+                # Собираем батч листьев
+                attempts = 0
+                while (len(tensors) < self.batch_size and
+                       attempts < self.batch_size * 3 and self.running):
+
+                    node, move_stack = mcts._select(root)
+
+                    if node.is_terminal:
+                        # Терминал — сразу backup, GPU не нужен
+                        sim_eng = engine.copy()
+                        for m in move_stack:
+                            sim_eng.make_move_int(m)
+                        result = sim_eng.game_result()
+                        depth_parity = len(move_stack) % 2
+                        value = result if depth_parity == 0 else -result
+                        mcts._backup(node, move_stack, value)
+                        attempts += 1
+                        continue
+
+                    # Воспроизводим позицию листа
+                    sim_eng = engine.copy()
+                    for m in move_stack:
+                        sim_eng.make_move_int(m)
+
+                    tensors.append(np.array(sim_eng.get_board_tensor(), dtype=np.float32))
+                    metas.append((node, move_stack))
+                    mcts._apply_virtual_loss(node, VIRTUAL_LOSS)
+                    attempts += 1
+
+                # --- Батчевый инференс на GPU ---
+                if tensors:
+                    policies, values = mcts._infer(tensors)
+
+                    for i, (node, move_stack) in enumerate(metas):
+                        sim_eng = engine.copy()
+                        for m in move_stack:
+                            sim_eng.make_move_int(m)
+
+                        if not node.is_expanded:
+                            mcts._expand_node(node, sim_eng, policies[i])
+
+                        # Снимаем виртуальный лосс и пишем настоящий результат
+                        mcts._apply_virtual_loss(node, -VIRTUAL_LOSS)
+                        mcts._backup(node, move_stack, float(values[i]))
+
+                    total_sims += len(tensors)
+
+                # --- Шлём статистику в GUI ---
+                if total_sims % report_every < self.batch_size or not self.running:
+                    self._emit_stats(root, total_sims)
+
+                self.msleep(2)   # даём GUI подышать
+
+            self._emit_stats(root, total_sims)
+
+        except Exception as e:
+            print(f"[MCTSThread] Критическая ошибка: {e}")
+            traceback.print_exc()
+
+    def _emit_stats(self, root, total_sims):
+        if not root.children:
+            return
+        total_visits = sum(c.visits for c in root.children.values())
+        if total_visits == 0:
+            return
+
+        stats = []
+        for m_int, node in root.children.items():
+            if node.visits > 0:
+                stats.append((m_int, node.visits / total_visits))
+        stats.sort(key=lambda x: x[1], reverse=True)
+
+        val = root.value_sum / root.visits if root.visits > 0 else 0.0
+        self.update_signal.emit(stats[:5], float(val), total_sims)
+
 
 class BoardWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.setMinimumSize(800, 600)
         self.engine = CapablancaEngine()
+        self.selected_sq = None
         self.flipped = False
-        self.selected_sq = None
-        self.legal_moves = []
-        self.main_window = parent
-        self.setMinimumSize(600, 480)
+        self.legal_moves = self.engine.get_legal_moves_int()
+        self.top_moves_data = []   # [(m_int, prob, QColor)]
 
-    def reset_game(self):
-        self.engine = CapablancaEngine()
-        self.selected_sq = None
-        self._update_state()
+    # ---------- Геометрия доски 10x8 ----------
+    def get_sq_rect(self, sq):
+        r, f = divmod(sq, 10)
+        v_rank = r if self.flipped else (7 - r)
+        v_file = (9 - f) if self.flipped else f
+        w, h = self.width() / 10, self.height() / 8
+        return QRect(int(v_file * w), int(v_rank * h), int(w), int(h))
 
-    def _update_state(self):
-        self.legal_moves = self.engine.get_legal_moves()
-        self.main_window.analyze_position()
-        self.update()
+    def get_sq_at(self, pos):
+        w, h = self.width() / 10, self.height() / 8
+        vf, vr = int(pos.x() // w), int(pos.y() // h)
+        if 0 <= vf < 10 and 0 <= vr < 8:
+            r = vr if self.flipped else (7 - vr)
+            f = (9 - vf) if self.flipped else vf
+            return r * 10 + f
+        return None
 
-    def get_board_state(self):
-        tensor = self.engine.get_board_tensor()
-        board = {}
-        # В Capablanca Chess 10x8: 20 плоскостей (8 фигур * 2 + доп. инфо)
-        # Предполагаем порядок плоскостей: P, N, B, R, Q, A, C, K для белых, затем для черных
-        for c in range(2):
-            for p in range(8):
-                plane_offset = (c * 8 + p) * 80
-                for sq in range(80):
-                    if tensor[plane_offset + sq] > 0.5:
-                        file = sq % 10
-                        rank = sq // 10
-                        board[(file, rank)] = (c, p)
-        return board
-
+    # ---------- Отрисовка ----------
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        sq_size = min(self.width() // 10, self.height() // 8)
-        offset_x = (self.width() - sq_size * 10) // 2
-        offset_y = (self.height() - sq_size * 8) // 2
+        tensor = self.engine.get_board_tensor()
 
-        board_state = self.get_board_state()
+        # Клетки
+        painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        for r in range(8):
+            for f in range(10):
+                sq = r * 10 + f
+                rect = self.get_sq_rect(sq)
+                dark = (r + f) % 2 != 0
+                bg = QColor("#ebecd0") if dark else QColor("#779556")
+                tc = QColor("#779556") if dark else QColor("#ebecd0")
+                painter.fillRect(rect, bg)
 
-        for rank in range(8):
-            for file in range(10):
-                draw_f = 9 - file if self.flipped else file
-                draw_r = rank if self.flipped else 7 - rank
-                x, y = offset_x + draw_f * sq_size, offset_y + draw_r * sq_size
+                if self.selected_sq == sq:
+                    painter.fillRect(rect, QColor(255, 255, 0, 120))
 
-                painter.fillRect(x, y, sq_size, sq_size, COLOR_LIGHT if (file + rank) % 2 != 0 else COLOR_DARK)
+                painter.setPen(tc)
+                if (not self.flipped and r == 0) or (self.flipped and r == 7):
+                    painter.drawText(rect.adjusted(0, 0, -4, -4),
+                                     Qt.AlignBottom | Qt.AlignRight, chr(ord('a') + f))
+                if (not self.flipped and f == 0) or (self.flipped and f == 9):
+                    painter.drawText(rect.adjusted(4, 4, 0, 0),
+                                     Qt.AlignTop | Qt.AlignLeft, str(r + 1))
 
-                if self.selected_sq == (file, rank):
-                    painter.fillRect(x, y, sq_size, sq_size, COLOR_HIGHLIGHT)
+        # Фигуры
+        painter.setFont(QFont("Arial", int(self.height() / 8 * 0.65)))
+        for sq in range(80):
+            piece = None
+            for i in range(8):
+                if tensor[i * 80 + sq] > 0.5:
+                    piece = (0, i)
+                    break
+                if tensor[(8 + i) * 80 + sq] > 0.5:
+                    piece = (1, i)
+                    break
+            if piece:
+                painter.setPen(Qt.black)
+                painter.drawText(self.get_sq_rect(sq), Qt.AlignCenter,
+                                 PIECE_CHARS.get(piece, '?'))
 
-                if (file, rank) in board_state:
-                    c, p = board_state[(file, rank)]
-                    painter.setPen(Qt.white if c == 0 else Qt.black)
-                    painter.setFont(QFont("Arial", sq_size // 2))
-                    painter.drawText(QRect(x, y, sq_size, sq_size), Qt.AlignCenter, PIECE_CHARS[(c, p)])
+        # Подсветка легальных ходов
+        if self.selected_sq is not None:
+            best_dest = None
+            if self.top_moves_data:
+                bm = self.top_moves_data[0][0]
+                fs, ts, _ = decode_move(bm)
+                if fs == self.selected_sq:
+                    best_dest = ts
 
-                if self.selected_sq:
-                    prefix = sq_to_uci(*self.selected_sq)
-                    for m in self.legal_moves:
-                        if m.startswith(prefix) and uci_to_sq(m[2:4]) == (file, rank):
-                            painter.setBrush(COLOR_HINT)
-                            painter.setPen(Qt.NoPen)
-                            r_dot = sq_size // 8
-                            painter.drawEllipse(x + sq_size//2 - r_dot, y + sq_size//2 - r_dot, r_dot*2, r_dot*2)
+            for m in self.legal_moves:
+                fs, ts, _ = decode_move(m)
+                if fs == self.selected_sq:
+                    c = self.get_sq_rect(ts).center()
+                    if ts == best_dest:
+                        painter.setBrush(QColor(0, 255, 0, 180))
+                        painter.drawEllipse(c, 12, 12)
+                    else:
+                        painter.setBrush(QColor(0, 0, 0, 50))
+                        painter.drawEllipse(c, 7, 7)
 
+        # Стрелки топ-ходов от MCTS
+        for m_int, prob, color in self.top_moves_data:
+            f, t, _ = decode_move(m_int)
+            self.draw_arrow(painter, f, t, color, prob)
+
+    def draw_arrow(self, painter, f, t, color, p):
+        s = QPointF(self.get_sq_rect(f).center())
+        e = QPointF(self.get_sq_rect(t).center())
+        c = QColor(color)
+        c.setAlpha(int(max(80, p * 255)))
+        painter.setPen(QPen(c, 5, Qt.SolidLine, Qt.RoundCap))
+        painter.setBrush(c)
+        painter.drawLine(s, e)
+        ang = np.arctan2(e.y() - s.y(), e.x() - s.x())
+        p1 = e - QPointF(np.cos(ang - 0.5) * 16, np.sin(ang - 0.5) * 16)
+        p2 = e - QPointF(np.cos(ang + 0.5) * 16, np.sin(ang + 0.5) * 16)
+        painter.drawPolygon(QPolygonF([e, p1, p2]))
+
+    # ---------- Ввод ----------
     def mousePressEvent(self, event):
-        sq_size = min(self.width() // 10, self.height() // 8)
-        offset_x = (self.width() - sq_size * 10) // 2
-        offset_y = (self.height() - sq_size * 8) // 2
-        f = (event.x() - offset_x) // sq_size
-        r = (event.y() - offset_y) // sq_size
+        sq = self.get_sq_at(event.pos())
+        if sq is None:
+            return
 
-        if 0 <= f < 10 and 0 <= r < 8:
-            file = 9 - f if self.flipped else f
-            rank = r if self.flipped else 7 - r
-
-            if self.selected_sq:
-                move = sq_to_uci(*self.selected_sq) + sq_to_uci(file, rank)
-                possible = [m for m in self.legal_moves if m.startswith(move)]
-                if possible:
-                    self.engine.make_move(possible[0])
+        if self.selected_sq is not None:
+            for m in self.legal_moves:
+                f, t, _ = decode_move(m)
+                if f == self.selected_sq and t == sq:
+                    # Ход человека — останавливаем расчёт, применяем ход
+                    self.main_window.stop_thinking()
+                    self.engine.make_move_int(m)
+                    self.legal_moves = self.engine.get_legal_moves_int()
                     self.selected_sq = None
-                    self._update_state()
+                    self.top_moves_data = []          # сбрасываем стрелки
+                    self.main_window.add_move(m)
+                    self.update()
                     return
 
-            board_state = self.get_board_state()
-            if (file, rank) in board_state and board_state[(file, rank)][0] == self.engine.side_to_move():
-                self.selected_sq = (file, rank)
-            else:
-                self.selected_sq = None
-            self.update()
+        self.selected_sq = sq
+        self.update()
+
 
 class CapablancaGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Capablanca AI GUI")
-        self.setStyleSheet("QMainWindow, QWidget { background-color: #1a1a1a; color: white; } "
-                           "QPushButton { background-color: #333; border: 1px solid #555; padding: 10px; min-height: 20px; } "
-                           "QListWidget { background-color: #000; border: 1px solid #333; }")
-
-        self.net = None
+        self.setWindowTitle("Capablanca AI — GPU MCTS Analyzer")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.net = None
+        self.think_thread = None
+        self.move_history = []
 
-        central = QWidget()
-        layout = QHBoxLayout(central)
+        # ------- Layout -------
+        main = QWidget()
+        layout = QHBoxLayout(main)
 
         self.board_widget = BoardWidget(self)
-        layout.addWidget(self.board_widget, stretch=3)
+        layout.addWidget(self.board_widget, 5)
 
-        self.side_panel = QWidget()
-        self.side_panel.setFixedWidth(300)
-        side_layout = QVBoxLayout(self.side_panel)
+        sidebar = QVBoxLayout()
 
-        self.status_label = QLabel("Загрузите веса (64ch, 5blocks)")
-        self.status_label.setWordWrap(True)
-        self.status_label.setFont(QFont("Arial", 10, QFont.Bold))
-        side_layout.addWidget(self.status_label)
-
-        btn_load = QPushButton("Загрузить веса (.pth)")
+        # ------- Загрузка модели -------
+        btn_load = QPushButton("Загрузить веса")
         btn_load.clicked.connect(self.load_weights)
-        side_layout.addWidget(btn_load)
+        sidebar.addWidget(btn_load)
 
-        btn_flip = QPushButton("Повернуть доску")
+        # ------- Анализировать за -------
+        grp_side = QGroupBox("Анализировать за")
+        side_layout = QVBoxLayout(grp_side)
+        self.radio_all   = QRadioButton("Всех (всегда)")
+        self.radio_white = QRadioButton("Белых")
+        self.radio_black = QRadioButton("Чёрных")
+        self.radio_all.setChecked(True)
+        self._side_group = QButtonGroup()
+        for i, r in enumerate([self.radio_all, self.radio_white, self.radio_black]):
+            self._side_group.addButton(r, i)
+            side_layout.addWidget(r)
+        sidebar.addWidget(grp_side)
+
+        # ------- Лимит симуляций -------
+        grp_lim = QGroupBox("Лимит симуляций")
+        lim_layout = QHBoxLayout(grp_lim)
+        self.spin_sims = QSpinBox()
+        self.spin_sims.setMinimum(0)           # 0 = безлимитно
+        self.spin_sims.setMaximum(10_000_000)
+        self.spin_sims.setSingleStep(1000)
+        self.spin_sims.setValue(100_000)
+        self.spin_sims.setSpecialValueText("∞ безлимитно")
+        lim_layout.addWidget(self.spin_sims)
+        sidebar.addWidget(grp_lim)
+
+        # ------- Кнопки управления -------
+        self.btn_think = QPushButton("▶ Думать (GPU MCTS)")
+        self.btn_think.clicked.connect(self.toggle_thinking)
+        self.btn_think.setEnabled(False)
+        self.btn_think.setStyleSheet("font-weight: bold; font-size: 13px;")
+        sidebar.addWidget(self.btn_think)
+
+        btn_flip = QPushButton("Перевернуть доску")
         btn_flip.clicked.connect(self.flip_board)
-        side_layout.addWidget(btn_flip)
+        sidebar.addWidget(btn_flip)
 
-        btn_reset = QPushButton("Сбросить партию")
-        btn_reset.clicked.connect(self.reset_game)
-        side_layout.addWidget(btn_reset)
+        self.status = QLabel("Загрузите модель, чтобы начать анализ")
+        self.status.setWordWrap(True)
+        sidebar.addWidget(self.status)
 
-        side_layout.addSpacing(20)
-        side_layout.addWidget(QLabel("Анализ позиции:"))
-        self.analysis_list = QListWidget()
-        side_layout.addWidget(self.analysis_list)
+        sidebar.addWidget(QLabel("Топ-5 (MCTS):"))
+        self.move_list = QListWidget()
+        self.move_list.setMaximumHeight(180)
+        sidebar.addWidget(self.move_list)
 
-        layout.addWidget(self.side_panel)
-        self.setCentralWidget(central)
-        self.board_widget._update_state()
-
-    def load_weights(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Открыть веса", "", "Weights (*.pth)")
-        if path:
-            try:
-                # ИСПРАВЛЕНО: Устанавливаем 64 канала и 5 блоков согласно вашей ошибке
-                self.net = CapablancaNet(num_channels=64, num_res_blocks=5)
-
-                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-
-                if isinstance(checkpoint, dict) and "model" in checkpoint:
-                    state_dict = checkpoint["model"]
-                else:
-                    state_dict = checkpoint
-
-                self.net.load_state_dict(state_dict)
-                self.net.to(self.device).eval()
-
-                self.status_label.setText(f"Веса загружены успешно!\nDevice: {self.device}")
-                self.analyze_position()
-            except Exception as e:
-                print(f"ОШИБКА:\n{traceback.format_exc()}")
-                self.status_label.setText(f"Ошибка загрузки. Вероятно, параметры сети в файле отличаются от 64ch/5blocks.")
+        sidebar.addStretch()
+        layout.addLayout(sidebar, 2)
+        self.setCentralWidget(main)
 
     def flip_board(self):
         self.board_widget.flipped = not self.board_widget.flipped
         self.board_widget.update()
 
-    def reset_game(self):
-        self.board_widget.reset_game()
-        self.status_label.setText("Партия сброшена")
+    def add_move(self, m_int):
+        """Человек сделал ход — просто запоминаем, НЕ запускаем анализ автоматически."""
+        self.move_history.append(m_int)
 
-    def analyze_position(self):
-        self.analysis_list.clear()
-        if not self.net: return
-
-        if self.board_widget.engine.is_game_over():
-            self.status_label.setText("Игра завершена")
+    # ------- Модель -------
+    def load_weights(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Загрузить веса", "", "*.pth")
+        if not path:
             return
+        try:
+            ckpt = torch.load(path, map_location=self.device)
+            sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
+            sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
+                  for k, v in sd.items()}
 
-        tensor_data = self.board_widget.engine.get_board_tensor()
-        t = torch.tensor(tensor_data, dtype=torch.float32, device=self.device).view(1, 20, 8, 10)
+            ch = sd.get("input_conv.net.0.weight",
+                        sd.get("input_block.0.weight")).shape[0]
+            bl = len([k for k in sd.keys()
+                      if "res_blocks" in k and "conv1.weight" in k])
 
-        with torch.no_grad():
-            policy_logits, value = self.net(t)
-            probs = torch.softmax(policy_logits, dim=1).squeeze(0).cpu().numpy()
+            self.net = CapablancaNet(num_channels=ch, num_res_blocks=bl)
+            self.net.load_state_dict(sd)
+            self.net.to(self.device).eval()
 
-        moves_with_probs = []
-        for m in self.board_widget.legal_moves:
-            idx = self.board_widget.engine.move_to_policy_idx(m)
-            if idx is not None:
-                moves_with_probs.append((m, probs[idx]))
+            self.status.setText(f"Готово: {ch}ch×{bl}bl | {self.device}")
+            self.btn_think.setEnabled(True)
+        except Exception as e:
+            self.status.setText(f"Ошибка: {e}")
+            traceback.print_exc()
 
-        moves_with_probs.sort(key=lambda x: x[1], reverse=True)
+    # ------- MCTS управление -------
+    def toggle_thinking(self):
+        if self.think_thread and self.think_thread.isRunning():
+            self.stop_thinking()
+        else:
+            self.start_thinking()
 
-        self.analysis_list.addItem(f"Value (оценка): {value.item():.3f}")
-        self.analysis_list.addItem("-" * 15)
-        for m, p in moves_with_probs[:10]:
-            self.analysis_list.addItem(f"{m}: {p*100:.1f}%")
+    def start_thinking(self):
+        if not self.net:
+            return
+        self.stop_thinking()
+
+        # Читаем настройки из UI
+        side_id = self._side_group.checkedId()
+        analyze_for = [-1, 0, 1][side_id]   # 0=все → -1, 1=белые → 0, 2=чёрные → 1
+        max_sims = self.spin_sims.value() or 10_000_000  # 0 в спинбоксе = безлимитно
+
+        side_label = ["всех", "белых", "чёрных"][side_id]
+        lim_label = "∞" if self.spin_sims.value() == 0 else f"{max_sims:,}"
+        self.btn_think.setText("⏹ Остановить")
+        self.move_list.clear()
+        self.status.setText(f"MCTS: за {side_label}, лимит {lim_label}…")
+
+        self.think_thread = MCTSThread(
+            self.move_history, self.net, self.device,
+            max_sims=max_sims, analyze_for=analyze_for,
+        )
+        self.think_thread.update_signal.connect(self.on_mcts_update)
+        self.think_thread.start()
+
+    def stop_thinking(self):
+        if self.think_thread and self.think_thread.isRunning():
+            self.think_thread.running = False
+            self.think_thread.wait(1500)
+
+        self.btn_think.setText("▶ Думать (GPU MCTS)")
+        self.board_widget.top_moves_data = []
+        self.board_widget.update()
+
+    def on_mcts_update(self, moves, val, sims):
+        self.move_list.clear()
+        self.board_widget.top_moves_data = []
+
+        colors = [
+            QColor(0, 200, 0),     # 1 зелёный
+            QColor(0, 160, 255),   # 2 синий
+            QColor(255, 140, 0),   # 3 оранжевый
+            QColor(180, 100, 220), # 4 фиолетовый
+            QColor(120, 120, 120)  # 5 серый
+        ]
+
+        for i, (m_int, prob) in enumerate(moves):
+            uci = move_to_uci(m_int)
+            self.move_list.addItem(f"{i + 1}. {uci}  ({prob * 100:.1f}%)")
+            self.board_widget.top_moves_data.append((m_int, prob, colors[i]))
+
+        winrate = (val + 1.0) / 2.0
+        side = self.board_widget.engine.side_to_move()
+        side_str = "Белые" if side == 0 else "Чёрные"
+        lim = self.spin_sims.value()
+        done = lim > 0 and sims >= lim
+        self.status.setText(
+            f"Ход: {side_str} | Сим: {sims:,} {'✓' if done else ''} | "
+            f"Оценка: {winrate:.1%}"
+        )
+        self.board_widget.update()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = CapablancaGUI()
-    window.show()
+    gui = CapablancaGUI()
+    gui.show()
     sys.exit(app.exec_())

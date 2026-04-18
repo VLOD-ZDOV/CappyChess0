@@ -10,7 +10,7 @@ import torch.nn.functional as F
 # Policy vector layout (must match Rust engine):
 #   0..6400        : from_sq * 80 + to_sq  (normal moves)
 #   6400..6880     : promotions (6 types × 80 to-squares)
-POLICY_SIZE = 6880 # Было 6720
+POLICY_SIZE = 7000  # FIX: было 6880 — макс. индекс промоушена = 6400+99*6+5 = 6999
 
 
 class ConvBnRelu(nn.Module):
@@ -87,7 +87,7 @@ class CapablancaNet(nn.Module):
         )
 
         # ── Policy head ──────────────────────────────────────────────────────
-        # Outputs POLICY_SIZE logits (6720)
+        # Outputs POLICY_SIZE logits (7000)
         self.policy_head = nn.Sequential(
             nn.Conv2d(num_channels, 32, kernel_size=1, bias=False),
             nn.BatchNorm2d(32),
