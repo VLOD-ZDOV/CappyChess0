@@ -1,6 +1,7 @@
-
 // src/lib.rs — Capablanca Chess Engine (10x8 board)
 use pyo3::prelude::*;
+use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray};
+use ndarray::Array2;
 
 type BB = u128;
 const BOARD_MASK: BB = (1u128 << 80) - 1;
@@ -376,5 +377,346 @@ impl CapablancaEngine {
 #[pymodule(name = "capablanca_engine")]
 fn capablanca_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CapablancaEngine>()?;
+    m.add_class::<RustMCTS>()?;
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RUST MCTS — дерево живёт в Rust, Python только кормит нейросетью
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const POLICY_SIZE_MCTS: usize = 7000;
+const VIRTUAL_LOSS_V: i32 = 3;
+const C_PUCT_V: f32 = 1.25;
+const DIRICHLET_ALPHA_V: f64 = 0.3;
+const DIRICHLET_EPS_V: f64 = 0.25;
+
+struct MctsNode {
+    board: Board,
+    move_from_parent: u32,
+    prior: f32,
+    visits: i32,
+    value_sum: f32,
+    virtual_loss: i32,
+    children: Vec<usize>,
+    is_expanded: bool,
+    is_terminal: bool,
+    parent: Option<usize>,
+}
+
+impl MctsNode {
+    fn new(board: Board, move_from_parent: u32, prior: f32, parent: Option<usize>) -> Self {
+        MctsNode {
+            board, move_from_parent, prior,
+            visits: 0, value_sum: 0.0, virtual_loss: 0,
+            children: Vec::new(),
+            is_expanded: false, is_terminal: false, parent,
+        }
+    }
+    fn q(&self) -> f32 {
+        let d = self.visits + self.virtual_loss;
+        if d > 0 { self.value_sum / d as f32 } else { 0.0 }
+    }
+}
+
+struct Arena { nodes: Vec<MctsNode> }
+impl Arena {
+    fn new(cap: usize) -> Self { Arena { nodes: Vec::with_capacity(cap) } }
+    fn add(&mut self, n: MctsNode) -> usize { let i = self.nodes.len(); self.nodes.push(n); i }
+    fn get(&self, i: usize) -> &MctsNode { &self.nodes[i] }
+    fn get_mut(&mut self, i: usize) -> &mut MctsNode { &mut self.nodes[i] }
+}
+
+fn xorshift64(s: &mut u64) -> f64 {
+    *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17;
+    (*s as f64) / (u64::MAX as f64)
+}
+
+fn dirichlet_noise(alpha: f64, n: usize, rng: &mut u64) -> Vec<f64> {
+    let d = alpha - 1.0/3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        loop {
+            let u1 = xorshift64(rng).max(1e-15);
+            let u2 = xorshift64(rng);
+            let x = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            let v = (1.0 + c * x).powi(3);
+            if v <= 0.0 { continue; }
+            let u = xorshift64(rng);
+            if u < 1.0 - 0.0331 * x.powi(4) { out.push(d * v); break; }
+            if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) { out.push(d * v); break; }
+        }
+    }
+    let sum: f64 = out.iter().sum();
+    if sum > 0.0 { out.iter_mut().for_each(|x| *x /= sum); }
+    out
+}
+
+struct SingleMcts {
+    arena: Arena,
+    root: usize,
+    pending: Vec<usize>,   // индексы листьев ожидающих inference
+}
+
+impl SingleMcts {
+    fn new(board: Board) -> Self {
+        let mut arena = Arena::new(8192);
+        let root = arena.add(MctsNode::new(board, 0, 1.0, None));
+        SingleMcts { arena, root, pending: Vec::new() }
+    }
+
+    fn select(&mut self) -> Option<usize> {
+        let mut idx = self.root;
+        loop {
+            let node = self.arena.get(idx);
+            if node.is_terminal { return None; }
+            if !node.is_expanded { return Some(idx); }
+            if node.children.is_empty() { return None; }
+            let sqrt_n = (self.arena.get(idx).visits + self.arena.get(idx).virtual_loss).max(1) as f32;
+            let sqrt_n = sqrt_n.sqrt();
+            let mut best = f32::NEG_INFINITY;
+            let mut best_ci = self.arena.get(idx).children[0];
+            for &ci in &self.arena.get(idx).children.clone() {
+                let c = self.arena.get(ci);
+                let score = c.q() + C_PUCT_V * c.prior * sqrt_n / (1 + c.visits + c.virtual_loss) as f32;
+                if score > best { best = score; best_ci = ci; }
+            }
+            idx = best_ci;
+        }
+    }
+
+    fn apply_vloss(&mut self, mut idx: usize, delta: i32) {
+        loop {
+            let n = self.arena.get_mut(idx);
+            n.virtual_loss = if delta < 0 { (n.virtual_loss + delta).max(0) } else { n.virtual_loss + delta };
+            match n.parent { Some(p) => idx = p, None => break }
+        }
+    }
+
+    fn expand(&mut self, idx: usize, policy: &[f32], add_noise: bool, rng: &mut u64) {
+        let legal = self.arena.get(idx).board.gen_legal();
+        if legal.is_empty() {
+            self.arena.get_mut(idx).is_terminal = true;
+            self.arena.get_mut(idx).is_expanded = true;
+            return;
+        }
+        let n = legal.len();
+        let mut priors: Vec<f32> = legal.iter().map(|&(f, t, p)| {
+            let pi = Board::move_to_idx(f, t, p);
+            if pi < policy.len() { policy[pi] } else { 1e-8 }
+        }).collect();
+        let sum: f32 = priors.iter().sum();
+        if sum <= 1e-12 { priors.iter_mut().for_each(|x| *x = 1.0/n as f32); }
+        else { priors.iter_mut().for_each(|x| *x /= sum); }
+        if add_noise {
+            let noise = dirichlet_noise(DIRICHLET_ALPHA_V, n, rng);
+            for (p, &nd) in priors.iter_mut().zip(noise.iter()) {
+                *p = (1.0 - DIRICHLET_EPS_V as f32) * *p + DIRICHLET_EPS_V as f32 * nd as f32;
+            }
+        }
+        let mut child_ids = Vec::with_capacity(n);
+        for (i, &(f, t, p)) in legal.iter().enumerate() {
+            let mut cb = self.arena.get(idx).board.clone();
+            cb.apply_move(f, t, p);
+            let m = (f << 10) | (t << 3) | p.map(|pr| pr as u32 + 1).unwrap_or(0);
+            let ci = self.arena.add(MctsNode::new(cb, m, priors[i], Some(idx)));
+            child_ids.push(ci);
+        }
+        self.arena.get_mut(idx).children = child_ids;
+        self.arena.get_mut(idx).is_expanded = true;
+    }
+
+    fn backup(&mut self, mut idx: usize, value: f32) {
+        let mut sign = 1.0f32;
+        loop {
+            let n = self.arena.get_mut(idx);
+            n.visits += 1;
+            n.value_sum += value * sign;
+            n.virtual_loss = (n.virtual_loss - VIRTUAL_LOSS_V).max(0);
+            sign *= -1.0;
+            match n.parent { Some(p) => idx = p, None => break }
+        }
+    }
+
+    fn collect_leaves(&mut self, parallel: usize, rng: &mut u64) -> Vec<Vec<f32>> {
+        self.pending.clear();
+        let mut tensors = Vec::new();
+        for _ in 0..parallel {
+            if let Some(leaf) = self.select() {
+                if self.arena.get(leaf).is_terminal { continue; }
+                self.apply_vloss(leaf, VIRTUAL_LOSS_V);
+                tensors.push(self.arena.get(leaf).board.to_tensor());
+                self.pending.push(leaf);
+            }
+        }
+        tensors
+    }
+
+    fn apply_inference(&mut self, policies: &[Vec<f32>], values: &[f32], rng: &mut u64) {
+        let pending = std::mem::take(&mut self.pending);
+        for (i, leaf) in pending.into_iter().enumerate() {
+            if i >= policies.len() { break; }
+            self.apply_vloss(leaf, -VIRTUAL_LOSS_V);
+            let is_root = leaf == self.root;
+            if !self.arena.get(leaf).is_expanded {
+                self.expand(leaf, &policies[i], is_root, rng);
+            }
+            let side = self.arena.get(leaf).board.side;
+            let v = if side == 0 { values[i] } else { -values[i] };
+            self.backup(leaf, v);
+        }
+    }
+
+    fn get_policy(&self) -> Vec<f32> {
+        let root = self.arena.get(self.root);
+        let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
+        let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
+        if total > 0 {
+            for &ci in &root.children {
+                let c = self.arena.get(ci);
+                let m = c.move_from_parent;
+                let f = (m >> 10) & 0x7F;
+                let t = (m >> 3) & 0x7F;
+                let pv = m & 0b111;
+                let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                let idx = Board::move_to_idx(f, t, p);
+                if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
+            }
+        }
+        pol
+    }
+
+    fn is_over(&mut self) -> bool {
+        if self.arena.get(self.root).board.halfmove_clock >= 100 { return true; }
+        let legal = self.arena.get(self.root).board.gen_legal();
+        legal.is_empty()
+    }
+
+    fn root_value(&self) -> f32 {
+        let r = self.arena.get(self.root);
+        if r.visits > 0 { r.value_sum / r.visits as f32 } else { 0.0 }
+    }
+
+    fn make_move(&mut self, m_int: u32) {
+        // Находим ребёнка с этим ходом и делаем его новым корнем (tree reuse)
+        let children = self.arena.get(self.root).children.clone();
+        for ci in children {
+            if self.arena.get(ci).move_from_parent == m_int {
+                self.arena.get_mut(ci).parent = None;
+                self.root = ci;
+                return;
+            }
+        }
+        // Ход не найден в дереве — применяем к доске напрямую
+        let pv = m_int & 0b111;
+        let t = (m_int >> 3) & 0x7F;
+        let f = (m_int >> 10) & 0x7F;
+        let p = if pv == 0 { None } else { Some((pv-1) as usize) };
+        let mut new_board = self.arena.get(self.root).board.clone();
+        new_board.apply_move(f, t, p);
+        let new_root = self.arena.add(MctsNode::new(new_board, m_int, 1.0, None));
+        self.root = new_root;
+    }
+}
+
+/// RustMCTS — батчевый MCTS для N игр одновременно.
+/// Python управляет только GPU inference, всё остальное в Rust.
+#[pyclass]
+pub struct RustMCTS {
+    games: Vec<SingleMcts>,
+    parallel_sims: usize,
+    rng: u64,
+    leaf_game_map: Vec<usize>,
+    leaf_counts: Vec<usize>,
+}
+
+#[pymethods]
+impl RustMCTS {
+    #[new]
+    pub fn new(engines: Vec<PyRef<CapablancaEngine>>, parallel_sims: usize) -> Self {
+        let games = engines.iter().map(|e| SingleMcts::new(e.board.clone())).collect();
+        RustMCTS { games, parallel_sims, rng: 0xdeadbeefcafe1234u64,
+            leaf_game_map: Vec::new(), leaf_counts: Vec::new() }
+    }
+
+    /// Собирает листья для inference.
+    /// Возвращает 2D NumPy массив формы (N, 1600) — прямой доступ к памяти, без Python float объектов.
+    pub fn collect_leaves<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+        self.leaf_game_map.clear();
+        self.leaf_counts = vec![0; self.games.len()];
+        let mut flat: Vec<f32> = Vec::new();
+        let mut total = 0usize;
+
+        for (g, game) in self.games.iter_mut().enumerate() {
+            if game.is_over() { continue; }
+            let tensors = game.collect_leaves(self.parallel_sims, &mut self.rng);
+            self.leaf_counts[g] = tensors.len();
+            for _ in &tensors { self.leaf_game_map.push(g); }
+            total += tensors.len();
+            for t in tensors { flat.extend_from_slice(&t); }
+        }
+
+        let cols = 1600usize; // 20 * 8 * 10
+        if total == 0 {
+            // Возвращаем пустой массив (0, 1600) — Python проверит shape[0] == 0
+            Array2::<f32>::zeros((0, cols)).into_pyarray(py).into()
+        } else {
+            Array2::from_shape_vec((total, cols), flat)
+            .expect("collect_leaves: shape mismatch")
+            .into_pyarray(py)
+            .into()
+        }
+    }
+
+    /// Применяет результаты GPU inference к деревьям.
+    /// Принимает NumPy массивы напрямую — нулевой overhead на сериализацию.
+    /// policies: shape (N, 7000) f32
+    /// values:   shape (N,)      f32
+    pub fn apply_inference(
+        &mut self,
+        policies: PyReadonlyArray2<f32>,
+        values: PyReadonlyArray1<f32>,
+    ) {
+        let pol = policies.as_array();
+        let val = values.as_slice().expect("values must be contiguous");
+
+        let mut offset = 0;
+        for (g, &count) in self.leaf_counts.iter().enumerate() {
+            if count == 0 { continue; }
+            // Нарезаем строки матрицы в Vec<Vec<f32>> для SingleMcts::apply_inference
+            // Это единственное копирование, но оно происходит внутри Rust — без PyO3 overhead
+            let pol_slice: Vec<Vec<f32>> = (offset..offset + count)
+            .map(|i| pol.row(i).to_vec())
+            .collect();
+            let rng = &mut self.rng;
+            self.games[g].apply_inference(&pol_slice, &val[offset..offset + count], rng);
+            offset += count;
+        }
+    }
+
+    /// Финальные policy-векторы из visit counts.
+    pub fn get_policies(&self) -> Vec<Vec<f32>> {
+        self.games.iter().map(|g| g.get_policy()).collect()
+    }
+
+    /// Value оценки корней.
+    pub fn get_values(&self) -> Vec<f32> {
+        self.games.iter().map(|g| g.root_value()).collect()
+    }
+
+    /// Статус завершения игр.
+    pub fn games_over(&mut self) -> Vec<bool> {
+        self.games.iter_mut().map(|g| g.is_over()).collect()
+    }
+
+    /// Применяет ход к конкретной игре (для tree reuse).
+    pub fn make_move(&mut self, game_idx: usize, m_int: u32) {
+        if game_idx < self.games.len() {
+            self.games[game_idx].make_move(m_int);
+        }
+    }
+
+    pub fn num_games(&self) -> usize { self.games.len() }
+    pub fn last_batch_size(&self) -> usize { self.leaf_game_map.len() }
 }
