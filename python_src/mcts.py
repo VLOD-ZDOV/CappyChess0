@@ -99,7 +99,7 @@ class UltraFastMCTS:
 
     def _search_rust(self, engines: List, simulations: int) -> List[np.ndarray]:
         rust_mcts = _RustMCTS(engines, PARALLEL_SIMS)
-        steps = max(1, simulations // PARALLEL_SIMS)
+        steps = max(1, (simulations + PARALLEL_SIMS - 1) // PARALLEL_SIMS)  # FIX: ceiling div — было 192 вместо 200
 
         for _ in range(steps):
             # collect_leaves() теперь возвращает numpy array (N, 1600) — нулевая сериализация
@@ -136,7 +136,7 @@ class UltraFastMCTS:
             self._expand_node_py(roots[i], engines[i], policies[i],
                                  add_noise=self.add_dirichlet)
 
-        steps = max(1, simulations // PARALLEL_SIMS)
+        steps = max(1, (simulations + PARALLEL_SIMS - 1) // PARALLEL_SIMS)  # FIX: ceiling div — было 192 вместо 200
         for _ in range(steps):
             all_tensors, all_meta = [], []
             for g in range(num_games):

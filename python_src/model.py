@@ -123,6 +123,21 @@ class CapablancaNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        # FIX: policy head — маленький gain → почти равномерный softmax на старте
+        policy_linear = list(self.policy_head.children())[-1]
+        if isinstance(policy_linear, nn.Linear):
+            nn.init.xavier_uniform_(policy_linear.weight, gain=0.01)
+            nn.init.zeros_(policy_linear.bias)
+
+        # FIX: value head финальный Linear (перед Tanh).
+        # Без этого случайные веса → выходы Tanh насыщаются ≈ ±1.
+        # MCTS с первой симуляции ловит +1.0 и перестаёт исследовать.
+        # gain=0.01 → value на старте ≈ N(0, 0.01) → Tanh ≈ 0 → честный PUCT.
+        value_linear = list(self.value_head.children())[-2]  # Linear перед Tanh
+        if isinstance(value_linear, nn.Linear):
+            nn.init.xavier_uniform_(value_linear.weight, gain=0.01)
+            nn.init.zeros_(value_linear.bias)
+
     def forward(self, x: torch.Tensor):
         """
         Args:
