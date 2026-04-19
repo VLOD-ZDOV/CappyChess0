@@ -65,8 +65,8 @@ fn king_attacks(sq: u32) -> BB {
     ((b << 10) | (b >> 10) | ((b << 1) & not_a) | ((b >> 1) & not_j) | ((b << 11) & not_a) | ((b << 9) & not_j) | ((b >> 9) & not_a) | ((b >> 11) & not_j)) & BOARD_MASK
 }
 
-fn white_pawn_attacks(pawns: BB) -> BB { ((pawns << 11) & not_file_a()) | ((pawns << 9) & not_file_j()) }
-fn black_pawn_attacks(pawns: BB) -> BB { ((pawns >> 9) & not_file_a()) | ((pawns >> 11) & not_file_j()) }
+fn white_pawn_attacks(pawns: BB) -> BB { ((pawns & not_file_j()) << 11) | ((pawns & not_file_a()) << 9) } // FIX: pre-shift маски
+fn black_pawn_attacks(pawns: BB) -> BB { ((pawns & not_file_j()) >> 9) | ((pawns & not_file_a()) >> 11) } // FIX: pre-shift маски
 
 const PAWN: usize = 0; const KNIGHT: usize = 1; const BISHOP: usize = 2; const ROOK: usize = 3;
 const QUEEN: usize = 4; const ARCH: usize = 5; const CHANC: usize = 6; const KING: usize = 7;
@@ -122,8 +122,8 @@ impl Board {
         if us == 0 {
             let push1 = (pawns << 10) & empty;
             let push2 = ((pawns & rank_mask(1)) << 10 & empty) << 10 & empty;
-            let cap_r = (pawns << 11) & not_file_a() & their_pieces;
-            let cap_l = (pawns << 9) & not_file_j() & their_pieces;
+            let cap_r = ((pawns & not_file_j()) << 11) & their_pieces; // FIX: pre-shift маска
+            let cap_l = ((pawns & not_file_a()) << 9)  & their_pieces; // FIX: pre-shift маска
             for to in bb_iter(push1) { add_pawn_move(to - 10, to, us, &mut moves); }
             for to in bb_iter(push2) { moves.push((to - 20, to, None)); }
             // FIX: split loops — объединение через OR теряет ходы когда две пешки бьют одно поле
@@ -136,8 +136,8 @@ impl Board {
         } else {
             let push1 = (pawns >> 10) & empty;
             let push2 = ((pawns & rank_mask(6)) >> 10 & empty) >> 10 & empty;
-            let cap_r = (pawns >> 9) & not_file_a() & their_pieces;
-            let cap_l = (pawns >> 11) & not_file_j() & their_pieces;
+            let cap_r = ((pawns & not_file_j()) >> 9)  & their_pieces; // FIX: pre-shift маска
+            let cap_l = ((pawns & not_file_a()) >> 11) & their_pieces; // FIX: pre-shift маска
             for to in bb_iter(push1) { add_pawn_move(to + 10, to, us, &mut moves); }
             for to in bb_iter(push2) { moves.push((to + 20, to, None)); }
             // FIX: split loops — объединение через OR теряет ходы когда две пешки бьют одно поле
@@ -389,7 +389,7 @@ const POLICY_SIZE_MCTS: usize = 7000;
 const VIRTUAL_LOSS_V: i32 = 3;
 const C_PUCT_V: f32 = 1.25;
 const DIRICHLET_ALPHA_V: f64 = 0.3;
-const DIRICHLET_EPS_V: f64 = 0.25;
+const DIRICHLET_EPS_V: f64 = 0.35; // FIX: повышено с 0.25 — больше исследования на старте
 
 struct MctsNode {
     board: Board,
@@ -432,11 +432,14 @@ fn xorshift64(s: &mut u64) -> f64 {
     (*s as f64) / (u64::MAX as f64)
 }
 
-fn dirichlet_noise(alpha: f64, n: usize, rng: &mut u64) -> Vec<f64> {
-    let d = alpha - 1.0/3.0;
-    let c = 1.0 / (9.0 * d).sqrt();
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
+// FIX: оригинальный Marsaglia-Tsang работает только при alpha >= 1/3.
+// При alpha=0.3: d = 0.3 - 1/3 = -0.033 → sqrt(9*d) = sqrt(-0.3) = NaN.
+// NaN-приоритеты → select() всегда выбирал children[0] → entropy=0, top1=1.
+// Исправление: sample_gamma с редукцией Gamma(a) = Gamma(a+1) * U^(1/a) для a < 1.
+fn sample_gamma(alpha: f64, rng: &mut u64) -> f64 {
+    if alpha >= 1.0 {
+        let d = alpha - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
         loop {
             let u1 = xorshift64(rng).max(1e-15);
             let u2 = xorshift64(rng);
@@ -444,10 +447,19 @@ fn dirichlet_noise(alpha: f64, n: usize, rng: &mut u64) -> Vec<f64> {
             let v = (1.0 + c * x).powi(3);
             if v <= 0.0 { continue; }
             let u = xorshift64(rng);
-            if u < 1.0 - 0.0331 * x.powi(4) { out.push(d * v); break; }
-            if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) { out.push(d * v); break; }
+            if u < 1.0 - 0.0331 * x.powi(4) { return d * v; }
+            if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) { return d * v; }
         }
+    } else {
+        // Gamma(alpha) = Gamma(alpha+1) * U^(1/alpha), корректно для любого alpha > 0
+        let g = sample_gamma(alpha + 1.0, rng);
+        let u = xorshift64(rng).max(1e-15);
+        g * u.powf(1.0 / alpha)
     }
+}
+
+fn dirichlet_noise(alpha: f64, n: usize, rng: &mut u64) -> Vec<f64> {
+    let mut out: Vec<f64> = (0..n).map(|_| sample_gamma(alpha, rng)).collect();
     let sum: f64 = out.iter().sum();
     if sum > 0.0 { out.iter_mut().for_each(|x| *x /= sum); }
     out
@@ -480,7 +492,7 @@ impl SingleMcts {
             for &ci in &self.arena.get(idx).children.clone() {
                 let c = self.arena.get(ci);
                 let score = c.q() + C_PUCT_V * c.prior * sqrt_n / (1 + c.visits + c.virtual_loss) as f32;
-                if score > best { best = score; best_ci = ci; }
+                if !score.is_nan() && score > best { best = score; best_ci = ci; } // FIX: NaN guard
             }
             idx = best_ci;
         }
