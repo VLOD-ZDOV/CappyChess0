@@ -53,6 +53,7 @@ class Config:
     games_per_iter: int = 128
     max_game_length: int = 150
     mcts_batch: int = 128
+    mcts_parallel_sims: int = 32  # листьев за шаг MCTS (больше = реже round-trip Python↔GPU)
 
     # Тренировка
     batch_size: int = 512
@@ -182,7 +183,7 @@ def print_diversity(stats: dict, prefix: str = "  Diversity"):
 # ── Self-play ─────────────────────────────────────────────────────────────────
 
 def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sample]:
-    mcts = UltraFastMCTS(net, device, cfg.c_puct, batch_size=cfg.mcts_batch)
+    mcts = UltraFastMCTS(net, device, cfg.c_puct, batch_size=cfg.mcts_batch, parallel_sims=cfg.mcts_parallel_sims)
     all_samples: List[Sample] = []
 
     batch_sz = cfg.mcts_batch
@@ -374,7 +375,7 @@ def train(cfg: Config = None):
     print(f"🚀 Тренировка на {device}")
     print(f"   Модель:        {cfg.num_channels}ch × {cfg.num_res_blocks} blocks")
     print(f"   Self-play:     {cfg.games_per_iter} игр/итер, {cfg.simulations} симуляций/ход")
-    print(f"   MCTS batch:    {cfg.mcts_batch}")
+    print(f"   MCTS batch:    {cfg.mcts_batch}  parallel_sims={cfg.mcts_parallel_sims}")
     print(f"   Train batch:   {cfg.batch_size} × до {cfg.train_steps} шагов (≤1 эпохи буфера)")
     print(f"   LR:            {cfg.learning_rate:.2e}  weight_decay={cfg.weight_decay}")
     print(f"   Precision:     BF16 + TF32\n")
@@ -542,6 +543,8 @@ if __name__ == "__main__":
     parser.add_argument("--simulations",         type=int,   default=80)
     parser.add_argument("--games",               type=int,   default=128)
     parser.add_argument("--mcts-batch",          type=int,   default=128)
+    parser.add_argument("--mcts-parallel-sims", type=int, default=32,
+                        help="Листьев за шаг MCTS. Больше = меньше round-trips GPU.")
     parser.add_argument("--batch-size",          type=int,   default=512)
     parser.add_argument("--train-steps",         type=int,   default=200)
     parser.add_argument("--min-train-steps",     type=int,   default=20)
@@ -571,6 +574,7 @@ if __name__ == "__main__":
         simulations=args.simulations,
         games_per_iter=args.games,
         mcts_batch=args.mcts_batch,
+        mcts_parallel_sims=args.mcts_parallel_sims,
         batch_size=args.batch_size,
         train_steps=args.train_steps,
         min_train_steps=args.min_train_steps,

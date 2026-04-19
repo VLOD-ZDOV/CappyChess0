@@ -1,21 +1,11 @@
 # mcts.py — Python-обёртка над RustMCTS
 #
-# Всё дерево MCTS теперь живёт в Rust (lib.rs → RustMCTS).
-# Python отвечает только за:
-#   1. Батчевый GPU inference (нейросеть)
-#   2. Управление циклом симуляций
-#   3. Совместимость с train.py / eval.py / gui.py
-#
-# Что ускорилось по сравнению со старым Python MCTS:
-#   - engine.copy() × 100к → 0  (позиция хранится прямо в узле дерева)
-#   - make_move_int() × 800к → 0  (ходы применяются при expansion в Rust)
-#   - best_child Python-цикл × 18М итераций → 0  (UCB в Rust)
-#   - Нет GIL-contention, нет dict overhead для children
-#
-# ОПТИМИЗАЦИЯ (numpy bottleneck fix):
-#   - collect_leaves() теперь возвращает numpy array (N, 1600) вместо List[List[float]]
-#   - apply_inference() теперь принимает numpy arrays вместо List[List[float]]
-#   - Убраны все .tolist() — экономия ~28М Python float объектов за шаг
+# ОПТИМИЗАЦИИ v2:
+#   - _infer теперь принимает np.ndarray (N,1600) напрямую — убран list comprehension
+#   - PARALLEL_SIMS поднят до 32: меньше round-trips Python↔Rust↔GPU за игру
+#   - _infer: убран промежуточный np.stack (leaf_matrix уже готовая матрица)
+#   - cuda.synchronize убран — non_blocking=True + autocast достаточно
+#   - pinned memory переиспользуется без лишних копий
 
 import numpy as np
 import torch
@@ -30,7 +20,7 @@ except ImportError:
 
 POLICY_SIZE   = 7000
 VIRTUAL_LOSS  = 3
-PARALLEL_SIMS = 16   # увеличено с 8: Rust без overhead'а справляется с большим батчем
+PARALLEL_SIMS = 32   # было 16: больше листьев за шаг → меньше round-trips → GPU загружен плотнее
 
 
 class MCTSNode:
@@ -51,18 +41,21 @@ class MCTSNode:
 class UltraFastMCTS:
     """
     Батчевый MCTS. Дерево живёт в Rust, Python — только GPU inference.
-    Интерфейс не изменился: train.py / eval.py / gui.py работают без правок.
     """
 
     def __init__(self, net: torch.nn.Module, device: torch.device,
                  c_puct: float = 1.25, batch_size: int = 256,
-                 add_dirichlet: bool = True):
+                 add_dirichlet: bool = True, parallel_sims: int = None):
         self.net = net
         self.device = device
         self.c_puct = c_puct
         self.batch_size = batch_size
         self.add_dirichlet = add_dirichlet
+        # Если передан parallel_sims — переопределяем глобальный PARALLEL_SIMS для этого объекта
+        self._parallel_sims = parallel_sims if parallel_sims is not None else PARALLEL_SIMS
 
+        # Pinned memory под максимальный батч:
+        # 256 игр × 32 PARALLEL_SIMS = 8192 листьев максимум
         MAX_LEAVES = 8192
         self.pinned_buf = torch.empty(MAX_LEAVES, 20, 8, 10,
                                       pin_memory=True, dtype=torch.float32)
@@ -70,19 +63,30 @@ class UltraFastMCTS:
         self.net.eval()
 
     @torch.no_grad()
-    def _infer(self, tensors: List[np.ndarray]):
-        """Батчевый GPU inference. tensors: список (1600,) float32."""
-        n = len(tensors)
+    def _infer(self, tensors):
+        """
+        Батчевый GPU inference.
+        tensors: np.ndarray (N, 1600) из Rust,
+                 ИЛИ List[np.ndarray (1600,)] из gui.py / python fallback.
+        Оба формата поддерживаются.
+        """
+        # Нормализуем: list → matrix
+        if isinstance(tensors, list):
+            if len(tensors) == 0:
+                return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty((0,), dtype=np.float32)
+            tensors = np.stack(tensors, axis=0).reshape(len(tensors), 1600)
+
+        n = tensors.shape[0]
         if n == 0:
             return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty((0,), dtype=np.float32)
 
-        arr = np.stack(tensors, axis=0).reshape(n, 20, 8, 10)
+        arr = tensors.reshape(n, 20, 8, 10)
         if n <= self.pinned_size:
             buf = self.pinned_buf[:n]
             buf.copy_(torch.from_numpy(arr))
             x = buf.to(self.device, non_blocking=True)
         else:
-            x = torch.from_numpy(arr).to(self.device)
+            x = torch.from_numpy(arr.copy()).to(self.device, non_blocking=True)
 
         x = x.to(memory_format=torch.channels_last)
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -98,23 +102,19 @@ class UltraFastMCTS:
         return self._search_python(engines, simulations)
 
     def _search_rust(self, engines: List, simulations: int) -> List[np.ndarray]:
-        rust_mcts = _RustMCTS(engines, PARALLEL_SIMS)
-        steps = max(1, (simulations + PARALLEL_SIMS - 1) // PARALLEL_SIMS)  # FIX: ceiling div — было 192 вместо 200
+        rust_mcts = _RustMCTS(engines, self._parallel_sims)
+        steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
 
         for _ in range(steps):
-            # collect_leaves() теперь возвращает numpy array (N, 1600) — нулевая сериализация
-            leaf_matrix = rust_mcts.collect_leaves()  # np.ndarray shape (N, 1600)
+            # collect_leaves() возвращает np.ndarray (N, 1600) — нулевая сериализация
+            leaf_matrix = rust_mcts.collect_leaves()
 
             if leaf_matrix.shape[0] == 0:
                 continue
 
-            # Передаём строки матрицы в _infer как список 1D массивов
-            leaf_list = [leaf_matrix[i] for i in range(leaf_matrix.shape[0])]
-            policies_np, values_np = self._infer(leaf_list)
+            # FIX: передаём матрицу напрямую — убран list comprehension и np.stack
+            policies_np, values_np = self._infer(leaf_matrix)
 
-            # Передаём numpy arrays напрямую в Rust — никаких .tolist(), никаких Python float объектов
-            # policies_np: (N, 7000) float32 contiguous C-order
-            # values_np:   (N,)      float32 contiguous
             rust_mcts.apply_inference(
                 np.ascontiguousarray(policies_np, dtype=np.float32),
                 np.ascontiguousarray(values_np,   dtype=np.float32),
@@ -130,13 +130,15 @@ class UltraFastMCTS:
         import math
         num_games = len(engines)
         roots = [MCTSNode(None, -1, 1.0) for _ in range(num_games)]
-        root_tensors = [np.array(e.get_board_tensor(), dtype=np.float32) for e in engines]
+        root_tensors = np.stack([
+            np.array(e.get_board_tensor(), dtype=np.float32) for e in engines
+        ]).reshape(num_games, 1600)
         policies, _ = self._infer(root_tensors)
         for i in range(num_games):
             self._expand_node_py(roots[i], engines[i], policies[i],
                                  add_noise=self.add_dirichlet)
 
-        steps = max(1, (simulations + PARALLEL_SIMS - 1) // PARALLEL_SIMS)  # FIX: ceiling div — было 192 вместо 200
+        steps = max(1, (simulations + PARALLEL_SIMS - 1) // PARALLEL_SIMS)
         for _ in range(steps):
             all_tensors, all_meta = [], []
             for g in range(num_games):
@@ -156,7 +158,8 @@ class UltraFastMCTS:
                     all_meta.append((g, node, stack))
                     self._vloss_py(node, VIRTUAL_LOSS)
             if not all_tensors: continue
-            pols, vals = self._infer(all_tensors)
+            tensor_matrix = np.stack(all_tensors).reshape(len(all_tensors), 1600)
+            pols, vals = self._infer(tensor_matrix)
             for i, (g, node, stack) in enumerate(all_meta):
                 sim = engines[g].copy()
                 for m in stack: sim.make_move_int(m)
@@ -220,7 +223,6 @@ class UltraFastMCTS:
         while cur:
             cur.visits += 1; cur.value_sum += value * sign; sign *= -1.0; cur = cur.parent
 
-    # gui.py использует эти имена напрямую
     def _select(self, root): return self._select_py(root)
     def _expand_node(self, node, engine, policy_vec, add_noise=False):
         return self._expand_node_py(node, engine, policy_vec, add_noise)

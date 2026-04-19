@@ -5,7 +5,7 @@ import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
                              QListWidget, QSpinBox, QButtonGroup, QRadioButton,
-                             QGroupBox)
+                             QGroupBox, QDialog, QDialogButtonBox)
 from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QPolygonF
 from PyQt5.QtCore import Qt, QRect, QPointF, QThread, pyqtSignal
 
@@ -26,11 +26,42 @@ PIECE_CHARS = {
 }
 
 
+# Rust: PAWN=0,KNIGHT=1,BISHOP=2,ROOK=3,QUEEN=4,ARCH=5,CHANC=6
+# p_val = piece_index + 1  →  KNIGHT→2, BISHOP→3, ROOK→4, QUEEN→5, ARCH→6, CHANC→7
+_PROMO_FROM_VAL = [None, None, 'n', 'b', 'r', 'q', 'a', 'c']
+_PROMO_TO_VAL   = {'n': 2, 'b': 3, 'r': 4, 'q': 5, 'a': 6, 'c': 7}
+_PROMO_NAMES    = {'n': 'Конь', 'b': 'Слон', 'r': 'Ладья', 'q': 'Ферзь', 'a': 'Архиепископ', 'c': 'Канцлер'}
+
+class PromotionDialog(QDialog):
+    """Диалог выбора фигуры при превращении пешки."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Превращение пешки")
+        self.chosen = 'q'  # по умолчанию ферзь
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Выберите фигуру:"))
+
+        btn_layout = QHBoxLayout()
+        # Все возможные превращения в Капабланке
+        for piece_char, name in [('q','Ферзь ♕'), ('r','Ладья ♖'),
+                                   ('b','Слон ♗'), ('n','Конь ♘'),
+                                   ('a','Архиепископ A'), ('c','Канцлер C')]:
+            btn = QPushButton(name)
+            btn.setMinimumWidth(110)
+            btn.clicked.connect(lambda checked, c=piece_char: self._pick(c))
+            btn_layout.addWidget(btn)
+        layout.addLayout(btn_layout)
+
+    def _pick(self, piece_char):
+        self.chosen = piece_char
+        self.accept()
+
+
 def decode_move(m_int):
     p_val = m_int & 0b111
     to_sq = (m_int >> 3) & 0x7F
     from_sq = (m_int >> 10) & 0x7F
-    promo = ['q', 'r', 'b', 'n', 'a', 'c'][p_val - 1] if p_val > 0 else None
+    promo = _PROMO_FROM_VAL[p_val] if 0 < p_val < len(_PROMO_FROM_VAL) else None
     return from_sq, to_sq, promo
 
 
@@ -284,18 +315,37 @@ class BoardWidget(QWidget):
             return
 
         if self.selected_sq is not None:
-            for m in self.legal_moves:
-                f, t, _ = decode_move(m)
-                if f == self.selected_sq and t == sq:
-                    # Ход человека — останавливаем расчёт, применяем ход
-                    self.main_window.stop_thinking()
-                    self.engine.make_move_int(m)
-                    self.legal_moves = self.engine.get_legal_moves_int()
-                    self.selected_sq = None
-                    self.top_moves_data = []          # сбрасываем стрелки
-                    self.main_window.add_move(m)
-                    self.update()
-                    return
+            # Собираем все ходы из выбранной клетки в целевую
+            matching = [m for m in self.legal_moves
+                        if decode_move(m)[0] == self.selected_sq
+                        and decode_move(m)[1] == sq]
+
+            if matching:
+                self.main_window.stop_thinking()
+
+                # Если несколько ходов с одинаковыми from/to — это промоции
+                if len(matching) > 1:
+                    dlg = PromotionDialog(self)
+                    if dlg.exec_() != QDialog.Accepted:
+                        self.selected_sq = None
+                        self.update()
+                        return
+                    chosen_promo = dlg.chosen
+                    # Ищем ход с выбранной промоцией
+                    move = next(
+                        (m for m in matching if decode_move(m)[2] == chosen_promo),
+                        matching[0]
+                    )
+                else:
+                    move = matching[0]
+
+                self.engine.make_move_int(move)
+                self.legal_moves = self.engine.get_legal_moves_int()
+                self.selected_sq = None
+                self.top_moves_data = []
+                self.main_window.add_move(move)
+                self.update()
+                return
 
         self.selected_sq = sq
         self.update()
@@ -356,6 +406,11 @@ class CapablancaGUI(QMainWindow):
         self.btn_think.setStyleSheet("font-weight: bold; font-size: 13px;")
         sidebar.addWidget(self.btn_think)
 
+        btn_new = QPushButton("🆕 Новая партия")
+        btn_new.clicked.connect(self.new_game)
+        btn_new.setStyleSheet("color: #c0392b; font-weight: bold;")
+        sidebar.addWidget(btn_new)
+
         btn_flip = QPushButton("Перевернуть доску")
         btn_flip.clicked.connect(self.flip_board)
         sidebar.addWidget(btn_flip)
@@ -372,6 +427,19 @@ class CapablancaGUI(QMainWindow):
         sidebar.addStretch()
         layout.addLayout(sidebar, 2)
         self.setCentralWidget(main)
+
+    def new_game(self):
+        """Сбрасывает доску и историю ходов."""
+        self.stop_thinking()
+        self.move_history = []
+        self.board_widget.engine = CapablancaEngine()
+        self.board_widget.legal_moves = self.board_widget.engine.get_legal_moves_int()
+        self.board_widget.selected_sq = None
+        self.board_widget.top_moves_data = []
+        self.board_widget.update()
+        self.move_list.clear()
+        self.status.setText("Новая партия. Загрузите модель чтобы начать анализ." if not self.net
+                            else "Новая партия. Нажмите ▶ для анализа.")
 
     def flip_board(self):
         self.board_widget.flipped = not self.board_widget.flipped
