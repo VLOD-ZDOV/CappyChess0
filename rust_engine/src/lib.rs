@@ -161,19 +161,38 @@ impl Board {
     }
 
     fn gen_castling(&self, moves: &mut Vec<(u32, u32, Option<usize>)>) {
+        // Рокировка в шахматах Капабланки (10×8):
+        //   Королевский фланг: король f(5)→i(8) +3 клетки, ладья j(9)→h(7)
+        //     - пусты: g(6), h(7), i(8)
+        //     - король не проходит через шах: g(6), h(7), i(8)
+        //   Ферзевый фланг: король f(5)→c(2) -3 клетки, ладья a(0)→d(3)
+        //     - пусты: b(1), c(2), d(3), e(4)
+        //     - король не проходит через шах: e(4), d(3), c(2)
         let us = self.side; let occ = self.occupancy(); let opp_att = self.attacks_by(1 - us);
         let back_rank = if us == 0 { 0u32 } else { 7u32 };
-        let king_sq = back_rank * 10 + 5;
-        if self.pieces[us][KING] & (1u128 << king_sq) == 0 || (opp_att & (1u128 << king_sq) != 0) { return; }
+        let b = back_rank * 10;
+        let king_sq = b + 5;
+        if self.pieces[us][KING] & (1u128 << king_sq) == 0 { return; }
+        if opp_att & (1u128 << king_sq) != 0 { return; }
+
+        // ── Королевский фланг: король f(5)→i(8), ладья j(9)→h(7) ──────────
         if self.castling & (1 << (us * 2)) != 0 {
-            let sq6 = 1u128 << (back_rank * 10 + 6); let sq7 = 1u128 << (back_rank * 10 + 7);
-            let sq8 = 1u128 << (back_rank * 10 + 8); // FIX: поле i тоже должно быть пустым (ладья встаёт туда)
-            if occ & (sq6 | sq7 | sq8) == 0 && (self.pieces[us][ROOK] & (1u128 << (back_rank * 10 + 9)) != 0) && (opp_att & (sq6 | sq7) == 0) { moves.push((king_sq, back_rank * 10 + 7, None)); }
+            let must_empty = (1u128 << (b+6)) | (1u128 << (b+7)) | (1u128 << (b+8));
+            let king_path  = (1u128 << (b+6)) | (1u128 << (b+7)) | (1u128 << (b+8));
+            let rook_ok = self.pieces[us][ROOK] & (1u128 << (b+9)) != 0;
+            if occ & must_empty == 0 && rook_ok && opp_att & king_path == 0 {
+                moves.push((king_sq, b + 8, None));
+            }
         }
+
+        // ── Ферзевый фланг: король f(5)→c(2), ладья a(0)→d(3) ─────────────
         if self.castling & (1 << (us * 2 + 1)) != 0 {
-            let clear = (1u128 << (back_rank * 10 + 1)) | (1u128 << (back_rank * 10 + 2)) | (1u128 << (back_rank * 10 + 3)) | (1u128 << (back_rank * 10 + 4));
-            let pass = (1u128 << (back_rank * 10 + 3)) | (1u128 << (back_rank * 10 + 4));
-            if occ & clear == 0 && (self.pieces[us][ROOK] & (1u128 << (back_rank * 10 + 0)) != 0) && (opp_att & pass == 0) { moves.push((king_sq, back_rank * 10 + 3, None)); }
+            let must_empty = (1u128 << (b+1)) | (1u128 << (b+2)) | (1u128 << (b+3)) | (1u128 << (b+4));
+            let king_path  = (1u128 << (b+4)) | (1u128 << (b+3)) | (1u128 << (b+2));
+            let rook_ok = self.pieces[us][ROOK] & (1u128 << (b+0)) != 0;
+            if occ & must_empty == 0 && rook_ok && opp_att & king_path == 0 {
+                moves.push((king_sq, b + 2, None));
+            }
         }
     }
 
@@ -200,10 +219,18 @@ impl Board {
             if to / 10 == promo_rank { self.pieces[us][PAWN] &= !to_bb; self.pieces[us][promo.unwrap_or(QUEEN)] |= to_bb; }
         }
         if moving_piece == KING {
-            let back = if us == 0 { 0 } else { 70 };
+            let back = if us == 0 { 0u32 } else { 70u32 };
             if from == back + 5 {
-                if to == back + 7 { self.pieces[us][ROOK] &= !(1u128 << (back + 9)); self.pieces[us][ROOK] |= 1u128 << (back + 8); }
-                else if to == back + 3 { self.pieces[us][ROOK] &= !(1u128 << back); self.pieces[us][ROOK] |= 1u128 << (back + 4); }
+                // Королевский фланг: король f(5)→i(8), ладья j(9)→h(7)
+                if to == back + 8 {
+                    self.pieces[us][ROOK] &= !(1u128 << (back + 9));
+                    self.pieces[us][ROOK] |=   1u128 << (back + 7);
+                }
+                // Ферзевый фланг: король f(5)→c(2), ладья a(0)→d(3)
+                else if to == back + 2 {
+                    self.pieces[us][ROOK] &= !(1u128 << (back + 0));
+                    self.pieces[us][ROOK] |=   1u128 << (back + 3);
+                }
             }
             self.castling &= !(3 << (us * 2));
         }
