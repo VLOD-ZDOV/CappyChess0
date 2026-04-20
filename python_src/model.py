@@ -89,11 +89,11 @@ class CapablancaNet(nn.Module):
         # ── Policy head ──────────────────────────────────────────────────────
         # Outputs POLICY_SIZE logits (7000)
         self.policy_head = nn.Sequential(
-            nn.Conv2d(num_channels, 32, kernel_size=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(num_channels, 64, kernel_size=1, bias=False),  # FIX: 32→64, убираем bottleneck
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Flatten(),
-            nn.Linear(32 * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
+            nn.Linear(64 * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
         )
 
         # ── Value head ───────────────────────────────────────────────────────
@@ -123,17 +123,15 @@ class CapablancaNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # FIX: policy head — маленький gain → почти равномерный softmax на старте
+        # Policy head финальный Linear: gain=0.01 → почти равномерный softmax на старте
+        # Это только для свежей сети — на уже обученных весах не влияет
         policy_linear = list(self.policy_head.children())[-1]
         if isinstance(policy_linear, nn.Linear):
             nn.init.xavier_uniform_(policy_linear.weight, gain=0.01)
             nn.init.zeros_(policy_linear.bias)
 
-        # FIX: value head финальный Linear (перед Tanh).
-        # Без этого случайные веса → выходы Tanh насыщаются ≈ ±1.
-        # MCTS с первой симуляции ловит +1.0 и перестаёт исследовать.
-        # gain=0.01 → value на старте ≈ N(0, 0.01) → Tanh ≈ 0 → честный PUCT.
-        value_linear = list(self.value_head.children())[-2]  # Linear перед Tanh
+        # Value head финальный Linear (перед Tanh): gain=0.01 → value≈0 на старте
+        value_linear = list(self.value_head.children())[-2]
         if isinstance(value_linear, nn.Linear):
             nn.init.xavier_uniform_(value_linear.weight, gain=0.01)
             nn.init.zeros_(value_linear.bias)
@@ -143,7 +141,7 @@ class CapablancaNet(nn.Module):
         Args:
             x: (batch, 20, 8, 10) float tensor
         Returns:
-            policy_logits: (batch, 6720)  — raw logits (use CrossEntropy in training)
+            policy_logits: (batch, 7000)  — raw logits (use CrossEntropy in training)
             value:         (batch, 1)     — in [-1, 1]
         """
         x = self.input_conv(x)

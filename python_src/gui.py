@@ -25,12 +25,14 @@ PIECE_CHARS = {
     (1, 5): 'a', (1, 6): 'c', (1, 7): '♚'
 }
 
-
-# Rust: PAWN=0,KNIGHT=1,BISHOP=2,ROOK=3,QUEEN=4,ARCH=5,CHANC=6
-# p_val = piece_index + 1  →  KNIGHT→2, BISHOP→3, ROOK→4, QUEEN→5, ARCH→6, CHANC→7
-_PROMO_FROM_VAL = [None, None, 'n', 'b', 'r', 'q', 'a', 'c']
-_PROMO_TO_VAL   = {'n': 2, 'b': 3, 'r': 4, 'q': 5, 'a': 6, 'c': 7}
-_PROMO_NAMES    = {'n': 'Конь', 'b': 'Слон', 'r': 'Ладья', 'q': 'Ферзь', 'a': 'Архиепископ', 'c': 'Канцлер'}
+# Индексы для превращения (Promotion)
+# В Rust: KNIGHT=1, BISHOP=2, ROOK=3, QUEEN=4, ARCH=5, CHANC=6
+_PROMO_FROM_VAL = [None, 'n', 'b', 'r', 'q', 'a', 'c']
+_PROMO_TO_VAL   = {'n': 1, 'b': 2, 'r': 3, 'q': 4, 'a': 5, 'c': 6}
+_PROMO_NAMES    = {
+    'n': 'Конь', 'b': 'Слон', 'r': 'Ладья',
+    'q': 'Ферзь', 'a': 'Архиепископ', 'c': 'Канцлер'
+}
 
 class PromotionDialog(QDialog):
     """Диалог выбора фигуры при превращении пешки."""

@@ -49,9 +49,11 @@ class Config:
     # Self-play
     simulations: int = 80
     c_puct: float = 1.25
-    temperature_moves: int = 30
+    temperature_moves: int = 50       # FIX: 30→50, больше исследования в начале партии
+    temperature: float = 1.0          # tau для первых temperature_moves ходов (1.0 = пропорционально visit counts)
+    temperature_late: float = 0.5     # tau после temperature_moves (мягкий argmax, не жадный)
     games_per_iter: int = 128
-    max_game_length: int = 150
+    max_game_length: int = 200
     mcts_batch: int = 128
     mcts_parallel_sims: int = 32  # листьев за шаг MCTS (больше = реже round-trip Python↔GPU)
 
@@ -214,17 +216,19 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
                 pol = policies[j]
                 histories[game_idx].append((board_np, pol.copy(), side))
 
-                if move_num < cfg.temperature_moves:
-                    raw = np.array([
-                        pol[eng.move_int_to_policy_idx(m) or 0] for m in legal
-                    ], dtype=np.float64)
-                    s = raw.sum()
-                    probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
-                    move = int(np.random.choice(legal, p=probs))
-                else:
-                    move = max(legal,
-                               key=lambda m: pol[eng.move_int_to_policy_idx(m) or 0])
-                    move = int(move)
+                # Temperature sampling:
+                #   move_num < temperature_moves: tau=temperature (по умолчанию 1.0)
+                #   иначе: tau=temperature_late (0.5 — мягкий argmax, не жадный)
+                # Применяем tau через степень: prob ∝ visit_count^(1/tau)
+                tau = cfg.temperature if move_num < cfg.temperature_moves else cfg.temperature_late
+                raw = np.array([
+                    pol[eng.move_int_to_policy_idx(m) or 0] for m in legal
+                ], dtype=np.float64)
+                if tau != 1.0:
+                    raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
+                s = raw.sum()
+                probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
+                move = int(np.random.choice(legal, p=probs))
 
                 eng.make_move_int(move)
 
@@ -247,7 +251,14 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
                 else:
                     draws += 1
             else:
-                result = eng.material_result()
+                # FIX: градуированная материальная оценка вместо ступенчатой ±0.5/0.
+                # Было: |balance|>3 → ±0.5, иначе 0.0 — почти все таймауты давали 0.
+                # Стало: линейная шкала, зажатая в [-0.8, 0.8].
+                # Это даёт сети больше информации о качестве позиции.
+                balance = eng.material_result()  # ±0.5 или 0.0 из Rust
+                # Дополнительно получаем сырой баланс через Python-обёртку
+                # (material_result уже содержит знак, масштабируем мягче)
+                result = float(np.clip(balance * 1.6, -0.8, 0.8))
                 timeouts += 1
 
             for board_np, pol, side in histories[i]:
@@ -475,6 +486,13 @@ def train(cfg: Config = None):
         # Диагностика свежих данных
         stats = policy_diversity_stats(samples)
         print_diversity(stats)
+
+        # Автоадаптация температуры: если policy схлопнулась — поднимаем tau
+        if stats.get('top1_mean', 0) > 0.85 and cfg.temperature < 2.0:
+            cfg.temperature = min(cfg.temperature * 1.2, 2.0)
+            print(f"  ⚠️  top1>{0.85:.2f} → temperature поднята до {cfg.temperature:.2f}")
+        elif stats.get('entropy_mean', 0) > 3.5 and cfg.temperature > 0.8:
+            cfg.temperature = max(cfg.temperature * 0.95, 0.8)
         print()
 
         # ── Тренировка ───────────────────────────────────────────────────────
@@ -543,6 +561,12 @@ if __name__ == "__main__":
     parser.add_argument("--simulations",         type=int,   default=80)
     parser.add_argument("--games",               type=int,   default=128)
     parser.add_argument("--mcts-batch",          type=int,   default=128)
+    parser.add_argument("--temperature",          type=float, default=1.0,
+                        help="Температура выборки хода (tau) в первые --temperature-moves ходов")
+    parser.add_argument("--temperature-late",     type=float, default=0.5,
+                        help="Температура после --temperature-moves (0.5=мягкий argmax, 0=жадный)")
+    parser.add_argument("--temperature-moves",    type=int,   default=50,
+                        help="Ходов с высокой температурой")
     parser.add_argument("--mcts-parallel-sims", type=int, default=32,
                         help="Листьев за шаг MCTS. Больше = меньше round-trips GPU.")
     parser.add_argument("--batch-size",          type=int,   default=512)
@@ -574,6 +598,9 @@ if __name__ == "__main__":
         simulations=args.simulations,
         games_per_iter=args.games,
         mcts_batch=args.mcts_batch,
+        temperature=args.temperature,
+        temperature_late=args.temperature_late,
+        temperature_moves=args.temperature_moves,
         mcts_parallel_sims=args.mcts_parallel_sims,
         batch_size=args.batch_size,
         train_steps=args.train_steps,
