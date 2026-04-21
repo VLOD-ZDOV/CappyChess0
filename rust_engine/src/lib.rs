@@ -1,7 +1,6 @@
 // src/lib.rs — Capablanca Chess Engine (10x8 board)
 use pyo3::prelude::*;
-use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray};
-use ndarray::Array2;
+use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray, PyUntypedArrayMethods};use ndarray::Array2;
 
 type BB = u128;
 const BOARD_MASK: BB = (1u128 << 80) - 1;
@@ -325,7 +324,7 @@ fn bb_iter(mut bb: BB) -> impl Iterator<Item = u32> {
 //   get_legal_moves_int() → gen_legal()
 //   (внутри MCTS copy + expand) → gen_legal()
 // Кэш сбрасывается только при make_move_int().
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct CapablancaEngine {
     board: Board,
@@ -418,31 +417,40 @@ const C_PUCT_V: f32 = 1.25;
 const DIRICHLET_ALPHA_V: f64 = 0.3;
 const DIRICHLET_EPS_V: f64 = 0.35; // FIX: повышено с 0.25 — больше исследования на старте
 
+// MctsNode без Board — как в lc0.
+// Board хранится только в SingleMcts.root_board.
+// Позиция восстанавливается при expand/collect_leaves проходом от корня.
+// Размер: ~60 байт вместо ~300 байт → 8192 узлов = 480KB (влезает в L2).
 struct MctsNode {
-    board: Board,
-    move_from_parent: u32,
+    move_from_parent: u32,  // ход которым пришли в этот узел
     prior: f32,
     visits: i32,
-    value_sum: f32,
+    wl: f32,               // running average Q (lc0: FinalizeScoreUpdate)
     virtual_loss: i32,
     children: Vec<usize>,
     is_expanded: bool,
     is_terminal: bool,
+    side: u8,              // чья очередь хода в этом узле (0=белые, 1=чёрные)
     parent: Option<usize>,
 }
 
 impl MctsNode {
-    fn new(board: Board, move_from_parent: u32, prior: f32, parent: Option<usize>) -> Self {
+    fn new(move_from_parent: u32, prior: f32, side: u8, parent: Option<usize>) -> Self {
         MctsNode {
-            board, move_from_parent, prior,
-            visits: 0, value_sum: 0.0, virtual_loss: 0,
+            move_from_parent, prior, side,
+            visits: 0, wl: 0.0, virtual_loss: 0,
             children: Vec::new(),
             is_expanded: false, is_terminal: false, parent,
         }
     }
     fn q(&self) -> f32 {
-        let d = self.visits + self.virtual_loss;
-        if d > 0 { self.value_sum / d as f32 } else { 0.0 }
+        if self.virtual_loss > 0 {
+            let total = self.visits + self.virtual_loss;
+            if total > 0 { (self.wl * self.visits as f32 - self.virtual_loss as f32) / total as f32 }
+            else { 0.0 }
+        } else {
+            self.wl
+        }
     }
 }
 
@@ -495,14 +503,45 @@ fn dirichlet_noise(alpha: f64, n: usize, rng: &mut u64) -> Vec<f64> {
 struct SingleMcts {
     arena: Arena,
     root: usize,
+    root_board: Board,     // Board только в корне — позиция восстанавливается по пути
     pending: Vec<usize>,   // индексы листьев ожидающих inference
+    pending_boards: Vec<Board>, // доски для pending листьев (нужны для side и expand)
 }
 
 impl SingleMcts {
     fn new(board: Board) -> Self {
+        let side = board.side as u8;
         let mut arena = Arena::new(8192);
-        let root = arena.add(MctsNode::new(board, 0, 1.0, None));
-        SingleMcts { arena, root, pending: Vec::new() }
+        let root = arena.add(MctsNode::new(0, 1.0, side, None));
+        SingleMcts { arena, root, root_board: board, pending: Vec::new(), pending_boards: Vec::new() }
+    }
+
+    // Восстанавливает Board для узла idx, проходя путь от корня.
+    // O(depth) — обычно 10-30 ходов, быстро.
+    fn board_at(&self, idx: usize) -> Board {
+        // Собираем путь от узла до корня
+        let mut path = Vec::new();
+        let mut cur = idx;
+        while cur != self.root {
+            let node = self.arena.get(cur);
+            path.push(node.move_from_parent);
+            match node.parent {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        // Применяем ходы от корня вниз
+        let mut board = self.root_board.clone();
+        for &m in path.iter().rev() {
+            if m != 0 {
+                let pv = m & 0b111;
+                let t  = (m >> 3) & 0x7F;
+                let f  = (m >> 10) & 0x7F;
+                let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                board.apply_move(f, t, p);
+            }
+        }
+        board
     }
 
     fn select(&mut self) -> Option<usize> {
@@ -512,14 +551,31 @@ impl SingleMcts {
             if node.is_terminal { return None; }
             if !node.is_expanded { return Some(idx); }
             if node.children.is_empty() { return None; }
-            let sqrt_n = (self.arena.get(idx).visits + self.arena.get(idx).virtual_loss).max(1) as f32;
-            let sqrt_n = sqrt_n.sqrt();
+
+            let parent_visits = (self.arena.get(idx).visits + self.arena.get(idx).virtual_loss).max(1);
+            let sqrt_n = (parent_visits as f32).sqrt();
+
+            // FIX: динамический CPUCT из lc0 (CPuctBase=19652, CPuctInit=C_PUCT_V).
+            // При малом N ≈ C_PUCT_V, при большом N растёт логарифмически.
+            // Это делает поиск шире при многих симуляциях.
+            const CPUCT_BASE: f32 = 19652.0;
+            let cpuct = C_PUCT_V + ((parent_visits as f32 + CPUCT_BASE) / CPUCT_BASE).ln();
+
+            // FPU (First Play Urgency): непосещённый узел получает оценку
+            // parent_q - fpu_reduction, а не 0. Иначе движок тратит симуляции
+            // на явно плохие ходы только потому что у них visits=0.
+            let parent_q = self.arena.get(idx).q();
+            const FPU_REDUCTION: f32 = 0.1;
+            let fpu = parent_q - FPU_REDUCTION;
+
             let mut best = f32::NEG_INFINITY;
             let mut best_ci = self.arena.get(idx).children[0];
             for &ci in &self.arena.get(idx).children.clone() {
                 let c = self.arena.get(ci);
-                let score = c.q() + C_PUCT_V * c.prior * sqrt_n / (1 + c.visits + c.virtual_loss) as f32;
-                if !score.is_nan() && score > best { best = score; best_ci = ci; } // FIX: NaN guard
+                // FPU: если узел не посещён — используем fpu вместо c.q()
+                let q_val = if c.visits > 0 { c.q() } else { fpu };
+                let score = q_val + cpuct * c.prior * sqrt_n / (1 + c.visits + c.virtual_loss) as f32;
+                if !score.is_nan() && score > best { best = score; best_ci = ci; }
             }
             idx = best_ci;
         }
@@ -533,8 +589,9 @@ impl SingleMcts {
         }
     }
 
-    fn expand(&mut self, idx: usize, policy: &[f32], add_noise: bool, rng: &mut u64) {
-        let legal = self.arena.get(idx).board.gen_legal();
+    // board передаётся снаружи (уже восстановлен через board_at или хранится в pending_boards)
+    fn expand(&mut self, idx: usize, board: &Board, policy: &[f32], add_noise: bool, rng: &mut u64) {
+        let legal = board.gen_legal();
         if legal.is_empty() {
             self.arena.get_mut(idx).is_terminal = true;
             self.arena.get_mut(idx).is_expanded = true;
@@ -549,17 +606,19 @@ impl SingleMcts {
         if sum <= 1e-12 { priors.iter_mut().for_each(|x| *x = 1.0/n as f32); }
         else { priors.iter_mut().for_each(|x| *x /= sum); }
         if add_noise {
-            let noise = dirichlet_noise(DIRICHLET_ALPHA_V, n, rng);
+            let dynamic_alpha = (10.0_f64 / n as f64).max(0.1);
+            let noise = dirichlet_noise(dynamic_alpha, n, rng);
             for (p, &nd) in priors.iter_mut().zip(noise.iter()) {
                 *p = (1.0 - DIRICHLET_EPS_V as f32) * *p + DIRICHLET_EPS_V as f32 * nd as f32;
             }
         }
+        // Дочерние узлы: храним только ход и prior — Board не нужен
+        let parent_side = board.side;
+        let child_side = (1 - parent_side) as u8;
         let mut child_ids = Vec::with_capacity(n);
         for (i, &(f, t, p)) in legal.iter().enumerate() {
-            let mut cb = self.arena.get(idx).board.clone();
-            cb.apply_move(f, t, p);
             let m = (f << 10) | (t << 3) | p.map(|pr| pr as u32 + 1).unwrap_or(0);
-            let ci = self.arena.add(MctsNode::new(cb, m, priors[i], Some(idx)));
+            let ci = self.arena.add(MctsNode::new(m, priors[i], child_side, Some(idx)));
             child_ids.push(ci);
         }
         self.arena.get_mut(idx).children = child_ids;
@@ -567,25 +626,52 @@ impl SingleMcts {
     }
 
     fn backup(&mut self, mut idx: usize, value: f32) {
+        // Running average как в lc0 FinalizeScoreUpdate:
+        //   wl += (v - wl) / (n + 1)
+        // Убирает деление при каждом q() — теперь q() просто возвращает wl.
         let mut sign = 1.0f32;
         loop {
             let n = self.arena.get_mut(idx);
             n.visits += 1;
-            n.value_sum += value * sign;
+            n.wl += (value * sign - n.wl) / n.visits as f32;
             n.virtual_loss = (n.virtual_loss - VIRTUAL_LOSS_V).max(0);
             sign *= -1.0;
             match n.parent { Some(p) => idx = p, None => break }
         }
     }
 
-    fn collect_leaves(&mut self, parallel: usize, rng: &mut u64) -> Vec<Vec<f32>> {
+    // Early stopping — если лучший ход математически не может быть догнан
+    // вторым за оставшиеся симуляции, пропускаем игру.
+    // ВАЖНО: срабатывает только если корень уже раскрыт И набрал достаточно визитов.
+    // Без проверки root.visits дерево пропускалось ДО первой симуляции → нулевые policy.
+    fn best_move_is_decided(&self, sims_remaining: i32) -> bool {
+        let root = self.arena.get(self.root);
+        // Не трогаем нераскрытые деревья и деревья с менее чем 2 детьми
+        if !root.is_expanded || root.children.len() < 2 { return false; }
+        // Нужен минимальный порог визитов чтобы статистика была значимой
+        if root.visits < 10 { return false; }
+        let mut best = 0i32;
+        let mut second = 0i32;
+        for &ci in &root.children {
+            let v = self.arena.get(ci).visits;
+            if v > best { second = best; best = v; }
+            else if v > second { second = v; }
+        }
+        second + sims_remaining < best
+    }
+
+    fn collect_leaves(&mut self, parallel: usize, _rng: &mut u64) -> Vec<Vec<f32>> {
         self.pending.clear();
+        self.pending_boards.clear();
         let mut tensors = Vec::new();
         for _ in 0..parallel {
             if let Some(leaf) = self.select() {
                 if self.arena.get(leaf).is_terminal { continue; }
                 self.apply_vloss(leaf, VIRTUAL_LOSS_V);
-                tensors.push(self.arena.get(leaf).board.to_tensor());
+                // Восстанавливаем позицию проходом от корня — O(depth)
+                let board = self.board_at(leaf);
+                tensors.push(board.to_tensor());
+                self.pending_boards.push(board);
                 self.pending.push(leaf);
             }
         }
@@ -594,69 +680,123 @@ impl SingleMcts {
 
     fn apply_inference(&mut self, policies: &[Vec<f32>], values: &[f32], rng: &mut u64) {
         let pending = std::mem::take(&mut self.pending);
+        let boards  = std::mem::take(&mut self.pending_boards);
         for (i, leaf) in pending.into_iter().enumerate() {
             if i >= policies.len() { break; }
             self.apply_vloss(leaf, -VIRTUAL_LOSS_V);
             let is_root = leaf == self.root;
             if !self.arena.get(leaf).is_expanded {
-                self.expand(leaf, &policies[i], is_root, rng);
+                if let Some(board) = boards.get(i) {
+                    self.expand(leaf, board, &policies[i], is_root, rng);
+                }
             }
-            let side = self.arena.get(leaf).board.side;
+            let side = self.arena.get(leaf).side as usize;
             let v = if side == 0 { values[i] } else { -values[i] };
             self.backup(leaf, v);
         }
     }
 
-    fn get_policy(&self) -> Vec<f32> {
-        let root = self.arena.get(self.root);
-        let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
-        let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
-        if total > 0 {
-            for &ci in &root.children {
-                let c = self.arena.get(ci);
-                let m = c.move_from_parent;
-                let f = (m >> 10) & 0x7F;
-                let t = (m >> 3) & 0x7F;
-                let pv = m & 0b111;
-                let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
-                let idx = Board::move_to_idx(f, t, p);
-                if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
+    // Версия без Vec<Vec<f32>> — принимает плоский срез политик
+    fn apply_inference_flat(&mut self, pol_flat: &[f32], policy_size: usize,
+                            values: &[f32], rng: &mut u64) {
+        let pending = std::mem::take(&mut self.pending);
+        let boards  = std::mem::take(&mut self.pending_boards);
+        for (i, leaf) in pending.into_iter().enumerate() {
+            if i >= values.len() { break; }
+            self.apply_vloss(leaf, -VIRTUAL_LOSS_V);
+            let is_root = leaf == self.root;
+            if !self.arena.get(leaf).is_expanded {
+                let start = i * policy_size;
+                let end = start + policy_size;
+                if end <= pol_flat.len() {
+                    if let Some(board) = boards.get(i) {
+                        self.expand(leaf, board, &pol_flat[start..end], is_root, rng);
+                    }
+                }
             }
+            let side = self.arena.get(leaf).side as usize;
+            let v = if side == 0 { values[i] } else { -values[i] };
+            self.backup(leaf, v);
         }
-        pol
-    }
+                            }
 
-    fn is_over(&mut self) -> bool {
-        if self.arena.get(self.root).board.halfmove_clock >= 100 { return true; }
-        let legal = self.arena.get(self.root).board.gen_legal();
-        legal.is_empty()
-    }
+                            fn get_policy(&self) -> Vec<f32> {
+                                let root = self.arena.get(self.root);
+                                let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
+                                let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
+                                if total > 0 {
+                                    for &ci in &root.children {
+                                        let c = self.arena.get(ci);
+                                        let m = c.move_from_parent;
+                                        let f = (m >> 10) & 0x7F;
+                                        let t = (m >> 3) & 0x7F;
+                                        let pv = m & 0b111;
+                                        let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                                        let idx = Board::move_to_idx(f, t, p);
+                                        if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
+                                    }
+                                }
+                                pol
+                            }
 
-    fn root_value(&self) -> f32 {
-        let r = self.arena.get(self.root);
-        if r.visits > 0 { r.value_sum / r.visits as f32 } else { 0.0 }
-    }
+                            fn is_over(&mut self) -> bool {
+                                if self.root_board.halfmove_clock >= 100 { return true; }
+                                let legal = self.root_board.gen_legal();
+                                legal.is_empty()
+                            }
 
-    fn make_move(&mut self, m_int: u32) {
-        // Находим ребёнка с этим ходом и делаем его новым корнем (tree reuse)
-        let children = self.arena.get(self.root).children.clone();
-        for ci in children {
-            if self.arena.get(ci).move_from_parent == m_int {
-                self.arena.get_mut(ci).parent = None;
-                self.root = ci;
-                return;
-            }
-        }
-        // Ход не найден в дереве — применяем к доске напрямую
-        let pv = m_int & 0b111;
-        let t = (m_int >> 3) & 0x7F;
-        let f = (m_int >> 10) & 0x7F;
-        let p = if pv == 0 { None } else { Some((pv-1) as usize) };
-        let mut new_board = self.arena.get(self.root).board.clone();
-        new_board.apply_move(f, t, p);
-        let new_root = self.arena.add(MctsNode::new(new_board, m_int, 1.0, None));
-        self.root = new_root;
-    }
+                            fn root_value(&self) -> f32 {
+                                self.arena.get(self.root).wl
+                            }
+
+                            // Рекурсивно копирует поддерево из self.arena в new_arena (без Board).
+                            fn copy_subtree(&self, old_idx: usize, new_arena: &mut Arena, new_parent: Option<usize>) -> usize {
+                                let old_node = self.arena.get(old_idx);
+                                let mut new_node = MctsNode::new(
+                                    old_node.move_from_parent,
+                                    old_node.prior,
+                                    old_node.side,
+                                    new_parent,
+                                );
+                                new_node.visits      = old_node.visits;
+                                new_node.wl          = old_node.wl;
+                                new_node.is_expanded = old_node.is_expanded;
+                                new_node.is_terminal = old_node.is_terminal;
+                                let new_idx = new_arena.add(new_node);
+                                let children: Vec<usize> = old_node.children.clone();
+                                let mut new_children = Vec::with_capacity(children.len());
+                                for child_old in children {
+                                    new_children.push(self.copy_subtree(child_old, new_arena, Some(new_idx)));
+                                }
+                                new_arena.get_mut(new_idx).children = new_children;
+                                new_idx
+                            }
+
+                            fn make_move(&mut self, m_int: u32) {
+                                // Применяем ход к root_board
+                                let pv = m_int & 0b111;
+                                let t  = (m_int >> 3) & 0x7F;
+                                let f  = (m_int >> 10) & 0x7F;
+                                let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                                self.root_board.apply_move(f, t, p);
+                                let new_side = self.root_board.side as u8;
+
+                                let child_idx = self.arena.get(self.root).children.iter()
+                                .copied()
+                                .find(|&ci| self.arena.get(ci).move_from_parent == m_int);
+
+                                // Tree GC — копируем только нужное поддерево в новую арену.
+                                let mut new_arena = Arena::new(8192);
+                                self.root = if let Some(ci) = child_idx {
+                                    self.copy_subtree(ci, &mut new_arena, None)
+                                } else {
+                                    // Ход не был в дереве — создаём корень с нуля
+                                    new_arena.add(MctsNode::new(m_int, 1.0, new_side, None))
+                                };
+                                self.arena = new_arena;
+                                self.pending.clear();
+                                self.pending_boards.clear();
+                            }
 }
 
 /// RustMCTS — батчевый MCTS для N игр одновременно.
@@ -689,6 +829,9 @@ impl RustMCTS {
 
         for (g, game) in self.games.iter_mut().enumerate() {
             if game.is_over() { continue; }
+            // Early stopping: если позиция уже решена — не тратим симуляции
+            let sims_left = self.parallel_sims as i32;
+            if game.best_move_is_decided(sims_left) { continue; }
             let tensors = game.collect_leaves(self.parallel_sims, &mut self.rng);
             self.leaf_counts[g] = tensors.len();
             for _ in &tensors { self.leaf_game_map.push(g); }
@@ -717,19 +860,35 @@ impl RustMCTS {
         policies: PyReadonlyArray2<f32>,
         values: PyReadonlyArray1<f32>,
     ) {
-        let pol = policies.as_array();
-        let val = values.as_slice().expect("values must be contiguous");
+        let pol_flat = policies.as_slice().expect("policies must be C-contiguous");
+        let val     = values.as_slice().expect("values must be contiguous");
+
+        // Получаем policy_size из shape массива — надёжнее чем делить длины.
+        // policies.shape() = [N, policy_size], где N = число листьев этого батча.
+        let shape       = policies.shape();
+        let n_leaves    = shape[0];       // сколько листьев в ЭТОМ батче
+        let policy_size = shape[1];       // размер одной политики (7000)
+
+        // leaf_counts хранит разбивку листьев по играм ДЛЯ ЭТОГО батча.
+        // Суммируем чтобы убедиться что совпадает с n_leaves.
+        let total: usize = self.leaf_counts.iter().sum();
+        if total != n_leaves {
+            // Размер батча не совпадает с leaf_counts — пропускаем безопасно.
+            // Это может случиться при двойной буферизации если батч был пустой.
+            return;
+        }
 
         let mut offset = 0;
         for (g, &count) in self.leaf_counts.iter().enumerate() {
             if count == 0 { continue; }
-            // Нарезаем строки матрицы в Vec<Vec<f32>> для SingleMcts::apply_inference
-            // Это единственное копирование, но оно происходит внутри Rust — без PyO3 overhead
-            let pol_slice: Vec<Vec<f32>> = (offset..offset + count)
-            .map(|i| pol.row(i).to_vec())
-            .collect();
             let rng = &mut self.rng;
-            self.games[g].apply_inference(&pol_slice, &val[offset..offset + count], rng);
+            let start = offset * policy_size;
+            let end   = (offset + count) * policy_size;
+            if end > pol_flat.len() { break; }  // защита от edge cases
+            self.games[g].apply_inference_flat(
+                &pol_flat[start..end], policy_size,
+                &val[offset..offset + count], rng,
+            );
             offset += count;
         }
     }
