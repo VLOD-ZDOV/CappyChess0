@@ -457,22 +457,33 @@ class CapablancaGUI(QMainWindow):
         if not path:
             return
         try:
-            ckpt = torch.load(path, map_location=self.device)
-            sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
-            sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
-                  for k, v in sd.items()}
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+            raw_sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
 
-            ch = sd.get("input_conv.net.0.weight",
-                        sd.get("input_block.0.weight")).shape[0]
-            bl = len([k for k in sd.keys()
-                      if "res_blocks" in k and "conv1.weight" in k])
+            # Убираем префиксы torch.compile / DataParallel
+            sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
+                  for k, v in raw_sd.items()}
+
+            # Фильтруем несовместимый value_head.6 (старый Linear(256,1) → новый Linear(256,3))
+            incompatible = [k for k in sd if k.startswith("value_head.6")]
+            for k in incompatible:
+                del sd[k]
+
+            # Определяем архитектуру из весов
+            stem = sd.get("input_conv.net.0.weight") or sd.get("input_block.0.weight")
+            ch = stem.shape[0]
+            bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
 
             self.net = CapablancaNet(num_channels=ch, num_res_blocks=bl)
-            self.net.load_state_dict(sd)
+            missing, unexpected = self.net.load_state_dict(sd, strict=False)
             self.net.to(self.device).eval()
 
-            self.status.setText(f"Готово: {ch}ch×{bl}bl | {self.device}")
+            skipped = f", пропущено: {incompatible}" if incompatible else ""
+            self.status.setText(f"Готово: {ch}ch×{bl}bl | {self.device}{skipped}")
             self.btn_think.setEnabled(True)
+            print(f"✅ Загружено: {ch}ch×{bl}bl, пропущено слоёв: {len(incompatible)}")
+            if missing:
+                print(f"   Инициализированы заново: {missing}")
         except Exception as e:
             self.status.setText(f"Ошибка: {e}")
             traceback.print_exc()

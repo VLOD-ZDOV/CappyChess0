@@ -53,7 +53,7 @@ class Config:
     temperature: float = 1.0          # tau для первых temperature_moves ходов (1.0 = пропорционально visit counts)
     temperature_late: float = 0.5     # tau после temperature_moves (мягкий argmax, не жадный)
     games_per_iter: int = 128
-    max_game_length: int = 200
+    max_game_length: int = 150
     mcts_batch: int = 128
     mcts_parallel_sims: int = 32  # листьев за шаг MCTS (больше = реже round-trip Python↔GPU)
 
@@ -216,16 +216,21 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
                 pol = policies[j]
                 histories[game_idx].append((board_np, pol.copy(), side))
 
-                # Temperature sampling:
-                #   move_num < temperature_moves: tau=temperature (по умолчанию 1.0)
-                #   иначе: tau=temperature_late (0.5 — мягкий argmax, не жадный)
-                # Применяем tau через степень: prob ∝ visit_count^(1/tau)
-                tau = cfg.temperature if move_num < cfg.temperature_moves else cfg.temperature_late
+                # Temperature sampling с плавным decay (как в lc0):
+                #   до temperature_moves:          tau = cfg.temperature (1.0)
+                #   следующие 20 ходов:            tau плавно падает 1.0 → temperature_late
+                #   после temperature_moves + 20:  tau = temperature_late (0.5)
+                if move_num < cfg.temperature_moves:
+                    tau = cfg.temperature
+                else:
+                    decay_steps = 20
+                    overstep = min(move_num - cfg.temperature_moves, decay_steps)
+                    tau = cfg.temperature - (overstep / decay_steps) * (cfg.temperature - cfg.temperature_late)
+
                 raw = np.array([
                     pol[eng.move_int_to_policy_idx(m) or 0] for m in legal
                 ], dtype=np.float64)
-                if tau != 1.0:
-                    raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
+                raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
                 s = raw.sum()
                 probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
                 move = int(np.random.choice(legal, p=probs))
@@ -275,20 +280,44 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
+def value_to_wdl(v: float) -> np.ndarray:
+    """
+    Конвертирует скалярный исход в мягкий WDL one-hot [Win, Draw, Loss].
+    |v| >= 0.7 → жёсткий исход (чистая победа/поражение).
+    0 < |v| < 0.7 → мягкий переход (материальная оценка / таймаут).
+    Мягкие метки дают лучший градиент чем hard one-hot.
+    """
+    wdl = np.zeros(3, dtype=np.float32)
+    if v >= 0.7:
+        wdl[0] = 1.0                        # Win
+    elif v <= -0.7:
+        wdl[2] = 1.0                        # Loss
+    elif v > 0.0:
+        w = v / 0.7
+        wdl[0] = w; wdl[1] = 1.0 - w       # Частично Win, частично Draw
+    elif v < 0.0:
+        l = (-v) / 0.7
+        wdl[2] = l; wdl[1] = 1.0 - l       # Частично Loss, частично Draw
+    else:
+        wdl[1] = 1.0                        # Draw
+    return wdl
+
+
 class SelfPlayDataset(torch.utils.data.Dataset):
     def __init__(self, samples: List[CompactSample]):
-        self.boards = np.stack([s[0].astype(np.float32) for s in samples]).reshape(-1, 20, 8, 10)
+        self.boards   = np.stack([s[0].astype(np.float32) for s in samples]).reshape(-1, 20, 8, 10)
         self.policies = np.stack([unpack_policy(s[1]) for s in samples])
-        self.values = np.array([s[2] for s in samples], dtype=np.float32)
+        # WDL: каждый скалярный value → soft one-hot [Win, Draw, Loss]
+        self.wdl = np.stack([value_to_wdl(float(s[2])) for s in samples])
 
     def __len__(self):
-        return len(self.values)
+        return len(self.wdl)
 
     def __getitem__(self, idx):
         return (
             torch.from_numpy(self.boards[idx]),
             torch.from_numpy(self.policies[idx]),
-            torch.tensor(self.values[idx]),
+            torch.from_numpy(self.wdl[idx]),   # (3,) float32
         )
 
 
@@ -330,18 +359,24 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
         boards = boards.to(device, non_blocking=True,
                            memory_format=torch.channels_last)
         policies = policies.to(device, non_blocking=True)
-        values = values.unsqueeze(1).to(device, non_blocking=True)
+        values = values.to(device, non_blocking=True)  # WDL: (batch, 3)
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, preds = net(boards)
-            logits = logits.float()
-            preds = preds.float()
+            logits, wdl_logits = net(boards)
+            logits     = logits.float()
+            wdl_logits = wdl_logits.float()
 
-            log_probs = F.log_softmax(logits, dim=1)
+            # Policy: cross-entropy с visit counts как мягкими метками
+            log_probs   = F.log_softmax(logits, dim=1)
             policy_loss = -(policies * log_probs).sum(dim=1).mean()
-            value_loss = F.mse_loss(preds, values)
+
+            # WDL: cross-entropy с soft one-hot [Win, Draw, Loss]
+            # Эквивалентно KL-divergence от target к предсказанию
+            log_wdl    = F.log_softmax(wdl_logits, dim=1)
+            value_loss = -(values * log_wdl).sum(dim=1).mean()
+
             loss = policy_loss + cfg.value_loss_weight * value_loss
 
         scaler.scale(loss).backward()
@@ -434,15 +469,44 @@ def train(cfg: Config = None):
         path = os.path.join(cfg.checkpoint_dir, ckpts[-1])
         ckpt = torch.load(path, map_location=device, weights_only=False)
 
+        raw_sd = ckpt["model"]
+        # Убираем префиксы torch.compile / DataParallel
+        raw_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
+                  for k, v in raw_sd.items()}
+
+        # Фильтруем слои несовместимые с WDL (старый Linear(256,1) → новый Linear(256,3))
+        # value_head.6.weight shape: старый (1,256), новый (3,256)
+        incompatible_keys = []
+        target_sd = net._orig_mod.state_dict() if hasattr(net, "_orig_mod") else net.state_dict()
+        for k, v in raw_sd.items():
+            if k in target_sd and v.shape != target_sd[k].shape:
+                incompatible_keys.append(k)
+        for k in incompatible_keys:
+            del raw_sd[k]
+
         if hasattr(net, "_orig_mod"):
-            net._orig_mod.load_state_dict(ckpt["model"])
+            missing, unexpected = net._orig_mod.load_state_dict(raw_sd, strict=False)
         else:
-            net.load_state_dict(ckpt["model"])
+            missing, unexpected = net.load_state_dict(raw_sd, strict=False)
 
-        optimizer.load_state_dict(ckpt["optimizer"])
+        if incompatible_keys:
+            print(f"✅ Веса загружены (слои {incompatible_keys} пропущены для адаптации)")
+        if missing:
+            print(f"   Инициализированы заново: {missing}")
 
-        # FIX: принудительно устанавливаем LR из аргументов — загруженный
-        # state_dict оптимайзера может содержать старый LR от предыдущего запуска
+        # Загружаем оптимайзер только если архитектура совместима полностью
+        # При несовместимости (WDL переход) — создаём оптимайзер с нуля,
+        # иначе dtype mismatch между старыми fp16 состояниями и новыми fp32 слоями
+        if not incompatible_keys and "optimizer" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                print("✅ Оптимайзер загружен из чекпоинта")
+            except Exception as e:
+                print(f"⚠️  Оптимайзер не загружен ({e}), начинаем заново")
+        else:
+            print("ℹ️  Оптимайзер инициализирован заново (несовместимая архитектура)")
+
+        # Принудительно устанавливаем LR
         for pg in optimizer.param_groups:
             pg['lr'] = cfg.learning_rate
 

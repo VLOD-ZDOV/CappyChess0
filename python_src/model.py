@@ -1,7 +1,7 @@
 # model.py — Neural network for Capablanca Chess (10×8 board)
 # Architecture: AlphaZero-style residual network
 # Input:  (batch, 20, 8, 10)  — 20 feature planes
-# Output: policy (batch, 6720), value (batch, 1)
+# Output: policy (batch, 7000), wdl (batch, 3)  — Win/Draw/Loss логиты
 
 import torch
 import torch.nn as nn
@@ -96,8 +96,12 @@ class CapablancaNet(nn.Module):
             nn.Linear(64 * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
         )
 
-        # ── Value head ───────────────────────────────────────────────────────
-        # Outputs scalar in [-1, 1]
+        # ── Value head (WDL) ─────────────────────────────────────────────────
+        # Outputs 3 логита: [Win, Draw, Loss].
+        # Ожидаемое значение Q = P(Win) - P(Loss) вычисляется в inference().
+        # WDL даёт лучший градиент чем скалярный Tanh:
+        #   - сеть явно учится различать "острая позиция" vs "мёртвая ничья"
+        #   - cross-entropy loss вместо MSE — стабильнее обучение
         self.value_head = nn.Sequential(
             nn.Conv2d(num_channels, 8, kernel_size=1, bias=False),
             nn.BatchNorm2d(8),
@@ -105,8 +109,7 @@ class CapablancaNet(nn.Module):
             nn.Flatten(),
             nn.Linear(8 * self.BOARD_H * self.BOARD_W, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 1),
-            nn.Tanh(),
+            nn.Linear(256, 3),   # [Win, Draw, Loss] логиты
         )
 
         self._init_weights()
@@ -130,8 +133,10 @@ class CapablancaNet(nn.Module):
             nn.init.xavier_uniform_(policy_linear.weight, gain=0.01)
             nn.init.zeros_(policy_linear.bias)
 
-        # Value head финальный Linear (перед Tanh): gain=0.01 → value≈0 на старте
-        value_linear = list(self.value_head.children())[-2]
+        # Value head финальный Linear (WDL, 3 выхода): gain=0.01 →
+        # логиты ≈ 0 на старте → softmax даёт [0.33, 0.33, 0.33]
+        # Сеть не предпочитает ни победу, ни поражение до обучения
+        value_linear = list(self.value_head.children())[-1]
         if isinstance(value_linear, nn.Linear):
             nn.init.xavier_uniform_(value_linear.weight, gain=0.01)
             nn.init.zeros_(value_linear.bias)
@@ -142,19 +147,21 @@ class CapablancaNet(nn.Module):
             x: (batch, 20, 8, 10) float tensor
         Returns:
             policy_logits: (batch, 7000)  — raw logits (use CrossEntropy in training)
-            value:         (batch, 1)     — in [-1, 1]
+            wdl_logits:    (batch, 3)     — [Win, Draw, Loss] сырые логиты
         """
         x = self.input_conv(x)
         for block in self.res_blocks:
             x = block(x)
 
-        policy = self.policy_head(x)  # raw logits
-        value  = self.value_head(x)
-        return policy, value
+        policy     = self.policy_head(x)   # (batch, 7000) сырые логиты
+        wdl_logits = self.value_head(x)    # (batch, 3) сырые логиты [W,D,L]
+        return policy, wdl_logits
 
     def inference(self, x: torch.Tensor):
         """
-        Like forward(), but returns softmax policy (for MCTS usage).
+        Для MCTS: возвращает softmax policy и скалярный Q = P(Win) - P(Loss).
         """
-        logits, value = self(x)
-        return F.softmax(logits, dim=1), value
+        logits, wdl_logits = self(x)
+        wdl = F.softmax(wdl_logits, dim=1)               # [P(W), P(D), P(L)]
+        q   = (wdl[:, 0] - wdl[:, 2]).unsqueeze(1)       # Q ∈ [-1, 1]
+        return F.softmax(logits, dim=1), q

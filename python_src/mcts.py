@@ -92,9 +92,30 @@ class UltraFastMCTS:
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             logits, values = self.net(x)
 
-        policies = torch.softmax(logits.float(), dim=1).cpu().numpy()
-        values   = values.float().view(-1).cpu().numpy()
-        return policies, values
+        logits_f = logits.float()
+        values_f = values.float()
+
+        # Проверка на NaN/inf — может возникнуть при несовместимости весов
+        if torch.isnan(logits_f).any() or torch.isinf(logits_f).any():
+            print(f"⚠️  _infer: NaN/inf в logits! Возвращаем равномерное распределение.")
+            logits_f = torch.zeros_like(logits_f)
+        if torch.isnan(values_f).any() or torch.isinf(values_f).any():
+            print(f"⚠️  _infer: NaN/inf в values! Возвращаем нули.")
+            values_f = torch.zeros_like(values_f)
+
+        policies = torch.softmax(logits_f, dim=1).cpu().numpy()
+
+        # WDL → Q: сеть возвращает (N,3) logits [Win,Draw,Loss]
+        # Q = P(Win) - P(Loss) ∈ [-1, 1] — скалярная оценка для MCTS backup
+        # Если values (N,1) — старая модель, конвертируем напрямую
+        if values_f.shape[-1] == 3:
+            wdl_probs = torch.softmax(values_f, dim=1)
+            q_values  = (wdl_probs[:, 0] - wdl_probs[:, 2]).cpu().numpy()
+        else:
+            # Совместимость со старыми скалярными чекпоинтами
+            q_values = values_f.view(-1).cpu().numpy()
+
+        return policies, q_values
 
     def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
         if RUST_MCTS_AVAILABLE:
@@ -105,20 +126,38 @@ class UltraFastMCTS:
         rust_mcts = _RustMCTS(engines, self._parallel_sims)
         steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
 
-        for _ in range(steps):
-            # collect_leaves() возвращает np.ndarray (N, 1600) — нулевая сериализация
-            leaf_matrix = rust_mcts.collect_leaves()
+        # Двойная буферизация (идея из lc0 SearchWorker):
+        # пока GPU обрабатывает батч t, Rust уже собирает батч t+1.
+        # Это перекрывает CPU (Rust) и GPU работу вместо последовательного ожидания.
+        #
+        # Схема:
+        #   шаг 0: collect(0) → infer_async(0)
+        #   шаг 1: collect(1) [параллельно с GPU] → apply(0) → infer_async(1)
+        #   шаг 2: collect(2) [параллельно с GPU] → apply(1) → infer_async(2)
+        #   ...финал: apply(last)
 
-            if leaf_matrix.shape[0] == 0:
-                continue
+        prev_policies = None
+        prev_values   = None
 
-            # FIX: передаём матрицу напрямую — убран list comprehension и np.stack
-            policies_np, values_np = self._infer(leaf_matrix)
+        for step in range(steps + 1):
+            # Собираем следующий батч (если ещё есть шаги)
+            if step < steps:
+                leaf_matrix = rust_mcts.collect_leaves()
+                has_leaves  = leaf_matrix.shape[0] > 0
+            else:
+                has_leaves = False
 
-            rust_mcts.apply_inference(
-                np.ascontiguousarray(policies_np, dtype=np.float32),
-                np.ascontiguousarray(values_np,   dtype=np.float32),
-            )
+            # Применяем результаты предыдущего inference (если есть)
+            if prev_policies is not None:
+                rust_mcts.apply_inference(prev_policies, prev_values)
+                prev_policies = None
+                prev_values   = None
+
+            # Запускаем inference для текущего батча
+            if has_leaves:
+                p, v = self._infer(leaf_matrix)
+                prev_policies = np.ascontiguousarray(p, dtype=np.float32)
+                prev_values   = np.ascontiguousarray(v, dtype=np.float32)
 
         raw = rust_mcts.get_policies()
         return [np.array(p, dtype=np.float32) for p in raw]
