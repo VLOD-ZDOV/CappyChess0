@@ -70,7 +70,7 @@ class CapablancaNet(nn.Module):
         num_res_blocks: Number of residual blocks   (10 is a solid baseline)
     """
 
-    INPUT_PLANES = 20   # 8 piece types × 2 colors + 4 meta planes
+    INPUT_PLANES = 20   # 16 piece planes + plane16(side) + plane17(castling×4zones) + plane18(halfmove) + plane19(repetition)
     BOARD_H = 8
     BOARD_W = 10
 
@@ -88,12 +88,15 @@ class CapablancaNet(nn.Module):
 
         # ── Policy head ──────────────────────────────────────────────────────
         # Outputs POLICY_SIZE logits (7000)
+        # Policy head: num_channels → POLICY_SIZE
+        # Используем num_channels (не фиксированные 64) чтобы голова масштабировалась
+        # с размером сети. При 128ch: 128*80=10240 → 7000. Лучше представление ходов.
         self.policy_head = nn.Sequential(
-            nn.Conv2d(num_channels, 64, kernel_size=1, bias=False),  # FIX: 32→64, убираем bottleneck
-            nn.BatchNorm2d(64),
+            nn.Conv2d(num_channels, num_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(num_channels),
             nn.ReLU(inplace=True),
             nn.Flatten(),
-            nn.Linear(64 * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
+            nn.Linear(num_channels * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
         )
 
         # ── Value head (WDL) ─────────────────────────────────────────────────

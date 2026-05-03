@@ -16,6 +16,7 @@
 import os
 import sys
 import time
+import datetime
 import argparse
 import itertools
 from collections import defaultdict
@@ -33,31 +34,86 @@ except ImportError:
     raise ImportError("capablanca_engine not found. Build with: maturin develop --release")
 
 
+# ── UCI / PGN helpers ─────────────────────────────────────────────────────────
+
+_PROMO_FROM_VAL = [None, None, 'n', 'b', 'r', 'q', 'a', 'c']
+
+def move_to_uci(m_int: int) -> str:
+    p_val   = m_int & 0b111
+    to_sq   = (m_int >> 3) & 0x7F
+    from_sq = (m_int >> 10) & 0x7F
+    def sq(s): return f"{chr(ord('a') + s % 10)}{s // 10 + 1}"
+    promo = _PROMO_FROM_VAL[p_val] if 0 < p_val < len(_PROMO_FROM_VAL) else None
+    return sq(from_sq) + sq(to_sq) + (promo or "")
+
+
+def save_pgn(moves: list, result_str: str, pgn_path: str,
+             white_name: str = "White", black_name: str = "Black"):
+    """Сохраняет партию в PGN файл (дописывает если файл существует)."""
+    os.makedirs(os.path.dirname(os.path.abspath(pgn_path)), exist_ok=True)
+    now = datetime.datetime.now().strftime("%Y.%m.%d")
+    uci = [move_to_uci(m) for m in moves]
+    body = ""
+    for i in range(0, len(uci), 2):
+        body += f"{i//2+1}. {uci[i]}"
+        if i + 1 < len(uci): body += f" {uci[i+1]}"
+        body += " "
+    with open(pgn_path, "a", encoding="utf-8") as f:
+        f.write(f'[Event "Capablanca Eval"]\n')
+        f.write(f'[Date "{now}"]\n')
+        f.write(f'[White "{white_name}"]\n')
+        f.write(f'[Black "{black_name}"]\n')
+        f.write(f'[Result "{result_str}"]\n')
+        f.write(f'[Variant "capablanca"]\n')
+        f.write(f'[FEN "rnabqkcbnr/pppppppppp/10/10/10/10/PPPPPPPPPP/RNABQKCBNR w KQkq - 0 1"]\n')
+        f.write(f'[SetUp "1"]\n\n')
+        f.write(body + result_str + "\n\n")
+
+
 # ── Загрузка модели ────────────────────────────────────────────────────────────
 
 def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
-    """Загружает чекпоинт, автоматически определяя архитектуру."""
-    ckpt = torch.load(path, map_location=device)
-    sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
-    # Убираем prefix от torch.compile / DataParallel
-    sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in sd.items()}
+    """
+    Загружает чекпоинт, автоматически определяя архитектуру.
+    Поддерживает старую (scalar value, policy=6880) и новую (WDL, policy=7000).
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    raw_sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
+    sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in raw_sd.items()}
 
-    ch = sd["input_conv.net.0.weight"].shape[0]
-    bl = len([k for k in sd if "res_blocks" in k and "conv1.weight" in k])
+    # Архитектура из весов
+    stem_key = next((k for k in sd if ("input_conv" in k or "input_block" in k)
+                     and k.endswith(".weight") and "bn" not in k and "bias" not in k), None)
+    ch = sd[stem_key].shape[0] if stem_key else 128
+    bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
 
     net = CapablancaNet(num_channels=ch, num_res_blocks=bl)
-    net.load_state_dict(sd)
+
+    # Фильтруем слои с несовместимой формой (scalar↔WDL переход)
+    target = net.state_dict()
+    skipped = [k for k in sd if k in target and sd[k].shape != target[k].shape]
+    for k in skipped: del sd[k]
+
+    net.load_state_dict(sd, strict=False)
     net.to(device).eval()
     net = net.to(memory_format=torch.channels_last)
 
-    # Короткое имя для вывода: "iter00025" или имя файла без расширения
+    # Определяем тип value head для информации
+    vkey = next((k for k in sd if "value_head" in k and k.endswith(".weight")
+                 and "6." in k), None)
+    arch_tag = ""
+    if vkey and vkey in sd:
+        arch_tag = " [WDL]" if sd[vkey].shape[0] == 3 else " [scalar]"
+    if skipped:
+        arch_tag += f" ⚠{len(skipped)}skip"
+
+    # Короткое имя: model_iter00025 → iter25
     name = os.path.splitext(os.path.basename(path))[0]
     if "iter" in name:
-        # model_iter00025 → iter25
         num = name.split("iter")[-1].lstrip("0") or "0"
         name = f"iter{num}"
 
-    return net, name
+    return net, name, arch_tag
 
 
 def collect_checkpoints(paths: List[str], last: int = 0) -> List[str]:
@@ -89,6 +145,10 @@ def play_batch(
     max_moves: int,
     temperature_moves: int,
     mcts_batch: int,
+    verbose: bool = False,
+    pgn_path: str = None,
+    white_name: str = "White",
+    black_name: str = "Black",
 ) -> List[float]:
     """
     Играет num_games партий: net_white — белые, net_black — чёрные.
@@ -104,6 +164,7 @@ def play_batch(
     active  = list(range(num_games))
     results = [None] * num_games
     move_counts = [0] * num_games
+    histories = [[] for _ in range(num_games)]  # для verbose и PGN
 
     while active:
         # Разбиваем активные игры по чьему ходу
@@ -115,8 +176,9 @@ def play_batch(
             w_engines = [engines[i] for i in white_games]
             w_policies = mcts_w.search_games(w_engines, simulations)
             for j, gi in enumerate(white_games):
-                _apply_policy_move(engines[gi], w_policies[j],
-                                   move_counts[gi], temperature_moves)
+                m = _apply_policy_move(engines[gi], w_policies[j],
+                                       move_counts[gi], temperature_moves)
+                if m is not None: histories[gi].append(m)
                 move_counts[gi] += 1
 
         # MCTS для чёрных
@@ -124,8 +186,9 @@ def play_batch(
             b_engines = [engines[i] for i in black_games]
             b_policies = mcts_b.search_games(b_engines, simulations)
             for j, gi in enumerate(black_games):
-                _apply_policy_move(engines[gi], b_policies[j],
-                                   move_counts[gi], temperature_moves)
+                m = _apply_policy_move(engines[gi], b_policies[j],
+                                       move_counts[gi], temperature_moves)
+                if m is not None: histories[gi].append(m)
                 move_counts[gi] += 1
 
         # Проверяем завершение
@@ -138,17 +201,29 @@ def play_batch(
                 results[gi] = eng.material_result()
             else:
                 new_active.append(gi)
+                continue
+            # Игра завершилась — verbose и PGN
+            r = results[gi]
+            if verbose and move_counts[gi] <= 10:
+                print(f"  Партия {gi+1}: {move_counts[gi]} ходов, "
+                      f"результат={'1-0' if r>0 else ('0-1' if r<0 else '½-½')}")
+                for mn, mv in enumerate(histories[gi][:10]):
+                    side = "Бел" if mn % 2 == 0 else "Чёрн"
+                    print(f"    {mn+1:2d}. {side}: {move_to_uci(mv)}")
+            if pgn_path is not None:
+                res_str = "1-0" if r > 0.5 else ("0-1" if r < -0.5 else "1/2-1/2")
+                save_pgn(histories[gi], res_str, pgn_path, white_name, black_name)
         active = new_active
 
     return results
 
 
 def _apply_policy_move(engine: CapablancaEngine, policy: np.ndarray,
-                        move_num: int, temperature_moves: int):
-    """Выбирает и применяет ход согласно policy."""
+                        move_num: int, temperature_moves: int) -> int:
+    """Выбирает и применяет ход согласно policy. Возвращает выбранный ход."""
     legal = engine.get_legal_moves_int()
     if not legal:
-        return
+        return None
 
     probs = np.array([
         policy[engine.move_int_to_policy_idx(m) or 0] for m in legal
@@ -166,6 +241,7 @@ def _apply_policy_move(engine: CapablancaEngine, policy: np.ndarray,
         move = int(legal[np.argmax(probs)])
 
     engine.make_move_int(move)
+    return move
 
 
 # ── Матч двух моделей ─────────────────────────────────────────────────────────
@@ -179,6 +255,8 @@ def run_match(
     max_moves: int,
     temperature_moves: int,
     mcts_batch: int,
+    verbose: bool = False,
+    pgn_dir: str = None,
 ) -> Dict:
     """
     Играет games партий между A и B (половина — A белые, половина — B белые).
@@ -198,8 +276,11 @@ def run_match(
     n1 = half + remainder
     print(f"  [{name_a} белые] {n1} партий...", end="", flush=True)
     t0 = time.time()
+    pgn1 = os.path.join(pgn_dir, f"{name_a}_vs_{name_b}.pgn") if pgn_dir else None
     res1 = play_batch(net_a, net_b, device, n1, simulations,
-                      max_moves, temperature_moves, mcts_batch)
+                      max_moves, temperature_moves, mcts_batch,
+                      verbose=verbose, pgn_path=pgn1,
+                      white_name=name_a, black_name=name_b)
     for r in res1:
         if r > 0:   wins_a += 1
         elif r < 0: wins_b += 1
@@ -212,8 +293,11 @@ def run_match(
     # --- Блок 2: B = белые ---
     print(f"  [{name_b} белые] {half} партий...", end="", flush=True)
     t0 = time.time()
+    pgn2 = os.path.join(pgn_dir, f"{name_b}_vs_{name_a}.pgn") if pgn_dir else None
     res2 = play_batch(net_b, net_a, device, half, simulations,
-                      max_moves, temperature_moves, mcts_batch)
+                      max_moves, temperature_moves, mcts_batch,
+                      verbose=verbose, pgn_path=pgn2,
+                      white_name=name_b, black_name=name_a)
     for r in res2:
         # r — результат белых (= B), конвертируем в результат A
         r_a = -r
@@ -352,6 +436,10 @@ def main():
                         help="Взять только последние N чекпоинтов из папки")
     parser.add_argument("--device",      type=str, default="auto",
                         help="cuda / cpu / auto (default: auto)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Показывать первые 10 ходов каждой партии")
+    parser.add_argument("--pgn-dir",      type=str, default=None,
+                        help="Папка для сохранения PGN партий (напр. games/)")
     args = parser.parse_args()
 
     # Устройство
@@ -371,11 +459,11 @@ def main():
     models: List[Tuple[str, CapablancaNet]] = []
     for path in ckpt_paths:
         try:
-            net, name = load_model(path, device)
+            net, name, arch_tag = load_model(path, device)
             models.append((name, net))
             ch = net.num_channels
             bl = len(net.res_blocks)
-            print(f"  ✓ {name:<20} ({ch}ch × {bl} blocks)  [{path}]")
+            print(f"  ✓ {name:<20} ({ch}ch × {bl} blocks){arch_tag}  [{path}]")
         except Exception as e:
             print(f"  ✗ Ошибка загрузки {path}: {e}")
 
@@ -405,6 +493,8 @@ def main():
             max_moves=args.max_moves,
             temperature_moves=args.temperature_moves,
             mcts_batch=args.mcts_batch,
+            verbose=args.verbose,
+            pgn_dir=args.pgn_dir,
         )
         match_results.append(result)
 

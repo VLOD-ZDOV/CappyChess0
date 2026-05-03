@@ -102,9 +102,7 @@ class MCTSThread(QThread):
             # --- Проверяем чей ход — нужно ли анализировать ---
             current_side = engine.side_to_move()  # 0=белые, 1=чёрные
             if self.analyze_for != -1 and self.analyze_for != current_side:
-                # Не наш ход — ждём пока не остановят
-                while self.running:
-                    self.msleep(100)
+                # Не наш ход — выходим сразу
                 return
 
             # --- MCTS ---
@@ -167,7 +165,9 @@ class MCTSThread(QThread):
 
                         # Снимаем виртуальный лосс и пишем настоящий результат
                         mcts._apply_virtual_loss(node, -VIRTUAL_LOSS)
-                        mcts._backup(node, move_stack, float(values[i]))
+                        v = values[i]
+                        if hasattr(v, 'item'): v = v.item()
+                        mcts._backup(node, move_stack, float(v))
 
                     total_sims += len(tensors)
 
@@ -323,7 +323,8 @@ class BoardWidget(QWidget):
                         and decode_move(m)[1] == sq]
 
             if matching:
-                self.main_window.stop_thinking()
+                # НЕ вызываем stop_thinking() — пусть add_move сам решит что делать
+                # self.main_window.stop_thinking()
 
                 # Если несколько ходов с одинаковыми from/to — это промоции
                 if len(matching) > 1:
@@ -344,7 +345,8 @@ class BoardWidget(QWidget):
                 self.engine.make_move_int(move)
                 self.legal_moves = self.engine.get_legal_moves_int()
                 self.selected_sq = None
-                self.top_moves_data = []
+                # НЕ очищаем top_moves_data — оставляем стрелки до следующего обновления
+                # self.top_moves_data = []
                 self.main_window.add_move(move)
                 self.update()
                 return
@@ -448,8 +450,25 @@ class CapablancaGUI(QMainWindow):
         self.board_widget.update()
 
     def add_move(self, m_int):
-        """Человек сделал ход — просто запоминаем, НЕ запускаем анализ автоматически."""
+        """Человек сделал ход — запоминаем и перезапускаем анализ если нужно."""
         self.move_history.append(m_int)
+
+        # Если анализ был активен, перезапускаем его для новой позиции
+        was_thinking = self.think_thread and self.think_thread.isRunning()
+        if was_thinking:
+            # Проверяем: нужно ли анализировать новую позицию?
+            side_id = self._side_group.checkedId()
+            analyze_for = [-1, 0, 1][side_id]
+            current_side = self.board_widget.engine.side_to_move()
+
+            # ВСЕГДА останавливаем и перезапускаем для новой позиции
+            self.think_thread.running = False
+            self.think_thread.wait(1500)
+
+            # Если analyze_for=-1 (все) ИЛИ это наш ход — перезапускаем БЕЗ очистки
+            if analyze_for == -1 or analyze_for == current_side:
+                self.start_thinking(clear_display=False)
+            # Иначе (не наш ход) — НЕ запускаем, оставляем кнопку активной но поток остановлен
 
     # ------- Модель -------
     def load_weights(self):
@@ -464,13 +483,23 @@ class CapablancaGUI(QMainWindow):
             sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
                   for k, v in raw_sd.items()}
 
-            # Фильтруем несовместимый value_head.6 (старый Linear(256,1) → новый Linear(256,3))
-            incompatible = [k for k in sd if k.startswith("value_head.6")]
+            # Фильтруем слои с несовместимой формой (напр. value_head при scalar→WDL переходе)
+            temp_net_check = CapablancaNet(
+                num_channels=sd.get("input_conv.net.0.weight", sd.get(
+                    next((k for k in sd if "input" in k and "weight" in k), ""), None)
+                ).shape[0] if any("input" in k and "weight" in k for k in sd) else 128,
+                num_res_blocks=sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
+            )
+            target_sd = temp_net_check.state_dict()
+            incompatible = [k for k in sd if k in target_sd and sd[k].shape != target_sd[k].shape]
             for k in incompatible:
                 del sd[k]
+            del temp_net_check
 
             # Определяем архитектуру из весов
-            stem = sd.get("input_conv.net.0.weight") or sd.get("input_block.0.weight")
+            stem = sd.get("input_conv.net.0.weight")
+            if stem is None:
+                stem = sd.get("input_block.0.weight")
             ch = stem.shape[0]
             bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
 
@@ -495,7 +524,7 @@ class CapablancaGUI(QMainWindow):
         else:
             self.start_thinking()
 
-    def start_thinking(self):
+    def start_thinking(self, clear_display=True):
         if not self.net:
             return
         self.stop_thinking()
@@ -508,7 +537,13 @@ class CapablancaGUI(QMainWindow):
         side_label = ["всех", "белых", "чёрных"][side_id]
         lim_label = "∞" if self.spin_sims.value() == 0 else f"{max_sims:,}"
         self.btn_think.setText("⏹ Остановить")
-        self.move_list.clear()
+
+        # Очищаем только при явном запуске кнопкой, не при автоперезапуске
+        if clear_display:
+            self.move_list.clear()
+            self.board_widget.top_moves_data = []
+            self.board_widget.update()
+
         self.status.setText(f"MCTS: за {side_label}, лимит {lim_label}…")
 
         self.think_thread = MCTSThread(
@@ -524,8 +559,9 @@ class CapablancaGUI(QMainWindow):
             self.think_thread.wait(1500)
 
         self.btn_think.setText("▶ Думать (GPU MCTS)")
-        self.board_widget.top_moves_data = []
-        self.board_widget.update()
+        # НЕ сбрасываем top_moves_data и оценку — оставляем последние данные
+        # self.board_widget.top_moves_data = []
+        # self.board_widget.update()
 
     def on_mcts_update(self, moves, val, sims):
         self.move_list.clear()

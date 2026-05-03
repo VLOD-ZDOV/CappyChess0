@@ -53,7 +53,7 @@ class Config:
     temperature: float = 1.0          # tau для первых temperature_moves ходов (1.0 = пропорционально visit counts)
     temperature_late: float = 0.5     # tau после temperature_moves (мягкий argmax, не жадный)
     games_per_iter: int = 128
-    max_game_length: int = 150
+    max_game_length: int = 70
     mcts_batch: int = 128
     mcts_parallel_sims: int = 32  # листьев за шаг MCTS (больше = реже round-trip Python↔GPU)
 
@@ -81,6 +81,7 @@ class Config:
 
     # policy_loss ниже этого порога = коллапс — чекпоинт не сохраняется
     collapse_threshold: float = 0.01
+    force_save: bool = False  # если True — сохраняем чекпоинт даже при низком loss
 
 
 CompactSample = Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], float]
@@ -446,9 +447,49 @@ def train(cfg: Config = None):
     # FIX: новый API без deprecation warning
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
 
+    # Linear warmup + CosineAnnealingWarmRestarts.
+    # Первые warmup_iters итераций LR растёт линейно от 0 до cfg.learning_rate,
+    # затем косинусное затухание. Это стабилизирует начало обучения.
+    WARMUP_ITERS = 5
+
+    class WarmupCosineScheduler:
+        def __init__(self, optimizer, warmup_iters, T_0, T_mult, eta_min, base_lr):
+            self.warmup_iters = warmup_iters
+            self.base_lr = base_lr
+            self.cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+            )
+            self._last_lr = [base_lr]
+            self._iter = 0
+            self.optimizer = optimizer
+
+        def step(self):
+            self._iter += 1
+            if self._iter <= self.warmup_iters:
+                lr = self.base_lr * self._iter / self.warmup_iters
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = lr
+                self._last_lr = [lr]
+            else:
+                self.cosine.step()
+                self._last_lr = self.cosine.get_last_lr()
+
+        def get_last_lr(self):
+            return self._last_lr
+
+        def state_dict(self):
+            return {"cosine": self.cosine.state_dict(), "_iter": self._iter}
+
+        def load_state_dict(self, sd):
+            self.cosine.load_state_dict(sd["cosine"])
+            self._iter = sd.get("_iter", 0)
+
     def make_scheduler(opt):
-        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            opt, T_0=50, T_mult=2, eta_min=cfg.learning_rate * 0.05
+        return WarmupCosineScheduler(
+            opt, warmup_iters=WARMUP_ITERS,
+            T_0=50, T_mult=2,
+            eta_min=cfg.learning_rate * 0.05,
+            base_lr=cfg.learning_rate,
         )
 
     scheduler = make_scheduler(optimizer)
@@ -465,8 +506,11 @@ def train(cfg: Config = None):
 
     start_iter = 0
     ckpts = sorted([f for f in os.listdir(cfg.checkpoint_dir) if f.endswith(".pth")])
-    if ckpts:
-        path = os.path.join(cfg.checkpoint_dir, ckpts[-1])
+    # Предпочитаем latest.pth (сохраняется каждую итерацию)
+    _latest = os.path.join(cfg.checkpoint_dir, "latest.pth")
+    ckpts = [f for f in ckpts if not f.startswith("latest")]
+    if os.path.exists(_latest) or ckpts:
+        path = _latest if os.path.exists(_latest) else os.path.join(cfg.checkpoint_dir, ckpts[-1])
         ckpt = torch.load(path, map_location=device, weights_only=False)
 
         raw_sd = ckpt["model"]
@@ -576,8 +620,8 @@ def train(cfg: Config = None):
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
-        # Детектор коллапса
-        collapsed = metrics['policy_loss'] < cfg.collapse_threshold
+        # Детектор коллапса (--force-save обходит проверку)
+        collapsed = metrics['policy_loss'] < cfg.collapse_threshold and not cfg.force_save
         collapse_warn = "  ⚠️  КОЛЛАПС ПОЛИТИКИ — чекпоинт не сохранён!" if collapsed else ""
 
         print(f"\n  ✅ Тренировка за {train_time:.1f}s ({metrics['steps']} шагов)")
@@ -594,17 +638,26 @@ def train(cfg: Config = None):
               f"(self-play {sp_time:.1f}s + train {train_time:.1f}s)\n")
 
         # ── Чекпоинт ─────────────────────────────────────────────────────────
-        if iteration % cfg.save_every == 0 and not collapsed:
+        if not collapsed:
             model_to_save = net._orig_mod if hasattr(net, "_orig_mod") else net
-            path = os.path.join(cfg.checkpoint_dir, f"model_iter{iteration:05d}.pth")
-            torch.save({
+            ckpt_data = {
                 "iteration": iteration,
                 "model": model_to_save.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "metrics": metrics,
-            }, path)
-            print(f"  💾 Сохранён: {path}")
+            }
+            # latest.pth — перезаписывается каждую итерацию
+            # При падении/остановке всегда есть последнее состояние
+            latest_path = os.path.join(cfg.checkpoint_dir, "latest.pth")
+            torch.save(ckpt_data, latest_path)
+            print(f"  💾 latest.pth (iter {iteration})")
+
+            # Нумерованный архивный чекпоинт каждые save_every итераций
+            if iteration % cfg.save_every == 0:
+                path = os.path.join(cfg.checkpoint_dir, f"model_iter{iteration:05d}.pth")
+                torch.save(ckpt_data, path)
+                print(f"  💾 {os.path.basename(path)}")
 
             try:
                 with open(buffer_path, "wb") as f:
@@ -647,6 +700,8 @@ if __name__ == "__main__":
     parser.add_argument("--reset-buffer",        action="store_true",
                         help="Очистить replay buffer при старте")
     parser.add_argument("--collapse-threshold",  type=float, default=0.01)
+    parser.add_argument("--force-save",           action="store_true",
+                        help="Сохранять чекпоинт даже если policy_loss < collapse_threshold")
     args = parser.parse_args()
 
     # Сброс буфера если запрошен
@@ -677,5 +732,6 @@ if __name__ == "__main__":
         value_loss_weight=args.value_loss_weight,
         reset_scheduler=args.reset_scheduler,
         collapse_threshold=args.collapse_threshold,
+        force_save=args.force_save,
     )
     train(cfg)

@@ -126,38 +126,21 @@ class UltraFastMCTS:
         rust_mcts = _RustMCTS(engines, self._parallel_sims)
         steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
 
-        # Двойная буферизация (идея из lc0 SearchWorker):
-        # пока GPU обрабатывает батч t, Rust уже собирает батч t+1.
-        # Это перекрывает CPU (Rust) и GPU работу вместо последовательного ожидания.
-        #
-        # Схема:
-        #   шаг 0: collect(0) → infer_async(0)
-        #   шаг 1: collect(1) [параллельно с GPU] → apply(0) → infer_async(1)
-        #   шаг 2: collect(2) [параллельно с GPU] → apply(1) → infer_async(2)
-        #   ...финал: apply(last)
+        # Синхронный цикл: collect → infer → apply.
+        # Двойная буферизация убрана: leaf_counts перезаписывался до apply_inference,
+        # результаты инференса шли не тем узлам → ломало дерево и обучение.
+        for _ in range(steps):
+            leaf_matrix = rust_mcts.collect_leaves()
 
-        prev_policies = None
-        prev_values   = None
+            if leaf_matrix.shape[0] == 0:
+                continue
 
-        for step in range(steps + 1):
-            # Собираем следующий батч (если ещё есть шаги)
-            if step < steps:
-                leaf_matrix = rust_mcts.collect_leaves()
-                has_leaves  = leaf_matrix.shape[0] > 0
-            else:
-                has_leaves = False
+            policies_np, values_np = self._infer(leaf_matrix)
 
-            # Применяем результаты предыдущего inference (если есть)
-            if prev_policies is not None:
-                rust_mcts.apply_inference(prev_policies, prev_values)
-                prev_policies = None
-                prev_values   = None
-
-            # Запускаем inference для текущего батча
-            if has_leaves:
-                p, v = self._infer(leaf_matrix)
-                prev_policies = np.ascontiguousarray(p, dtype=np.float32)
-                prev_values   = np.ascontiguousarray(v, dtype=np.float32)
+            rust_mcts.apply_inference(
+                np.ascontiguousarray(policies_np, dtype=np.float32),
+                np.ascontiguousarray(values_np,   dtype=np.float32),
+            )
 
         raw = rust_mcts.get_policies()
         return [np.array(p, dtype=np.float32) for p in raw]
