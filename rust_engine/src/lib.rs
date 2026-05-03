@@ -1,6 +1,7 @@
 // src/lib.rs — Capablanca Chess Engine (10x8 board)
 use pyo3::prelude::*;
-use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray, PyUntypedArrayMethods};use ndarray::Array2;
+use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray, PyUntypedArrayMethods};
+use ndarray::Array2;
 
 type BB = u128;
 const BOARD_MASK: BB = (1u128 << 80) - 1;
@@ -248,6 +249,62 @@ impl Board {
         self.side = them;
     }
 
+    /// Проверяет недостаточность материала для мата.
+    ///
+    /// В шахматах Капабланки ничья по материалу когда ни одна сторона
+    /// не может поставить мат даже при худшей игре противника.
+    ///
+    /// Фигуры которые ВСЕГДА могут поставить мат (не ничья):
+    ///   Пешка, Ладья, Ферзь, Архиепископ (Слон+Конь), Канцлер (Ладья+Конь)
+    ///
+    /// Случаи недостаточного материала:
+    ///   К vs К
+    ///   К+Конь vs К
+    ///   К+Слон vs К
+    ///   К+Конь vs К+Конь
+    ///   К+Конь vs К+Слон
+    ///   К+Слон vs К+Слон  (любые цвета — при одном слоне у каждого)
+    ///   К+Конь+Конь vs К  (два коня не могут форсировать мат)
+    ///
+    /// НЕ ничья (мат возможен):
+    ///   К+Архиепископ vs К  — арх комбинирует ходы коня и слона, мат реален
+    ///   К+Канцлер vs К      — тривиальный мат
+    ///   К+Ладья vs К        — тривиальный мат
+    ///   К+Ферзь vs К        — тривиальный мат
+    ///   Любая пешка         — может превратиться
+    fn is_insufficient_material(&self) -> bool {
+        for c in 0..2 {
+            // Если есть пешки, ладьи, ферзи, архиепископы или канцлеры — мат возможен
+            if self.pieces[c][PAWN]  != 0 { return false; }
+            if self.pieces[c][ROOK]  != 0 { return false; }
+            if self.pieces[c][QUEEN] != 0 { return false; }
+            if self.pieces[c][ARCH]  != 0 { return false; } // Архиепископ может матовать
+            if self.pieces[c][CHANC] != 0 { return false; } // Канцлер может матовать
+        }
+
+        // Только короли + лёгкие фигуры (слоны и кони)
+        let w_knights = self.pieces[0][KNIGHT].count_ones();
+        let w_bishops = self.pieces[0][BISHOP].count_ones();
+        let b_knights = self.pieces[1][KNIGHT].count_ones();
+        let b_bishops = self.pieces[1][BISHOP].count_ones();
+        let w_minor = w_knights + w_bishops;
+        let b_minor = b_knights + b_bishops;
+
+        match (w_minor, b_minor) {
+            // К vs К
+            (0, 0) => true,
+            // К+1 vs К  или  К vs К+1
+            (1, 0) | (0, 1) => true,
+            // К+Конь+Конь vs К — два коня без помощника мат не форсируют
+            (2, 0) if w_knights == 2 => true,
+            (0, 2) if b_knights == 2 => true,
+            // К+1 vs К+1 — слоны и кони не матуют друг против друга
+            (1, 1) => true,
+            // Всё остальное — мат теоретически возможен
+            _ => false,
+        }
+    }
+
     fn material_balance(&self) -> i32 {
         // Стандартные веса + Капабланка-фигуры
         const WEIGHTS: [i32; 8] = [
@@ -374,16 +431,20 @@ impl CapablancaEngine {
 
     pub fn is_game_over(&mut self) -> bool {
         if self.board.halfmove_clock >= 100 { return true; }
+        if self.board.is_insufficient_material() { return true; }
         self.ensure_legal_cache();
         self.legal_cache.as_ref().unwrap().is_empty()
     }
 
     pub fn game_result(&mut self) -> f32 {
         if self.board.halfmove_clock >= 100 { return 0.0; }
+        if self.board.is_insufficient_material() { return 0.0; }
         self.ensure_legal_cache();
         if self.legal_cache.as_ref().unwrap().is_empty() {
-            if self.board.in_check(self.board.side) { return if self.board.side == 0 { -1.0 } else { 1.0 }; }
-            return 0.0;
+            if self.board.in_check(self.board.side) {
+                return if self.board.side == 0 { -1.0 } else { 1.0 };
+            }
+            return 0.0; // Пат
         }
         0.0
     }
@@ -405,6 +466,122 @@ fn capablanca_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CapablancaEngine>()?;
     m.add_class::<RustMCTS>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_policy_indices_no_collision() {
+        let mut seen = std::collections::HashMap::new();
+        let mut board = Board::start();
+        // Тестируем индексы промоций для всех файлов
+        let promos = [QUEEN, ROOK, BISHOP, KNIGHT, ARCH, CHANC];
+        for from_file in 0u32..10 {
+            for to_file in from_file.saturating_sub(1)..=(from_file+1).min(9) {
+                for &p in &promos {
+                    let from_sq = 6 * 10 + from_file;
+                    let to_sq   = 7 * 10 + to_file;
+                    let idx = Board::move_to_idx(from_sq, to_sq, Some(p));
+                    assert!(idx < 7000, "idx={idx} >= POLICY_SIZE=7000 for promo {p}");
+                    let key = (from_sq, to_sq, p);
+                    if let Some(prev) = seen.insert(idx, key) {
+                        panic!("Collision at idx={idx}: {:?} vs {:?}", prev, key);
+                    }
+                }
+            }
+        }
+        // Проверяем обычные ходы не пересекаются с промоциями
+        for f in 0u32..80 {
+            for t in 0u32..80 {
+                if f == t { continue; }
+                let idx = Board::move_to_idx(f, t, None);
+                assert!(idx < 6400, "Normal move idx={idx} >= 6400, from={f} to={t}");
+            }
+        }
+        println!("✅ policy indices: no collisions, all within POLICY_SIZE=7000");
+    }
+
+    #[test]
+    fn test_startpos_legal_moves() {
+        let mut board = Board::start();
+        let legal = board.gen_legal();
+        // В начальной позиции Капабланки: 10 пешечных ходов + 4 хода конями + 4 хода архиепископа/канцлера
+        // Точное число зависит от правил, но должно быть > 20
+        assert!(legal.len() >= 20, "Too few legal moves at startpos: {}", legal.len());
+        assert!(legal.len() <= 50, "Too many legal moves at startpos: {}", legal.len());
+        println!("Legal moves at start: {}", legal.len());
+    }
+
+    #[test]
+    fn test_board_hash_unique() {
+        let b1 = Board::start();
+        let mut b2 = Board::start();
+        b2.apply_move(1, 22, None);
+        let h1 = SingleMcts::board_hash(&b1);
+        let h2 = SingleMcts::board_hash(&b2);
+        assert_ne!(h1, h2, "Different positions must have different hashes");
+    }
+
+    #[test]
+    fn test_insufficient_material() {
+        // Вспомогательная функция: создаёт пустую доску только с королями
+        fn kings_only() -> Board {
+            let mut b = Board { pieces: [[0; 8]; 2], side: 0, castling: 0,
+                                ep_square: None, halfmove_clock: 0, fullmove: 1 };
+            b.pieces[0][KING] = 1u128 << 5;   // белый король f1
+            b.pieces[1][KING] = 1u128 << 75;  // чёрный король f8
+            b
+        }
+
+        // К vs К — ничья
+        let b = kings_only();
+        assert!(b.is_insufficient_material(), "K vs K must be draw");
+
+        // К+Конь vs К — ничья
+        let mut b = kings_only();
+        b.pieces[0][KNIGHT] = 1u128 << 1;
+        assert!(b.is_insufficient_material(), "K+N vs K must be draw");
+
+        // К+Слон vs К — ничья
+        let mut b = kings_only();
+        b.pieces[0][BISHOP] = 1u128 << 3;
+        assert!(b.is_insufficient_material(), "K+B vs K must be draw");
+
+        // К+2 Коня vs К — ничья (форсированный мат невозможен)
+        let mut b = kings_only();
+        b.pieces[0][KNIGHT] = (1u128 << 1) | (1u128 << 8);
+        assert!(b.is_insufficient_material(), "K+N+N vs K must be draw");
+
+        // К+1 vs К+1 — ничья
+        let mut b = kings_only();
+        b.pieces[0][KNIGHT] = 1u128 << 1;
+        b.pieces[1][BISHOP] = 1u128 << 66;
+        assert!(b.is_insufficient_material(), "K+N vs K+B must be draw");
+
+        // К+Архиепископ vs К — НЕ ничья
+        let mut b = kings_only();
+        b.pieces[0][ARCH] = 1u128 << 2;
+        assert!(!b.is_insufficient_material(), "K+A vs K must NOT be draw");
+
+        // К+Канцлер vs К — НЕ ничья
+        let mut b = kings_only();
+        b.pieces[0][CHANC] = 1u128 << 7;
+        assert!(!b.is_insufficient_material(), "K+C vs K must NOT be draw");
+
+        // К+Ладья vs К — НЕ ничья
+        let mut b = kings_only();
+        b.pieces[0][ROOK] = 1u128 << 0;
+        assert!(!b.is_insufficient_material(), "K+R vs K must NOT be draw");
+
+        // К+Пешка vs К — НЕ ничья
+        let mut b = kings_only();
+        b.pieces[0][PAWN] = 1u128 << 10;
+        assert!(!b.is_insufficient_material(), "K+P vs K must NOT be draw");
+
+        println!("✅ insufficient material: all cases correct");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -503,17 +680,40 @@ fn dirichlet_noise(alpha: f64, n: usize, rng: &mut u64) -> Vec<f64> {
 struct SingleMcts {
     arena: Arena,
     root: usize,
-    root_board: Board,     // Board только в корне — позиция восстанавливается по пути
-    pending: Vec<usize>,   // индексы листьев ожидающих inference
-    pending_boards: Vec<Board>, // доски для pending листьев (нужны для side и expand)
+    root_board: Board,
+    pending: Vec<usize>,
+    pending_boards: Vec<Board>,
+    // История хэшей позиций для детекции троекратного повторения
+    position_history: Vec<u64>,
 }
 
 impl SingleMcts {
+    fn board_hash(b: &Board) -> u64 {
+        let mut h: u64 = b.side as u64 * 0x9e3779b97f4a7c15;
+        for c in 0..2usize {
+            for p in 0..8usize {
+                let lo = b.pieces[c][p] as u64;
+                let hi = (b.pieces[c][p] >> 64) as u64;
+                h ^= lo.wrapping_mul(0x517cc1b727220a95u64.wrapping_add((c * 8 + p) as u64));
+                h ^= hi.wrapping_mul(0xbf58476d1ce4e5b9u64.wrapping_add((c * 8 + p) as u64));
+                h = h.rotate_left(17);
+            }
+        }
+        h ^= (b.castling as u64).wrapping_mul(0x6c62272e07bb0142);
+        h ^= b.ep_square.map(|s| s as u64 + 1).unwrap_or(0).wrapping_mul(0x94d049bb133111eb);
+        h
+    }
+
     fn new(board: Board) -> Self {
         let side = board.side as u8;
+        let initial_hash = Self::board_hash(&board);
         let mut arena = Arena::new(8192);
         let root = arena.add(MctsNode::new(0, 1.0, side, None));
-        SingleMcts { arena, root, root_board: board, pending: Vec::new(), pending_boards: Vec::new() }
+        SingleMcts {
+            arena, root, root_board: board,
+            pending: Vec::new(), pending_boards: Vec::new(),
+            position_history: vec![initial_hash],
+        }
     }
 
     // Восстанавливает Board для узла idx, проходя путь от корня.
@@ -566,13 +766,16 @@ impl SingleMcts {
             // на явно плохие ходы только потому что у них visits=0.
             let parent_q = self.arena.get(idx).q();
             const FPU_REDUCTION: f32 = 0.1;
-            let fpu = parent_q - FPU_REDUCTION;
+            // Ограничиваем снизу: при очень отрицательном parent_q дети всё равно исследуются
+            let fpu = (parent_q - FPU_REDUCTION).max(-1.0);
 
             let mut best = f32::NEG_INFINITY;
             let mut best_ci = self.arena.get(idx).children[0];
-            for &ci in &self.arena.get(idx).children.clone() {
+            // FIX: убрано .clone() — итерируем по индексам без копирования вектора
+            let n_ch = self.arena.get(idx).children.len();
+            for ci_pos in 0..n_ch {
+                let ci = self.arena.get(idx).children[ci_pos];
                 let c = self.arena.get(ci);
-                // FPU: если узел не посещён — используем fpu вместо c.q()
                 let q_val = if c.visits > 0 { c.q() } else { fpu };
                 let score = q_val + cpuct * c.prior * sqrt_n / (1 + c.visits + c.virtual_loss) as f32;
                 if !score.is_nan() && score > best { best = score; best_ci = ci; }
@@ -698,7 +901,7 @@ impl SingleMcts {
 
     // Версия без Vec<Vec<f32>> — принимает плоский срез политик
     fn apply_inference_flat(&mut self, pol_flat: &[f32], policy_size: usize,
-                            values: &[f32], rng: &mut u64) {
+                             values: &[f32], rng: &mut u64) {
         let pending = std::mem::take(&mut self.pending);
         let boards  = std::mem::take(&mut self.pending_boards);
         for (i, leaf) in pending.into_iter().enumerate() {
@@ -718,85 +921,95 @@ impl SingleMcts {
             let v = if side == 0 { values[i] } else { -values[i] };
             self.backup(leaf, v);
         }
-                            }
+    }
 
-                            fn get_policy(&self) -> Vec<f32> {
-                                let root = self.arena.get(self.root);
-                                let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
-                                let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
-                                if total > 0 {
-                                    for &ci in &root.children {
-                                        let c = self.arena.get(ci);
-                                        let m = c.move_from_parent;
-                                        let f = (m >> 10) & 0x7F;
-                                        let t = (m >> 3) & 0x7F;
-                                        let pv = m & 0b111;
-                                        let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
-                                        let idx = Board::move_to_idx(f, t, p);
-                                        if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
-                                    }
-                                }
-                                pol
-                            }
+    fn get_policy(&self) -> Vec<f32> {
+        let root = self.arena.get(self.root);
+        let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
+        let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
+        if total > 0 {
+            for &ci in &root.children {
+                let c = self.arena.get(ci);
+                let m = c.move_from_parent;
+                let f = (m >> 10) & 0x7F;
+                let t = (m >> 3) & 0x7F;
+                let pv = m & 0b111;
+                let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                let idx = Board::move_to_idx(f, t, p);
+                if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
+            }
+        }
+        pol
+    }
 
-                            fn is_over(&mut self) -> bool {
-                                if self.root_board.halfmove_clock >= 100 { return true; }
-                                let legal = self.root_board.gen_legal();
-                                legal.is_empty()
-                            }
+    fn is_over(&mut self) -> bool {
+        if self.root_board.halfmove_clock >= 100 { return true; }
+        if self.root_board.is_insufficient_material() { return true; }
+        // Троекратное повторение позиции
+        let cur_hash = Self::board_hash(&self.root_board);
+        let repeats = self.position_history.iter().filter(|&&h| h == cur_hash).count();
+        if repeats >= 2 { return true; }
+        self.root_board.gen_legal().is_empty()
+    }
 
-                            fn root_value(&self) -> f32 {
-                                self.arena.get(self.root).wl
-                            }
+    fn root_value(&self) -> f32 {
+        self.arena.get(self.root).wl
+    }
 
-                            // Рекурсивно копирует поддерево из self.arena в new_arena (без Board).
-                            fn copy_subtree(&self, old_idx: usize, new_arena: &mut Arena, new_parent: Option<usize>) -> usize {
-                                let old_node = self.arena.get(old_idx);
-                                let mut new_node = MctsNode::new(
-                                    old_node.move_from_parent,
-                                    old_node.prior,
-                                    old_node.side,
-                                    new_parent,
-                                );
-                                new_node.visits      = old_node.visits;
-                                new_node.wl          = old_node.wl;
-                                new_node.is_expanded = old_node.is_expanded;
-                                new_node.is_terminal = old_node.is_terminal;
-                                let new_idx = new_arena.add(new_node);
-                                let children: Vec<usize> = old_node.children.clone();
-                                let mut new_children = Vec::with_capacity(children.len());
-                                for child_old in children {
-                                    new_children.push(self.copy_subtree(child_old, new_arena, Some(new_idx)));
-                                }
-                                new_arena.get_mut(new_idx).children = new_children;
-                                new_idx
-                            }
+    // Рекурсивно копирует поддерево из self.arena в new_arena (без Board).
+    fn copy_subtree(&self, old_idx: usize, new_arena: &mut Arena, new_parent: Option<usize>) -> usize {
+        let old_node = self.arena.get(old_idx);
+        let mut new_node = MctsNode::new(
+            old_node.move_from_parent,
+            old_node.prior,
+            old_node.side,
+            new_parent,
+        );
+        new_node.visits      = old_node.visits;
+        new_node.wl          = old_node.wl;
+        new_node.is_expanded = old_node.is_expanded;
+        new_node.is_terminal = old_node.is_terminal;
+        let new_idx = new_arena.add(new_node);
+        let children: Vec<usize> = old_node.children.clone();
+        let mut new_children = Vec::with_capacity(children.len());
+        for child_old in children {
+            new_children.push(self.copy_subtree(child_old, new_arena, Some(new_idx)));
+        }
+        new_arena.get_mut(new_idx).children = new_children;
+        new_idx
+    }
 
-                            fn make_move(&mut self, m_int: u32) {
-                                // Применяем ход к root_board
-                                let pv = m_int & 0b111;
-                                let t  = (m_int >> 3) & 0x7F;
-                                let f  = (m_int >> 10) & 0x7F;
-                                let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
-                                self.root_board.apply_move(f, t, p);
-                                let new_side = self.root_board.side as u8;
+    fn make_move(&mut self, m_int: u32) {
+        // Применяем ход к root_board
+        let pv = m_int & 0b111;
+        let t  = (m_int >> 3) & 0x7F;
+        let f  = (m_int >> 10) & 0x7F;
+        let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
+        self.root_board.apply_move(f, t, p);
+        let new_side = self.root_board.side as u8;
 
-                                let child_idx = self.arena.get(self.root).children.iter()
-                                .copied()
-                                .find(|&ci| self.arena.get(ci).move_from_parent == m_int);
+        let child_idx = self.arena.get(self.root).children.iter()
+            .copied()
+            .find(|&ci| self.arena.get(ci).move_from_parent == m_int);
 
-                                // Tree GC — копируем только нужное поддерево в новую арену.
-                                let mut new_arena = Arena::new(8192);
-                                self.root = if let Some(ci) = child_idx {
-                                    self.copy_subtree(ci, &mut new_arena, None)
-                                } else {
-                                    // Ход не был в дереве — создаём корень с нуля
-                                    new_arena.add(MctsNode::new(m_int, 1.0, new_side, None))
-                                };
-                                self.arena = new_arena;
-                                self.pending.clear();
-                                self.pending_boards.clear();
-                            }
+        // Tree GC — копируем только нужное поддерево в новую арену.
+        let mut new_arena = Arena::new(8192);
+        self.root = if let Some(ci) = child_idx {
+            self.copy_subtree(ci, &mut new_arena, None)
+        } else {
+            // Ход не был в дереве — создаём корень с нуля
+            new_arena.add(MctsNode::new(m_int, 1.0, new_side, None))
+        };
+        self.arena = new_arena;
+        self.pending.clear();
+        self.pending_boards.clear();
+        // Обновляем историю: при необратимом ходе (взятие/пешка) старые позиции не повторятся
+        let new_hash = Self::board_hash(&self.root_board);
+        if self.root_board.halfmove_clock == 0 {
+            self.position_history.clear();
+        }
+        self.position_history.push(new_hash);
+    }
 }
 
 /// RustMCTS — батчевый MCTS для N игр одновременно.
@@ -845,9 +1058,9 @@ impl RustMCTS {
             Array2::<f32>::zeros((0, cols)).into_pyarray(py).into()
         } else {
             Array2::from_shape_vec((total, cols), flat)
-            .expect("collect_leaves: shape mismatch")
-            .into_pyarray(py)
-            .into()
+                .expect("collect_leaves: shape mismatch")
+                .into_pyarray(py)
+                .into()
         }
     }
 
