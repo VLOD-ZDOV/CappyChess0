@@ -51,12 +51,11 @@ class UltraFastMCTS:
         self.c_puct = c_puct
         self.batch_size = batch_size
         self.add_dirichlet = add_dirichlet
-        # Если передан parallel_sims — переопределяем глобальный PARALLEL_SIMS для этого объекта
         self._parallel_sims = parallel_sims if parallel_sims is not None else PARALLEL_SIMS
 
-        # Pinned memory под максимальный батч:
-        # 256 игр × 32 PARALLEL_SIMS = 8192 листьев максимум
-        MAX_LEAVES = 8192
+        # Pinned memory: batch_size × parallel_sims листьев максимум
+        # Больше parallel_sims = меньше GPU вызовов = быстрее, но хуже качество MCTS
+        MAX_LEAVES = max(8192, batch_size * self._parallel_sims * 2)
         self.pinned_buf = torch.empty(MAX_LEAVES, 20, 8, 10,
                                       pin_memory=True, dtype=torch.float32)
         self.pinned_size = MAX_LEAVES
@@ -86,7 +85,9 @@ class UltraFastMCTS:
             buf.copy_(torch.from_numpy(arr))
             x = buf.to(self.device, non_blocking=True)
         else:
-            x = torch.from_numpy(arr.copy()).to(self.device, non_blocking=True)
+            # Батч больше pinned buffer — аллоцируем новый
+            # (редкий случай, только при очень большом parallel_sims)
+            x = torch.from_numpy(np.ascontiguousarray(arr)).to(self.device, non_blocking=True)
 
         x = x.to(memory_format=torch.channels_last)
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -122,25 +123,99 @@ class UltraFastMCTS:
             return self._search_rust(engines, simulations)
         return self._search_python(engines, simulations)
 
+    def search_games_with_values(self, engines: List, simulations: int = 80):
+        """Возвращает (policies, values). values нужны для resign логики."""
+        if RUST_MCTS_AVAILABLE:
+            rust_mcts = _RustMCTS(engines, self._parallel_sims)
+            steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
+
+            prev_policies = None
+            prev_values   = None
+            prev_counts   = None
+
+            for step in range(steps + 1):
+                if step < steps:
+                    leaf_matrix = rust_mcts.collect_leaves()
+                    has_leaves  = leaf_matrix.shape[0] > 0
+                    if has_leaves:
+                        curr_counts = rust_mcts.get_current_batch_counts()
+                else:
+                    has_leaves = False
+
+                if prev_policies is not None and prev_counts is not None:
+                    rust_mcts.apply_inference_buffered(
+                        prev_policies, prev_values, prev_counts
+                    )
+
+                if has_leaves:
+                    p, v = self._infer(leaf_matrix)
+                    prev_policies = np.ascontiguousarray(p, dtype=np.float32)
+                    prev_values   = np.ascontiguousarray(v, dtype=np.float32)
+                    prev_counts   = curr_counts
+                else:
+                    prev_policies = prev_values = prev_counts = None
+
+            raw_policies = rust_mcts.get_policies()
+            raw_values   = rust_mcts.get_values()
+            policies = [np.array(p, dtype=np.float32) for p in raw_policies]
+            return policies, np.array(raw_values, dtype=np.float32)
+
+        policies = self._search_python(engines, simulations)
+        return policies, np.zeros(len(engines), dtype=np.float32)
+
     def _search_rust(self, engines: List, simulations: int) -> List[np.ndarray]:
+        policies, _ = self.search_games_with_values(engines, simulations)
+        return policies
+
+    def _search_rust_full(self, engines: List, simulations: int) -> List[np.ndarray]:
         rust_mcts = _RustMCTS(engines, self._parallel_sims)
         steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
 
-        # Синхронный цикл: collect → infer → apply.
-        # Двойная буферизация убрана: leaf_counts перезаписывался до apply_inference,
-        # результаты инференса шли не тем узлам → ломало дерево и обучение.
-        for _ in range(steps):
-            leaf_matrix = rust_mcts.collect_leaves()
+        # Правильная двойная буферизация:
+        # GPU считает батч N пока Rust собирает батч N+1.
+        # Ключ: batch_counts сохраняется ВМЕСТЕ с данными батча N
+        # и передаётся в apply_inference_buffered — не перезаписывается батчем N+1.
+        #
+        # Схема:
+        #   шаг 0: collect(0) → counts_0 = get_counts() → infer_start(0)
+        #   шаг 1: collect(1) [пока GPU считает 0] → counts_1
+        #          apply_buffered(result_0, counts_0) → infer_start(1)
+        #   шаг 2: collect(2) → counts_2
+        #          apply_buffered(result_1, counts_1) → infer_start(2)
+        #   ...
+        #   финал: apply_buffered(result_last, counts_last)
 
-            if leaf_matrix.shape[0] == 0:
-                continue
+        prev_policies  = None
+        prev_values    = None
+        prev_counts    = None
 
-            policies_np, values_np = self._infer(leaf_matrix)
+        for step in range(steps + 1):
+            # Собираем следующий батч (если ещё есть шаги)
+            if step < steps:
+                leaf_matrix = rust_mcts.collect_leaves()
+                has_leaves  = leaf_matrix.shape[0] > 0
+                if has_leaves:
+                    # Сохраняем counts ЭТОГО батча — он не изменится при следующем collect
+                    curr_counts = rust_mcts.get_current_batch_counts()
+            else:
+                has_leaves = False
 
-            rust_mcts.apply_inference(
-                np.ascontiguousarray(policies_np, dtype=np.float32),
-                np.ascontiguousarray(values_np,   dtype=np.float32),
-            )
+            # Применяем результаты предыдущего inference с ПРАВИЛЬНЫМИ counts
+            if prev_policies is not None and prev_counts is not None:
+                rust_mcts.apply_inference_buffered(
+                    prev_policies, prev_values, prev_counts
+                )
+
+            # Запускаем inference для текущего батча
+            if has_leaves:
+                p, v = self._infer(leaf_matrix)
+                prev_policies = np.ascontiguousarray(p, dtype=np.float32)
+                prev_values   = np.ascontiguousarray(v, dtype=np.float32)
+                prev_counts   = curr_counts
+            else:
+                prev_policies = None
+                prev_values   = None
+                prev_counts   = None
 
         raw = rust_mcts.get_policies()
         return [np.array(p, dtype=np.float32) for p in raw]

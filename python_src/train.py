@@ -51,9 +51,9 @@ class Config:
     c_puct: float = 1.25
     temperature_moves: int = 50       # FIX: 30→50, больше исследования в начале партии
     temperature: float = 1.0          # tau для первых temperature_moves ходов (1.0 = пропорционально visit counts)
-    temperature_late: float = 0.5     # tau после temperature_moves (мягкий argmax, не жадный)
+    temperature_late: float = 0.0     # tau после temperature_moves: 0.0 = жёсткий argmax (лучше матует)
     games_per_iter: int = 128
-    max_game_length: int = 70
+    max_game_length: int = 110
     mcts_batch: int = 128
     mcts_parallel_sims: int = 32  # листьев за шаг MCTS (больше = реже round-trip Python↔GPU)
 
@@ -66,8 +66,15 @@ class Config:
     value_loss_weight: float = 1.0
 
     # Буфер
-    buffer_max: int = 500_000
+    buffer_max: int = 999_000
     buffer_min_to_train: int = 10_000
+
+    # Сдача (Resignation): если V < resign_threshold на протяжении
+    # resign_consec ходов подряд после resign_min_move — игра заканчивается поражением.
+    # Убивает 30-40% таймаутов: сеть не играет 80 ходов голым королём.
+    resign_threshold: float = -0.95   # порог оценки
+    resign_consec: int = 3            # ходов подряд ниже порога
+    resign_min_move: int = 20         # не сдаёмся раньше этого хода
 
     # Инфраструктура
     device: str = "cuda"
@@ -197,13 +204,19 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
         n = min(batch_sz, cfg.games_per_iter - start)
         engines = [CapablancaEngine() for _ in range(n)]
         histories: List[List] = [[] for _ in range(n)]
+        # Счётчики последовательных ходов с V < resign_threshold
+        resign_counts = [0] * n
+        resigned = [False] * n
 
         active = list(range(n))
         move_num = 0
 
+        # adjudicated[i] = результат если игра досрочно присуждена, иначе None
+        adjudicated = [None] * n
+
         while active and move_num < cfg.max_game_length:
             cur_engines = [engines[i] for i in active]
-            policies = mcts.search_games(cur_engines, cfg.simulations)
+            policies, values_np = mcts.search_games_with_values(cur_engines, cfg.simulations)
 
             new_active = []
             for j, game_idx in enumerate(active):
@@ -217,10 +230,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
                 pol = policies[j]
                 histories[game_idx].append((board_np, pol.copy(), side))
 
-                # Temperature sampling с плавным decay (как в lc0):
-                #   до temperature_moves:          tau = cfg.temperature (1.0)
-                #   следующие 20 ходов:            tau плавно падает 1.0 → temperature_late
-                #   после temperature_moves + 20:  tau = temperature_late (0.5)
+                # Temperature sampling с плавным decay
                 if move_num < cfg.temperature_moves:
                     tau = cfg.temperature
                 else:
@@ -238,33 +248,67 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
 
                 eng.make_move_int(move)
 
-                if not eng.is_game_over():
+                if eng.is_game_over():
+                    continue  # уберём из active ниже
+
+                # Resign: проверяем оценку позиции после хода
+                # Используем root value из MCTS (уже вычислен выше)
+                # sign: value с точки зрения стороны которая только что сделала ход
+                if move_num >= cfg.resign_min_move:
+                    # root_value с точки зрения side_to_move ПОСЛЕ хода (противник)
+                    # Значит если значение высокое — тот кто только что ходил проигрывает
+                    # Берём WL из корня: положительный = хорошо для side_to_move сейчас
+                    root_v = float(values_np[j]) if 'values_np' in dir() else 0.0
+                    # Оценка с точки зрения того кто только что ходил (side до хода)
+                    v_for_mover = -root_v  # противник смотрит вперёд, нам нужно обратное
+                    if v_for_mover < cfg.resign_threshold:
+                        resign_counts[game_idx] += 1
+                    else:
+                        resign_counts[game_idx] = 0
+
+                    if resign_counts[game_idx] >= cfg.resign_consec:
+                        resigned[game_idx] = True
+                        continue  # выходим — не добавляем в new_active
+
+                # Досрочное присуждение (Adjudication):
+                # Если после хода есть решающий материальный перевес
+                # (≥8 очков, ≥10 ходов без взятий, ≥15 полных ходов) —
+                # заканчиваем игру не дожидаясь мата или таймаута.
+                adj = eng.adjudication_result()
+                if adj is not None:
+                    adjudicated[game_idx] = adj
+                else:
                     new_active.append(game_idx)
 
             active = new_active
             move_num += 1
 
         batch_positions = 0
-        white_wins = black_wins = draws = timeouts = 0
+        white_wins = black_wins = draws = timeouts = adjudications = 0
 
         for i, eng in enumerate(engines):
-            if eng.is_game_over():
+            if resigned[i]:
+                # Сдача: сторона которая последней ходила — проиграла
+                # Определяем кто сдался по side_to_move (ходит противник → предыдущий сдался)
+                last_side = histories[i][-1][1] if histories[i] else 0
+                result = -1.0 if last_side == 0 else 1.0
+                timeouts += 1  # считаем как незавершённую для статистики
+                if result > 0: white_wins += 1
+                else:          black_wins += 1
+            elif adjudicated[i] is not None:
+                # Досрочное присуждение — решающий материальный перевес
+                result = adjudicated[i]
+                adjudications += 1
+                if result > 0: white_wins += 1
+                else:          black_wins += 1
+            elif eng.is_game_over():
                 result = eng.game_result()
-                if result == 1.0:
-                    white_wins += 1
-                elif result == -1.0:
-                    black_wins += 1
-                else:
-                    draws += 1
+                if result == 1.0:   white_wins += 1
+                elif result == -1.0: black_wins += 1
+                else:               draws += 1
             else:
-                # FIX: градуированная материальная оценка вместо ступенчатой ±0.5/0.
-                # Было: |balance|>3 → ±0.5, иначе 0.0 — почти все таймауты давали 0.
-                # Стало: линейная шкала, зажатая в [-0.8, 0.8].
-                # Это даёт сети больше информации о качестве позиции.
-                balance = eng.material_result()  # ±0.5 или 0.0 из Rust
-                # Дополнительно получаем сырой баланс через Python-обёртку
-                # (material_result уже содержит знак, масштабируем мягче)
-                result = float(np.clip(balance * 1.6, -0.8, 0.8))
+                # Настоящий таймаут — мягкая материальная оценка
+                result = eng.material_result()
                 timeouts += 1
 
             for board_np, pol, side in histories[i]:
@@ -274,7 +318,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device) -> List[Sa
 
         print(f"  Batch {b+1}/{num_batches}: {n} games, "
               f"{batch_positions} positions, {move_num} ходов | "
-              f"бел={white_wins} чёрн={black_wins} пат/50={draws} timeout={timeouts}")
+              f"бел={white_wins} чёрн={black_wins} пат={draws} "
+              f"adj={adjudications} timeout={timeouts}")
 
     return all_samples
 
@@ -680,7 +725,7 @@ if __name__ == "__main__":
     parser.add_argument("--mcts-batch",          type=int,   default=128)
     parser.add_argument("--temperature",          type=float, default=1.0,
                         help="Температура выборки хода (tau) в первые --temperature-moves ходов")
-    parser.add_argument("--temperature-late",     type=float, default=0.5,
+    parser.add_argument("--temperature-late",     type=float, default=0.0,
                         help="Температура после --temperature-moves (0.5=мягкий argmax, 0=жадный)")
     parser.add_argument("--temperature-moves",    type=int,   default=50,
                         help="Ходов с высокой температурой")
@@ -700,6 +745,12 @@ if __name__ == "__main__":
     parser.add_argument("--reset-buffer",        action="store_true",
                         help="Очистить replay buffer при старте")
     parser.add_argument("--collapse-threshold",  type=float, default=0.01)
+    parser.add_argument("--resign-threshold",     type=float, default=-0.95,
+                        help="V ниже этого порога считается проигрышем (default: -0.95)")
+    parser.add_argument("--resign-consec",        type=int,   default=3,
+                        help="Ходов подряд с V < threshold для сдачи (default: 3)")
+    parser.add_argument("--resign-min-move",      type=int,   default=20,
+                        help="Минимальный ход для сдачи (default: 20)")
     parser.add_argument("--force-save",           action="store_true",
                         help="Сохранять чекпоинт даже если policy_loss < collapse_threshold")
     args = parser.parse_args()
@@ -732,6 +783,9 @@ if __name__ == "__main__":
         value_loss_weight=args.value_loss_weight,
         reset_scheduler=args.reset_scheduler,
         collapse_threshold=args.collapse_threshold,
+        resign_threshold=args.resign_threshold,
+        resign_consec=args.resign_consec,
+        resign_min_move=args.resign_min_move,
         force_save=args.force_save,
     )
     train(cfg)

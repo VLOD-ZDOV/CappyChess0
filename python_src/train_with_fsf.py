@@ -172,7 +172,9 @@ def generate_fsf_games(
         move_num    = 0
         ok          = True
 
-        while not engine.is_game_over() and move_num < cfg.max_game_length:
+        adjudicated_result = None  # досрочное присуждение
+
+        while not engine.is_game_over() and move_num < cfg.max_game_length and adjudicated_result is None:
             side   = engine.side_to_move()
             legal  = engine.get_legal_moves_int()
             if not legal: break
@@ -183,7 +185,6 @@ def generate_fsf_games(
                 # ── Ход нейросети ──
                 pol = mcts.search_games([engine], mcts_sims)[0]
 
-                # Temperature 0.8 для разнообразия
                 raw = np.array([pol[engine.move_int_to_policy_idx(m) or 0]
                                  for m in legal], dtype=np.float64)
                 raw = np.power(np.maximum(raw, 1e-8), 1.0 / 0.8)
@@ -198,13 +199,10 @@ def generate_fsf_games(
                 if move is None:
                     errors += 1; ok = False; break
 
-                # Мягкая метка для FSF хода — не one-hot, а немного сглаженная
-                # Это лучше чем жёсткий one-hot: сеть не штрафуется за другие хорошие ходы
                 pol = np.zeros(7000, dtype=np.float32)
                 pol_idx = engine.move_int_to_policy_idx(move)
                 if pol_idx is not None:
-                    pol[pol_idx] = 0.9  # 90% вместо 100% — мягкость
-                    # Остальные легальные ходы делим оставшиеся 10%
+                    pol[pol_idx] = 0.9
                     others = [engine.move_int_to_policy_idx(m) for m in legal
                               if m != move and engine.move_int_to_policy_idx(m) is not None]
                     if others:
@@ -216,11 +214,21 @@ def generate_fsf_games(
             uci_history.append(int_to_uci(move))
             move_num += 1
 
+            # Досрочное присуждение после хода
+            adj = engine.adjudication_result()
+            if adj is not None:
+                adjudicated_result = adj
+
         if not ok: continue
 
-        result = engine.game_result() if engine.is_game_over() else float(np.clip(engine.material_result() * 1.6, -0.8, 0.8))
+        if adjudicated_result is not None:
+            result = adjudicated_result
+        elif engine.is_game_over():
+            result = engine.game_result()
+        else:
+            result = engine.material_result()
 
-        if result > 0.5:   wins   += 1
+        if result > 0.5:    wins   += 1
         elif result < -0.5: losses += 1
         else:               draws  += 1
 
