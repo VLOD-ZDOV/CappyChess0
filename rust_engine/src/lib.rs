@@ -449,14 +449,35 @@ impl CapablancaEngine {
         0.0
     }
 
-    /// Оценка по материалу для позиций где игра прервана по лимиту ходов.
-    /// Возвращает: +0.5 (белые лучше), -0.5 (чёрные лучше), 0.0 (равно).
-    /// Порог 3 очка — меньше шума от случайных разменов в начале обучения.
+    /// Досрочное присуждение результата по материалу (Adjudication).
+    ///
+    /// Возвращает:
+    ///   ±1.0 — решительный перевес (≥8 очков): одна сторона имеет крупную фигуру
+    ///          которой у противника нет. Засчитывается как победа.
+    ///   ±0.5 — умеренный перевес (3-7 очков): вероятная победа, но не гарантия.
+    ///    0.0 — примерное равенство (< 3 очков).
+    ///
+    /// Порог 8 очков выбран под Капабланку: архиепископ стоит ~8, канцлер ~10.
+    /// Если у одной стороны есть арх/канц/ферзь, а у другой нет — перевес решающий.
     pub fn material_result(&self) -> f32 {
         let balance = self.board.material_balance();
-        if balance > 3 { 0.5 }
-        else if balance < -3 { -0.5 }
-        else { 0.0 }
+        if balance >= 8  { return  1.0; }
+        if balance <= -8 { return -1.0; }
+        if balance > 3  { return  0.5; }
+        if balance < -3 { return -0.5; }
+        0.0
+    }
+
+    /// Досрочное присуждение результата (вызывается из Python после каждого хода).
+    /// Срабатывает когда: fullmove >= 15, halfmove_clock >= 15, перевес >= 8 очков.
+    /// Возвращает Some(±1.0) если перевес решающий, None — продолжаем играть.
+    pub fn adjudication_result(&self) -> Option<f32> {
+        if self.board.fullmove < 15 { return None; }
+        if self.board.halfmove_clock < 10 { return None; }
+        let balance = self.board.material_balance();
+        if balance >= 8  { return Some( 1.0); }
+        if balance <= -8 { return Some(-1.0); }
+        None
     }
 }
 
@@ -529,10 +550,10 @@ mod tests {
         // Вспомогательная функция: создаёт пустую доску только с королями
         fn kings_only() -> Board {
             let mut b = Board { pieces: [[0; 8]; 2], side: 0, castling: 0,
-                                ep_square: None, halfmove_clock: 0, fullmove: 1 };
-            b.pieces[0][KING] = 1u128 << 5;   // белый король f1
-            b.pieces[1][KING] = 1u128 << 75;  // чёрный король f8
-            b
+                ep_square: None, halfmove_clock: 0, fullmove: 1 };
+                b.pieces[0][KING] = 1u128 << 5;   // белый король f1
+                b.pieces[1][KING] = 1u128 << 75;  // чёрный король f8
+                b
         }
 
         // К vs К — ничья
@@ -901,7 +922,7 @@ impl SingleMcts {
 
     // Версия без Vec<Vec<f32>> — принимает плоский срез политик
     fn apply_inference_flat(&mut self, pol_flat: &[f32], policy_size: usize,
-                             values: &[f32], rng: &mut u64) {
+                            values: &[f32], rng: &mut u64) {
         let pending = std::mem::take(&mut self.pending);
         let boards  = std::mem::take(&mut self.pending_boards);
         for (i, leaf) in pending.into_iter().enumerate() {
@@ -921,95 +942,95 @@ impl SingleMcts {
             let v = if side == 0 { values[i] } else { -values[i] };
             self.backup(leaf, v);
         }
-    }
+                            }
 
-    fn get_policy(&self) -> Vec<f32> {
-        let root = self.arena.get(self.root);
-        let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
-        let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
-        if total > 0 {
-            for &ci in &root.children {
-                let c = self.arena.get(ci);
-                let m = c.move_from_parent;
-                let f = (m >> 10) & 0x7F;
-                let t = (m >> 3) & 0x7F;
-                let pv = m & 0b111;
-                let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
-                let idx = Board::move_to_idx(f, t, p);
-                if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
-            }
-        }
-        pol
-    }
+                            fn get_policy(&self) -> Vec<f32> {
+                                let root = self.arena.get(self.root);
+                                let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
+                                let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
+                                if total > 0 {
+                                    for &ci in &root.children {
+                                        let c = self.arena.get(ci);
+                                        let m = c.move_from_parent;
+                                        let f = (m >> 10) & 0x7F;
+                                        let t = (m >> 3) & 0x7F;
+                                        let pv = m & 0b111;
+                                        let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                                        let idx = Board::move_to_idx(f, t, p);
+                                        if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
+                                    }
+                                }
+                                pol
+                            }
 
-    fn is_over(&mut self) -> bool {
-        if self.root_board.halfmove_clock >= 100 { return true; }
-        if self.root_board.is_insufficient_material() { return true; }
-        // Троекратное повторение позиции
-        let cur_hash = Self::board_hash(&self.root_board);
-        let repeats = self.position_history.iter().filter(|&&h| h == cur_hash).count();
-        if repeats >= 2 { return true; }
-        self.root_board.gen_legal().is_empty()
-    }
+                            fn is_over(&mut self) -> bool {
+                                if self.root_board.halfmove_clock >= 100 { return true; }
+                                if self.root_board.is_insufficient_material() { return true; }
+                                // Троекратное повторение позиции
+                                let cur_hash = Self::board_hash(&self.root_board);
+                                let repeats = self.position_history.iter().filter(|&&h| h == cur_hash).count();
+                                if repeats >= 2 { return true; }
+                                self.root_board.gen_legal().is_empty()
+                            }
 
-    fn root_value(&self) -> f32 {
-        self.arena.get(self.root).wl
-    }
+                            fn root_value(&self) -> f32 {
+                                self.arena.get(self.root).wl
+                            }
 
-    // Рекурсивно копирует поддерево из self.arena в new_arena (без Board).
-    fn copy_subtree(&self, old_idx: usize, new_arena: &mut Arena, new_parent: Option<usize>) -> usize {
-        let old_node = self.arena.get(old_idx);
-        let mut new_node = MctsNode::new(
-            old_node.move_from_parent,
-            old_node.prior,
-            old_node.side,
-            new_parent,
-        );
-        new_node.visits      = old_node.visits;
-        new_node.wl          = old_node.wl;
-        new_node.is_expanded = old_node.is_expanded;
-        new_node.is_terminal = old_node.is_terminal;
-        let new_idx = new_arena.add(new_node);
-        let children: Vec<usize> = old_node.children.clone();
-        let mut new_children = Vec::with_capacity(children.len());
-        for child_old in children {
-            new_children.push(self.copy_subtree(child_old, new_arena, Some(new_idx)));
-        }
-        new_arena.get_mut(new_idx).children = new_children;
-        new_idx
-    }
+                            // Рекурсивно копирует поддерево из self.arena в new_arena (без Board).
+                            fn copy_subtree(&self, old_idx: usize, new_arena: &mut Arena, new_parent: Option<usize>) -> usize {
+                                let old_node = self.arena.get(old_idx);
+                                let mut new_node = MctsNode::new(
+                                    old_node.move_from_parent,
+                                    old_node.prior,
+                                    old_node.side,
+                                    new_parent,
+                                );
+                                new_node.visits      = old_node.visits;
+                                new_node.wl          = old_node.wl;
+                                new_node.is_expanded = old_node.is_expanded;
+                                new_node.is_terminal = old_node.is_terminal;
+                                let new_idx = new_arena.add(new_node);
+                                let children: Vec<usize> = old_node.children.clone();
+                                let mut new_children = Vec::with_capacity(children.len());
+                                for child_old in children {
+                                    new_children.push(self.copy_subtree(child_old, new_arena, Some(new_idx)));
+                                }
+                                new_arena.get_mut(new_idx).children = new_children;
+                                new_idx
+                            }
 
-    fn make_move(&mut self, m_int: u32) {
-        // Применяем ход к root_board
-        let pv = m_int & 0b111;
-        let t  = (m_int >> 3) & 0x7F;
-        let f  = (m_int >> 10) & 0x7F;
-        let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
-        self.root_board.apply_move(f, t, p);
-        let new_side = self.root_board.side as u8;
+                            fn make_move(&mut self, m_int: u32) {
+                                // Применяем ход к root_board
+                                let pv = m_int & 0b111;
+                                let t  = (m_int >> 3) & 0x7F;
+                                let f  = (m_int >> 10) & 0x7F;
+                                let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                                self.root_board.apply_move(f, t, p);
+                                let new_side = self.root_board.side as u8;
 
-        let child_idx = self.arena.get(self.root).children.iter()
-            .copied()
-            .find(|&ci| self.arena.get(ci).move_from_parent == m_int);
+                                let child_idx = self.arena.get(self.root).children.iter()
+                                .copied()
+                                .find(|&ci| self.arena.get(ci).move_from_parent == m_int);
 
-        // Tree GC — копируем только нужное поддерево в новую арену.
-        let mut new_arena = Arena::new(8192);
-        self.root = if let Some(ci) = child_idx {
-            self.copy_subtree(ci, &mut new_arena, None)
-        } else {
-            // Ход не был в дереве — создаём корень с нуля
-            new_arena.add(MctsNode::new(m_int, 1.0, new_side, None))
-        };
-        self.arena = new_arena;
-        self.pending.clear();
-        self.pending_boards.clear();
-        // Обновляем историю: при необратимом ходе (взятие/пешка) старые позиции не повторятся
-        let new_hash = Self::board_hash(&self.root_board);
-        if self.root_board.halfmove_clock == 0 {
-            self.position_history.clear();
-        }
-        self.position_history.push(new_hash);
-    }
+                                // Tree GC — копируем только нужное поддерево в новую арену.
+                                let mut new_arena = Arena::new(8192);
+                                self.root = if let Some(ci) = child_idx {
+                                    self.copy_subtree(ci, &mut new_arena, None)
+                                } else {
+                                    // Ход не был в дереве — создаём корень с нуля
+                                    new_arena.add(MctsNode::new(m_int, 1.0, new_side, None))
+                                };
+                                self.arena = new_arena;
+                                self.pending.clear();
+                                self.pending_boards.clear();
+                                // Обновляем историю: при необратимом ходе (взятие/пешка) старые позиции не повторятся
+                                let new_hash = Self::board_hash(&self.root_board);
+                                if self.root_board.halfmove_clock == 0 {
+                                    self.position_history.clear();
+                                }
+                                self.position_history.push(new_hash);
+                            }
 }
 
 /// RustMCTS — батчевый MCTS для N игр одновременно.
@@ -1036,31 +1057,35 @@ impl RustMCTS {
     /// Возвращает 2D NumPy массив формы (N, 1600) — прямой доступ к памяти, без Python float объектов.
     pub fn collect_leaves<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
         self.leaf_game_map.clear();
-        self.leaf_counts = vec![0; self.games.len()];
+        let mut new_counts = vec![0usize; self.games.len()];
         let mut flat: Vec<f32> = Vec::new();
         let mut total = 0usize;
 
         for (g, game) in self.games.iter_mut().enumerate() {
             if game.is_over() { continue; }
-            // Early stopping: если позиция уже решена — не тратим симуляции
             let sims_left = self.parallel_sims as i32;
             if game.best_move_is_decided(sims_left) { continue; }
             let tensors = game.collect_leaves(self.parallel_sims, &mut self.rng);
-            self.leaf_counts[g] = tensors.len();
+            new_counts[g] = tensors.len();
             for _ in &tensors { self.leaf_game_map.push(g); }
             total += tensors.len();
             for t in tensors { flat.extend_from_slice(&t); }
         }
 
-        let cols = 1600usize; // 20 * 8 * 10
+        // leaf_counts сохраняется для get_current_batch_counts().
+        // Двойная буферизация управляется со стороны Python: после collect_leaves()
+        // Python вызывает get_current_batch_counts() и сам хранит counts предыдущего батча,
+        // передавая их в apply_inference_buffered — поэтому поле prev_batch здесь не нужно.
+        self.leaf_counts = new_counts;
+
+        let cols = 1600usize;
         if total == 0 {
-            // Возвращаем пустой массив (0, 1600) — Python проверит shape[0] == 0
             Array2::<f32>::zeros((0, cols)).into_pyarray(py).into()
         } else {
             Array2::from_shape_vec((total, cols), flat)
-                .expect("collect_leaves: shape mismatch")
-                .into_pyarray(py)
-                .into()
+            .expect("collect_leaves: shape mismatch")
+            .into_pyarray(py)
+            .into()
         }
     }
 
@@ -1098,6 +1123,42 @@ impl RustMCTS {
             let start = offset * policy_size;
             let end   = (offset + count) * policy_size;
             if end > pol_flat.len() { break; }  // защита от edge cases
+            self.games[g].apply_inference_flat(
+                &pol_flat[start..end], policy_size,
+                &val[offset..offset + count], rng,
+            );
+            offset += count;
+        }
+    }
+
+    /// Возвращает leaf_counts текущего батча — Python сохраняет и передаёт
+    /// в apply_inference_buffered при двойной буферизации.
+    pub fn get_current_batch_counts(&self) -> Vec<usize> {
+        self.leaf_counts.clone()
+    }
+
+    /// apply_inference с явным batch_counts для правильной двойной буферизации.
+    pub fn apply_inference_buffered(
+        &mut self,
+        policies: PyReadonlyArray2<f32>,
+        values: PyReadonlyArray1<f32>,
+        batch_counts: Vec<usize>,
+    ) {
+        let pol_flat    = policies.as_slice().expect("policies must be C-contiguous");
+        let val         = values.as_slice().expect("values must be contiguous");
+        let shape       = policies.shape();
+        let n_leaves    = shape[0];
+        let policy_size = shape[1];
+        let total: usize = batch_counts.iter().sum();
+        if total != n_leaves { return; }
+
+        let mut offset = 0;
+        for (g, &count) in batch_counts.iter().enumerate() {
+            if count == 0 { continue; }
+            let rng   = &mut self.rng;
+            let start = offset * policy_size;
+            let end   = (offset + count) * policy_size;
+            if end > pol_flat.len() { break; }
             self.games[g].apply_inference_flat(
                 &pol_flat[start..end], policy_size,
                 &val[offset..offset + count], rng,
