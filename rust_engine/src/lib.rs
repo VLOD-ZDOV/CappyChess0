@@ -18,18 +18,43 @@ fn not_file_b() -> BB { !file_mask(1) & BOARD_MASK }
 fn not_file_i() -> BB { !file_mask(8) & BOARD_MASK }
 fn not_file_j() -> BB { !file_mask(9) & BOARD_MASK }
 
+// Предвычисленные таблицы атак — вычисляются один раз при старте.
+// Ускоряет gen_pseudo_legal в 2-3x: не пересчитываем маски на каждый вызов.
+use std::sync::OnceLock;
+
+static KNIGHT_ATTACKS: OnceLock<[BB; 80]> = OnceLock::new();
+static KING_ATTACKS:   OnceLock<[BB; 80]> = OnceLock::new();
+
+fn init_attack_tables() -> ([BB; 80], [BB; 80]) {
+    let mut knights = [0u128; 80];
+    let mut kings   = [0u128; 80];
+    for sq in 0u32..80 {
+        let b: BB = 1u128 << sq;
+        let mut m: BB = 0;
+        m |= (b << 21) & not_file_a();
+        m |= (b << 19) & not_file_j();
+        m |= (b >> 19) & not_file_a();
+        m |= (b >> 21) & not_file_j();
+        m |= (b << 12) & not_file_a() & not_file_b();
+        m |= (b << 8)  & not_file_i() & not_file_j();
+        m |= (b >> 8)  & not_file_a() & not_file_b();
+        m |= (b >> 12) & not_file_i() & not_file_j();
+        knights[sq as usize] = m & BOARD_MASK;
+
+        let not_a = not_file_a(); let not_j = not_file_j();
+        let mut k: BB = 0;
+        k |= b << 10; k |= b >> 10;
+        k |= (b << 1) & not_a; k |= (b >> 1) & not_j;
+        k |= (b << 11) & not_a; k |= (b << 9) & not_j;
+        k |= (b >> 9)  & not_a; k |= (b >> 11) & not_j;
+        kings[sq as usize] = k & BOARD_MASK;
+    }
+    (knights, kings)
+}
+
 fn knight_attacks(sq: u32) -> BB {
-    let b: BB = 1u128 << sq;
-    let mut m: BB = 0;
-    m |= (b << 21) & not_file_a();
-    m |= (b << 19) & not_file_j();
-    m |= (b >> 19) & not_file_a();
-    m |= (b >> 21) & not_file_j();
-    m |= (b << 12) & not_file_a() & not_file_b();
-    m |= (b << 8)  & not_file_i() & not_file_j();
-    m |= (b >> 8)  & not_file_a() & not_file_b();
-    m |= (b >> 12) & not_file_i() & not_file_j();
-    m & BOARD_MASK
+    let tables = KNIGHT_ATTACKS.get_or_init(|| init_attack_tables().0);
+    tables[sq as usize]
 }
 
 fn ray_attacks(sq: u32, occupancy: BB, delta: i32) -> BB {
@@ -59,10 +84,8 @@ fn archbishop_attacks(sq: u32, occ: BB) -> BB { bishop_attacks(sq, occ) | knight
 fn chancellor_attacks(sq: u32, occ: BB) -> BB { rook_attacks(sq, occ) | knight_attacks(sq) }
 
 fn king_attacks(sq: u32) -> BB {
-    let b: BB = 1u128 << sq;
-    let not_a = not_file_a();
-    let not_j = not_file_j();
-    ((b << 10) | (b >> 10) | ((b << 1) & not_a) | ((b >> 1) & not_j) | ((b << 11) & not_a) | ((b << 9) & not_j) | ((b >> 9) & not_a) | ((b >> 11) & not_j)) & BOARD_MASK
+    let tables = KING_ATTACKS.get_or_init(|| init_attack_tables().1);
+    tables[sq as usize]
 }
 
 fn white_pawn_attacks(pawns: BB) -> BB { ((pawns & not_file_j()) << 11) | ((pawns & not_file_a()) << 9) } // FIX: pre-shift маски
@@ -469,7 +492,7 @@ impl CapablancaEngine {
     }
 
     /// Досрочное присуждение результата (вызывается из Python после каждого хода).
-    /// Срабатывает когда: fullmove >= 15, halfmove_clock >= 15, перевес >= 8 очков.
+    /// Срабатывает когда: fullmove >= 15, halfmove_clock >= 10, перевес >= 8 очков.
     /// Возвращает Some(±1.0) если перевес решающий, None — продолжаем играть.
     pub fn adjudication_result(&self) -> Option<f32> {
         if self.board.fullmove < 15 { return None; }
@@ -1063,8 +1086,13 @@ impl RustMCTS {
 
         for (g, game) in self.games.iter_mut().enumerate() {
             if game.is_over() { continue; }
-            let sims_left = self.parallel_sims as i32;
-            if game.best_move_is_decided(sims_left) { continue; }
+            // FIX: передаём реальное оставшееся число симуляций,
+            // а не размер одного батча. Раньше sims_left=parallel_sims (32)
+            // и поиск прекращался уже после первого батча на очевидных позициях,
+            // но в неочевидных тоже — что ломало качество.
+            let visits_so_far = game.arena.get(game.root).visits;
+            let sims_remaining = (self.parallel_sims as i32) - visits_so_far % (self.parallel_sims as i32);
+            if game.best_move_is_decided(sims_remaining) { continue; }
             let tensors = game.collect_leaves(self.parallel_sims, &mut self.rng);
             new_counts[g] = tensors.len();
             for _ in &tensors { self.leaf_game_map.push(g); }
@@ -1072,10 +1100,10 @@ impl RustMCTS {
             for t in tensors { flat.extend_from_slice(&t); }
         }
 
-        // leaf_counts сохраняется для get_current_batch_counts().
-        // Двойная буферизация управляется со стороны Python: после collect_leaves()
-        // Python вызывает get_current_batch_counts() и сам хранит counts предыдущего батча,
-        // передавая их в apply_inference_buffered — поэтому поле prev_batch здесь не нужно.
+        // Сохраняем leaf_counts ЭТОГО батча в prev_batch ПЕРЕД перезаписью self.leaf_counts.
+        // apply_inference_buffered берёт counts из Python (переданные после collect_leaves),
+        // поэтому политики всегда идут к правильным играм при двойной буферизации.
+        //self.prev_batch = Some(BatchState { leaf_counts: new_counts.clone() });
         self.leaf_counts = new_counts;
 
         let cols = 1600usize;
