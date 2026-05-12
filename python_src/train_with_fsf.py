@@ -38,6 +38,7 @@ from train import (
     pack_sample, unpack_policy,
     generate_games, train_epoch,
     policy_diversity_stats, print_diversity,
+    ModelEMA,  # EMA для self-play стабилизации
 )
 
 try:
@@ -268,8 +269,8 @@ def train_with_fsf(cfg: Config, args):
 
     if hasattr(torch, "compile"):
         try:
-            net = torch.compile(net)
-            print("✅ torch.compile() применён\n")
+            net = torch.compile(net, dynamic=True)
+            print("✅ torch.compile(dynamic=True) применён\n")
         except Exception as e:
             print(f"⚠️  torch.compile(): {e}\n")
 
@@ -277,11 +278,59 @@ def train_with_fsf(cfg: Config, args):
         net.parameters(), lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay, fused=True,
     )
-    scaler    = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=50, T_mult=2, eta_min=cfg.learning_rate * 0.05
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
+
+    # WarmupCosineScheduler из train.py — тот же формат state_dict
+    WARMUP_ITERS = 5
+
+    class WarmupCosineScheduler:
+        def __init__(self, optimizer, warmup_iters, T_0, T_mult, eta_min, base_lr):
+            self.warmup_iters = warmup_iters
+            self.base_lr = base_lr
+            self.cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+            )
+            self._last_lr = [base_lr]
+            self._iter = 0
+            self.optimizer = optimizer
+
+        def step(self):
+            self._iter += 1
+            if self._iter <= self.warmup_iters:
+                lr = self.base_lr * self._iter / self.warmup_iters
+                for pg in self.optimizer.param_groups: pg['lr'] = lr
+                self._last_lr = [lr]
+            else:
+                self.cosine.step()
+                self._last_lr = self.cosine.get_last_lr()
+
+        def get_last_lr(self): return self._last_lr
+
+        def state_dict(self):
+            return {"cosine": self.cosine.state_dict(), "_iter": self._iter}
+
+        def load_state_dict(self, sd):
+            if isinstance(sd, dict) and "cosine" in sd:
+                self.cosine.load_state_dict(sd["cosine"])
+                self._iter = sd.get("_iter", 0)
+            else:
+                try:
+                    self.cosine.load_state_dict(sd)
+                    self._iter = 0
+                except Exception:
+                    self._iter = 0
+
+    scheduler = WarmupCosineScheduler(
+        optimizer, warmup_iters=WARMUP_ITERS,
+        T_0=100, T_mult=2,
+        eta_min=cfg.learning_rate * 0.05,
+        base_lr=cfg.learning_rate,
     )
-    buffer    = ReplayBuffer(cfg.buffer_max)
+
+    # EMA копия весов для self-play
+    ema = ModelEMA(net, decay=cfg.ema_decay) if cfg.use_ema else None
+
+    buffer = ReplayBuffer(cfg.buffer_max)
 
     buffer_path = os.path.join(cfg.checkpoint_dir, "buffer.pkl")
     if os.path.exists(buffer_path):
@@ -323,8 +372,17 @@ def train_with_fsf(cfg: Config, args):
         if cfg.reset_scheduler or "scheduler" not in ckpt:
             print("🔄 Scheduler сброшен\n")
         else:
-            try: scheduler.load_state_dict(ckpt["scheduler"])
-            except: print("⚠️  Scheduler сброшен\n")
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception as e:
+                print(f"⚠️  Scheduler не загружен ({e}), сброшен\n")
+        # EMA загрузка
+        if ema is not None and "ema" in ckpt:
+            try:
+                ema.load_state_dict(ckpt["ema"])
+                print("✅ EMA загружен")
+            except Exception as e:
+                print(f"⚠️  EMA не загружен: {e}")
         start_iter = ckpt.get("iteration", 0) + 1
         print(f"📂 Загружен: {os.path.basename(load_path)} (итерация {start_iter})")
         if len(buffer) > 0:
@@ -343,15 +401,25 @@ def train_with_fsf(cfg: Config, args):
         print(f"[Iter {iteration}] {phase} | self={self_games}"
               + (f" + fsf={fsf_games_now}" if fsf_games_now > 0 else ""))
 
-        net.eval()
-        torch.set_grad_enabled(False)
         sp_start = time.time()
 
-        # ── Self-play ─────────────────────────────────────────────────────────
+        # Используем EMA веса для self-play (если включён)
+        if ema is not None:
+            saved_state = {k: v.clone() for k, v in
+                           (net._orig_mod if hasattr(net, '_orig_mod') else net).state_dict().items()
+                           if v.dtype.is_floating_point}
+            ema.apply_to(net)
+
+        net.eval()
+
+        # Self-play под inference_mode — быстрее set_grad_enabled(False)
         orig_games = cfg.games_per_iter
         cfg.games_per_iter = self_games
-        self_samples = generate_games(net, cfg, device)
+        with torch.inference_mode():
+            self_samples = generate_games(net, cfg, device, iteration)
         cfg.games_per_iter = orig_games
+
+        # FSF играем тоже на EMA весах если есть
 
         sp_time = time.time() - sp_start
         print(f"  Self: {len(self_samples):,} поз за {sp_time:.1f}s "
@@ -377,8 +445,12 @@ def train_with_fsf(cfg: Config, args):
             if extra > 0:
                 print(f"  ℹ️  FSF недоступен → +{extra} self-play игр вместо")
                 cfg.games_per_iter = extra
-                fsf_samples = generate_games(net, cfg, device)
+                fsf_samples = generate_games(net, cfg, device, iteration)
                 cfg.games_per_iter = orig_games
+
+        # Восстанавливаем тренировочные веса (после EMA self-play)
+        if ema is not None:
+            (net._orig_mod if hasattr(net, '_orig_mod') else net).load_state_dict(saved_state, strict=False)
 
         # ── Все данные в буфер ────────────────────────────────────────────────
         all_new = self_samples + fsf_samples
@@ -404,11 +476,13 @@ def train_with_fsf(cfg: Config, args):
             print(f"  ⏳ Буфер {len(buffer):,} < {cfg.buffer_min_to_train:,}, пропуск\n")
             continue
 
-        torch.set_grad_enabled(True)
         net.train()
         print(f"  🏋️  Тренировка (до {cfg.train_steps} шагов)...")
         t0 = time.time()
         metrics = train_epoch(net, optimizer, buffer, cfg, device, scaler, iteration)
+        # Обновляем EMA после каждой итерации train
+        if ema is not None:
+            ema.update(net)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
@@ -433,6 +507,8 @@ def train_with_fsf(cfg: Config, args):
                 "scheduler": scheduler.state_dict(),
                 "metrics": metrics,
             }
+            if ema is not None:
+                ckpt_data["ema"] = ema.state_dict()
             # latest.pth — перезаписывается каждую итерацию
             latest_save = os.path.join(cfg.checkpoint_dir, "latest.pth")
             torch.save(ckpt_data, latest_save)
@@ -474,6 +550,13 @@ def main():
     parser.add_argument("--channels",            type=int,   default=128)
     parser.add_argument("--res-blocks",           type=int,   default=10)
     parser.add_argument("--simulations",          type=int,   default=400)
+    parser.add_argument("--fast-simulations",     type=int,   default=100,
+                        help="Симуляций на быстрых ходах playout cap (default: 100)")
+    parser.add_argument("--fast-sim-fraction",    type=float, default=0.75,
+                        help="Доля ходов с быстрым поиском (0.75 = 75 пр. быстрых)")
+    parser.add_argument("--no-playout-cap",       dest="playout_cap_train_only_full",
+                        action="store_false", default=True,
+                        help="Отключить playout cap")
     parser.add_argument("--games",                type=int,   default=384,
                         help="Базовое число self-play игр (используется в фазе 50+)")
     parser.add_argument("--mcts-batch",           type=int,   default=512)
@@ -493,6 +576,10 @@ def main():
     parser.add_argument("--reset-scheduler",      action="store_true")
     parser.add_argument("--reset-buffer",         action="store_true")
     parser.add_argument("--collapse-threshold",   type=float, default=0.01)
+    parser.add_argument("--use-ema",              action="store_true", default=True,
+                        help="EMA веса для self-play (default: True)")
+    parser.add_argument("--no-ema",               dest="use_ema", action="store_false")
+    parser.add_argument("--ema-decay",            type=float, default=0.999)
 
     # FSF параметры
     parser.add_argument("--fsf-path",      type=str, default=None,
@@ -514,6 +601,9 @@ def main():
         num_channels=args.channels,
         num_res_blocks=args.res_blocks,
         simulations=args.simulations,
+        fast_simulations=getattr(args, 'fast_simulations', 100),
+        fast_sim_fraction=getattr(args, 'fast_sim_fraction', 0.75),
+        playout_cap_train_only_full=getattr(args, 'playout_cap_train_only_full', True),
         games_per_iter=args.games,
         mcts_batch=args.mcts_batch,
         mcts_parallel_sims=args.mcts_parallel_sims,
@@ -531,6 +621,8 @@ def main():
         save_every=args.save_every,
         reset_scheduler=args.reset_scheduler,
         collapse_threshold=args.collapse_threshold,
+        use_ema=getattr(args, 'use_ema', True),
+        ema_decay=getattr(args, 'ema_decay', 0.999),
     )
 
     train_with_fsf(cfg, args)

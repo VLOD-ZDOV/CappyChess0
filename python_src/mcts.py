@@ -79,14 +79,22 @@ class UltraFastMCTS:
         if n == 0:
             return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty((0,), dtype=np.float32)
 
+        # Паддинг до кратного parallel_sims: маленькие батчи плохо утилизируют GPU.
+        # Паддируем дублированием последней позиции, обрезаем результат до n в конце.
+        ps = self._parallel_sims
+        target = ((n + ps - 1) // ps) * ps
+        n_pad = target - n
+
         arr = tensors.reshape(n, 20, 8, 10)
-        if n <= self.pinned_size:
-            buf = self.pinned_buf[:n]
+        if n_pad > 0:
+            arr = np.concatenate([arr, np.repeat(arr[-1:], n_pad, axis=0)], axis=0)
+        n_total = arr.shape[0]
+
+        if n_total <= self.pinned_size:
+            buf = self.pinned_buf[:n_total]
             buf.copy_(torch.from_numpy(arr))
             x = buf.to(self.device, non_blocking=True)
         else:
-            # Батч больше pinned buffer — аллоцируем новый
-            # (редкий случай, только при очень большом parallel_sims)
             x = torch.from_numpy(np.ascontiguousarray(arr)).to(self.device, non_blocking=True)
 
         x = x.to(memory_format=torch.channels_last)
@@ -116,7 +124,8 @@ class UltraFastMCTS:
             # Совместимость со старыми скалярными чекпоинтами
             q_values = values_f.view(-1).cpu().numpy()
 
-        return policies, q_values
+        # Убираем паддинг — возвращаем только реальные n позиций
+        return policies[:n], q_values[:n]
 
     def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
         if RUST_MCTS_AVAILABLE:

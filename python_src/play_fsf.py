@@ -25,7 +25,7 @@ def parse_args():
 # Настройки
 GAMES_TO_PLAY = 150
 FSF_NODES_LIMIT = 300
-MCTS_SIMULATIONS = 100
+MCTS_SIMULATIONS = 300
 MAX_MOVES = 200
 FSF_PATH = "./fairy-stockfish-largeboard_x86-64-bmi2" # Укажи свой путь
 
@@ -138,7 +138,7 @@ class FairyStockfishWrapper:
 # Главный цикл
 # ==========================================
 def generate_fsf_games():
-    cfg = Config(num_channels=128, num_res_blocks=10) # Твои настройки сети
+    cfg = Config(num_channels=256, num_res_blocks=15) # Твои настройки сети
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # 1. Загрузка сети
