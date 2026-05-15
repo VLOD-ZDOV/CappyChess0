@@ -491,17 +491,7 @@ impl CapablancaEngine {
         0.0
     }
 
-    /// Досрочное присуждение результата (вызывается из Python после каждого хода).
-    /// Срабатывает когда: fullmove >= 15, halfmove_clock >= 10, перевес >= 8 очков.
-    /// Возвращает Some(±1.0) если перевес решающий, None — продолжаем играть.
-    pub fn adjudication_result(&self) -> Option<f32> {
-        if self.board.fullmove < 15 { return None; }
-        if self.board.halfmove_clock < 10 { return None; }
-        let balance = self.board.material_balance();
-        if balance >= 8  { return Some( 1.0); }
-        if balance <= -8 { return Some(-1.0); }
-        None
-    }
+    pub fn adjudication_result(&self) -> Option<f32> { None }
 }
 
 // РЕГИСТРАЦИЯ МОДУЛЯ С ЯВНЫМ ИМЕНЕМ
@@ -634,7 +624,10 @@ mod tests {
 
 const POLICY_SIZE_MCTS: usize = 7000;
 const VIRTUAL_LOSS_V: i32 = 3;
-const C_PUCT_V: f32 = 1.25;
+// Параметры MCTS из lc0 params.cc — тюненные на миллионах партий.
+const C_PUCT_V: f32 = 1.745;        // CPuct (lc0)
+const C_PUCT_FACTOR: f32 = 3.894;   // CPuctFactor — множитель для логарифмического роста
+const C_PUCT_BASE: f32 = 38739.0;   // CPuctBase — точка перегиба
 const DIRICHLET_ALPHA_V: f64 = 0.3;
 const DIRICHLET_EPS_V: f64 = 0.35; // FIX: повышено с 0.25 — больше исследования на старте
 
@@ -727,8 +720,9 @@ struct SingleMcts {
     root_board: Board,
     pending: Vec<usize>,
     pending_boards: Vec<Board>,
-    // История хэшей позиций для детекции троекратного повторения
     position_history: Vec<u64>,
+    // Переиспользуемый буфер для collect_leaves — без аллокаций каждый шаг
+    leaf_tensor_buf: Vec<f32>,
 }
 
 impl SingleMcts {
@@ -757,6 +751,7 @@ impl SingleMcts {
             arena, root, root_board: board,
             pending: Vec::new(), pending_boards: Vec::new(),
             position_history: vec![initial_hash],
+            leaf_tensor_buf: Vec::with_capacity(8192 * 1600),
         }
     }
 
@@ -799,17 +794,18 @@ impl SingleMcts {
             let parent_visits = (self.arena.get(idx).visits + self.arena.get(idx).virtual_loss).max(1);
             let sqrt_n = (parent_visits as f32).sqrt();
 
-            // FIX: динамический CPUCT из lc0 (CPuctBase=19652, CPuctInit=C_PUCT_V).
-            // При малом N ≈ C_PUCT_V, при большом N растёт логарифмически.
-            // Это делает поиск шире при многих симуляциях.
-            const CPUCT_BASE: f32 = 19652.0;
-            let cpuct = C_PUCT_V + ((parent_visits as f32 + CPUCT_BASE) / CPUCT_BASE).ln();
+            // Динамический CPUCT по формуле lc0 (params.cc):
+            //   cpuct = CPuct + CPuctFactor * ln((N + CPuctBase) / CPuctBase)
+            // Тюненные значения: CPuct=1.745, CPuctFactor=3.894, CPuctBase=38739
+            // При N=0: cpuct ≈ 1.745, при N=10K: ≈ 2.7, при N=100K: ≈ 4.0
+            let cpuct = C_PUCT_V
+                + C_PUCT_FACTOR * ((parent_visits as f32 + C_PUCT_BASE) / C_PUCT_BASE).ln();
 
-            // FPU (First Play Urgency): непосещённый узел получает оценку
-            // parent_q - fpu_reduction, а не 0. Иначе движок тратит симуляции
-            // на явно плохие ходы только потому что у них visits=0.
+            // FPU из lc0 params.cc: FpuValue = 0.330 (Reduction strategy).
+            // Большее значение = меньше стимула исследовать неизвестное (exploitation).
+            // Раньше 0.1 — было слишком оптимистично для непосещённых узлов.
             let parent_q = self.arena.get(idx).q();
-            const FPU_REDUCTION: f32 = 0.1;
+            const FPU_REDUCTION: f32 = 0.330;
             // Ограничиваем снизу: при очень отрицательном parent_q дети всё равно исследуются
             let fpu = (parent_q - FPU_REDUCTION).max(-1.0);
 
@@ -907,6 +903,28 @@ impl SingleMcts {
         second + sims_remaining < best
     }
 
+    // Версия с переиспользуемым буфером — без Vec<Vec<f32>> аллокаций
+    fn collect_leaves_into_buf(&mut self, parallel: usize, _rng: &mut u64) -> usize {
+        self.pending.clear();
+        self.pending_boards.clear();
+        self.leaf_tensor_buf.clear();
+        let mut count = 0usize;
+        for _ in 0..parallel {
+            if let Some(leaf) = self.select() {
+                if self.arena.get(leaf).is_terminal { continue; }
+                self.apply_vloss(leaf, VIRTUAL_LOSS_V);
+                let board = self.board_at(leaf);
+                // extend_from_slice — пишем прямо в reusable буфер
+                self.leaf_tensor_buf.extend_from_slice(&board.to_tensor());
+                self.pending_boards.push(board);
+                self.pending.push(leaf);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    // Старая версия — оставлена для совместимости
     fn collect_leaves(&mut self, parallel: usize, _rng: &mut u64) -> Vec<Vec<f32>> {
         self.pending.clear();
         self.pending_boards.clear();
@@ -915,7 +933,6 @@ impl SingleMcts {
             if let Some(leaf) = self.select() {
                 if self.arena.get(leaf).is_terminal { continue; }
                 self.apply_vloss(leaf, VIRTUAL_LOSS_V);
-                // Восстанавливаем позицию проходом от корня — O(depth)
                 let board = self.board_at(leaf);
                 tensors.push(board.to_tensor());
                 self.pending_boards.push(board);
@@ -1056,8 +1073,14 @@ impl SingleMcts {
                             }
 }
 
+/// BatchState хранит leaf_counts вместе с данными батча.
+/// Это позволяет двойной буферизации применять политики к правильному батчу —
+/// self.leaf_counts перезаписывается следующим collect_leaves, но BatchState нет.
+struct BatchState {
+    leaf_counts: Vec<usize>,
+}
+
 /// RustMCTS — батчевый MCTS для N игр одновременно.
-/// Python управляет только GPU inference, всё остальное в Rust.
 #[pyclass]
 pub struct RustMCTS {
     games: Vec<SingleMcts>,
@@ -1065,6 +1088,7 @@ pub struct RustMCTS {
     rng: u64,
     leaf_game_map: Vec<usize>,
     leaf_counts: Vec<usize>,
+    prev_batch: Option<BatchState>,  // для корректной двойной буферизации
 }
 
 #[pymethods]
@@ -1073,7 +1097,7 @@ impl RustMCTS {
     pub fn new(engines: Vec<PyRef<CapablancaEngine>>, parallel_sims: usize) -> Self {
         let games = engines.iter().map(|e| SingleMcts::new(e.board.clone())).collect();
         RustMCTS { games, parallel_sims, rng: 0xdeadbeefcafe1234u64,
-            leaf_game_map: Vec::new(), leaf_counts: Vec::new() }
+            leaf_game_map: Vec::new(), leaf_counts: Vec::new(), prev_batch: None }
     }
 
     /// Собирает листья для inference.
@@ -1093,17 +1117,18 @@ impl RustMCTS {
             let visits_so_far = game.arena.get(game.root).visits;
             let sims_remaining = (self.parallel_sims as i32) - visits_so_far % (self.parallel_sims as i32);
             if game.best_move_is_decided(sims_remaining) { continue; }
-            let tensors = game.collect_leaves(self.parallel_sims, &mut self.rng);
-            new_counts[g] = tensors.len();
-            for _ in &tensors { self.leaf_game_map.push(g); }
-            total += tensors.len();
-            for t in tensors { flat.extend_from_slice(&t); }
+            // Используем буферизованный сбор без лишних аллокаций Vec<Vec<f32>>
+            let count = game.collect_leaves_into_buf(self.parallel_sims, &mut self.rng);
+            new_counts[g] = count;
+            for _ in 0..count { self.leaf_game_map.push(g); }
+            total += count;
+            flat.extend_from_slice(&game.leaf_tensor_buf);
         }
 
         // Сохраняем leaf_counts ЭТОГО батча в prev_batch ПЕРЕД перезаписью self.leaf_counts.
         // apply_inference_buffered берёт counts из Python (переданные после collect_leaves),
         // поэтому политики всегда идут к правильным играм при двойной буферизации.
-        //self.prev_batch = Some(BatchState { leaf_counts: new_counts.clone() });
+        self.prev_batch = Some(BatchState { leaf_counts: new_counts.clone() });
         self.leaf_counts = new_counts;
 
         let cols = 1600usize;
