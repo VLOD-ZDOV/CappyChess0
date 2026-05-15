@@ -13,12 +13,21 @@ import torch.nn.functional as F
 POLICY_SIZE = 7000  # FIX: было 6880 — макс. индекс промоушена = 6400+99*6+5 = 6999
 
 
+def _gn_groups(channels: int) -> int:
+    """GroupNorm: 8 каналов на группу (стандартный эвристик).
+    GroupNorm не имеет running stats → работает корректно при batch=1 (MCTS inference)
+    и не накапливает устаревшие статистики при смене распределения данных (curriculum).
+    Веса (weight/bias) совместимы с BatchNorm checkpoint по форме — strict=False загружает корректно.
+    """
+    return max(1, channels // 8)
+
+
 class ConvBnRelu(nn.Module):
     def __init__(self, in_ch, out_ch, kernel=3, padding=1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel, padding=padding, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.GroupNorm(_gn_groups(out_ch), out_ch),
             nn.ReLU(inplace=True),
         )
 
@@ -32,9 +41,9 @@ class ResBlock(nn.Module):
     def __init__(self, channels: int, se_ratio: int = 8):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(channels)
+        self.bn1   = nn.GroupNorm(_gn_groups(channels), channels)
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(channels)
+        self.bn2   = nn.GroupNorm(_gn_groups(channels), channels)
 
         # Squeeze-Excitation
         se_ch = max(channels // se_ratio, 1)
@@ -93,7 +102,7 @@ class CapablancaNet(nn.Module):
         # с размером сети. При 128ch: 128*80=10240 → 7000. Лучше представление ходов.
         self.policy_head = nn.Sequential(
             nn.Conv2d(num_channels, num_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(num_channels),
+            nn.GroupNorm(_gn_groups(num_channels), num_channels),
             nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(num_channels * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
@@ -107,7 +116,7 @@ class CapablancaNet(nn.Module):
         #   - cross-entropy loss вместо MSE — стабильнее обучение
         self.value_head = nn.Sequential(
             nn.Conv2d(num_channels, 8, kernel_size=1, bias=False),
-            nn.BatchNorm2d(8),
+            nn.GroupNorm(_gn_groups(8), 8),
             nn.ReLU(inplace=True),
             nn.Flatten(),
             nn.Linear(8 * self.BOARD_H * self.BOARD_W, 256),
@@ -121,7 +130,7 @@ class CapablancaNet(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):

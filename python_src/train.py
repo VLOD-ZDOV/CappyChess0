@@ -63,6 +63,44 @@ class ModelEMA:
                 self.shadow[k].copy_(sd[k])
 
 
+class LaggedOpponentPool:
+    """Сохраняет снимки весов модели с прошлых итераций как слабые оппоненты.
+
+    Создаёт естественный curriculum между Random и FSF-1:
+      iter 0-4  → только Random (пул пуст)
+      iter 5+   → lagged iter 0 (~=Random+ с опытом обучения)
+      iter 10+  → lagged iter 5 (~= ощутимо слабее текущей, но не Random)
+    Старые снимки взвешены выше — более слабый оппонент полезнее.
+    """
+
+    def __init__(self, max_snapshots: int = 5):
+        self.max_snapshots = max_snapshots
+        self.snapshots: List[Tuple[int, dict]] = []  # (iter, cpu_state_dict)
+
+    def maybe_save(self, net, iteration: int, interval: int):
+        if interval <= 0 or iteration % interval != 0:
+            return
+        src = net._orig_mod if hasattr(net, '_orig_mod') else net
+        sd = {k: v.clone().cpu() for k, v in src.state_dict().items()}
+        self.snapshots.append((iteration, sd))
+        if len(self.snapshots) > self.max_snapshots:
+            self.snapshots.pop(0)
+        print(f"  📸 Lagged pool: iter {iteration} сохранён ({len(self.snapshots)}/{self.max_snapshots})")
+
+    def sample(self):
+        """Возвращает (iteration, state_dict), взвешивая старые снимки сильнее."""
+        if not self.snapshots:
+            return None
+        n = len(self.snapshots)
+        weights = np.array([n - i for i in range(n)], dtype=np.float64)
+        weights /= weights.sum()
+        idx = int(np.random.choice(n, p=weights))
+        return self.snapshots[idx]
+
+    def __len__(self):
+        return len(self.snapshots)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fairy-Stockfish интеграция (опциональная, активируется через --fsf-path)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +213,7 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
         return [], 0, 0, 0
 
     fsf_value_alpha = getattr(cfg, 'fsf_value_alpha', 0.7)
+    fsf_noise_prob  = getattr(cfg, 'fsf_noise_prob', 0.0)
     use_random = (fsf_nodes == 0)
     fsf = None
     if not use_random:
@@ -222,15 +261,20 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
                 move = int(np.random.choice(legal))
 
             else:  # FSF's turn
-                uci, score_cp = fsf.best_move(uci_history, nodes=fsf_nodes)
-                if uci == "(none)": break
-                move = _uci_to_int(uci, engine)
-                if move is None:
-                    errors += 1; ok = False; break
-                # FSF оценивает позицию ПОСЛЕ последнего хода NN (сейчас очередь FSF)
-                # score_cp > 0 → FSF (side to move) выигрывает → для NN плохо
-                if nn_positions and nn_positions[-1][3] is None:
-                    nn_positions[-1][3] = -float(np.tanh(score_cp / 400.0))
+                # fsf_noise_prob > 0: иногда FSF ходит случайно → softened opponent
+                if fsf_noise_prob > 0.0 and np.random.random() < fsf_noise_prob:
+                    move = int(np.random.choice(legal))
+                    # Нет eval для случайного хода — не заполняем fsf_eval
+                else:
+                    uci, score_cp = fsf.best_move(uci_history, nodes=fsf_nodes)
+                    if uci == "(none)": break
+                    move = _uci_to_int(uci, engine)
+                    if move is None:
+                        errors += 1; ok = False; break
+                    # FSF оценивает позицию ПОСЛЕ последнего хода NN (сейчас очередь FSF)
+                    # score_cp > 0 → FSF (side to move) выигрывает → для NN плохо
+                    if nn_positions and nn_positions[-1][3] is None:
+                        nn_positions[-1][3] = -float(np.tanh(score_cp / 400.0))
 
             engine.make_move_int(move)
             uci_history.append(_int_to_uci(move))
@@ -242,7 +286,7 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
         if not ok: continue
         if adjudicated_result is not None: result = adjudicated_result
         elif engine.is_game_over(): result = engine.game_result()
-        else: result = engine.material_result()
+        else: result = 0.0 if cfg.timeout_as_draw else engine.material_result()
 
         if result > 0.5:    wins   += 1
         elif result < -0.5: losses += 1
@@ -268,6 +312,90 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
           f"ошибки={errors} | NN: +{nn_wins}/={nn_draws}/-{nn_losses} "
           f"| {len(all_samples)} позиций")
     return all_samples, nn_wins, nn_draws, nn_losses
+
+
+def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
+                           num_games: int, mcts_sims: int = 50):
+    """Играет текущую модель против старого чекпоинта (lagged_sd).
+
+    Текущая сеть (NN): с Dirichlet, полный исследовательский режим.
+    Lagged сеть (OPP): без Dirichlet, детерминированный режим.
+    Сохраняем только позиции текущей сети (как в generate_fsf_games).
+
+    Returns: (samples, cur_wins, cur_draws, cur_losses)
+    """
+    try:
+        from capablanca_engine import CapablancaEngine
+        from mcts import UltraFastMCTS
+    except ImportError:
+        print("  ❌ capablanca_engine не доступен для lagged games")
+        return [], 0, 0, 0
+
+    from model import CapablancaNet
+
+    lagged_net = CapablancaNet(cfg.num_channels, cfg.num_res_blocks).to(device)
+    lagged_net.load_state_dict(lagged_sd, strict=False)
+    lagged_net.eval()
+
+    mcts_cur = UltraFastMCTS(net, device, c_puct=1.745, batch_size=1,
+                              add_dirichlet=True, parallel_sims=1)
+    mcts_lag = UltraFastMCTS(lagged_net, device, c_puct=1.745, batch_size=1,
+                              add_dirichlet=False, parallel_sims=1)
+
+    all_samples = []
+    cur_wins = cur_draws = cur_losses = 0
+
+    for game_idx in range(num_games):
+        engine  = CapablancaEngine()
+        nn_side = game_idx % 2
+        positions = []   # (board_np, pol, side) — только позиции текущей сети
+        move_num = 0
+        adjudicated_result = None
+
+        while not engine.is_game_over() and move_num < cfg.max_game_length and adjudicated_result is None:
+            side  = engine.side_to_move()
+            legal = engine.get_legal_moves_int()
+            if not legal:
+                break
+            board_np = np.array(engine.get_board_tensor(), dtype=np.float32)
+
+            is_current = (side == nn_side)
+            pol = (mcts_cur if is_current else mcts_lag).search_games([engine], mcts_sims)[0]
+
+            raw   = np.array([pol[engine.move_int_to_policy_idx(m) or 0]
+                               for m in legal], dtype=np.float64)
+            raw   = np.power(np.maximum(raw, 1e-8), 1.0 / 0.8)
+            probs = raw / raw.sum()
+            move  = int(np.random.choice(legal, p=probs))
+
+            if is_current:
+                positions.append((board_np, pol.copy(), side))
+
+            engine.make_move_int(move)
+            move_num += 1
+            adj = engine.adjudication_result()
+            if adj is not None:
+                adjudicated_result = adj
+
+        if adjudicated_result is not None: result = adjudicated_result
+        elif engine.is_game_over():        result = engine.game_result()
+        else:                              result = 0.0 if cfg.timeout_as_draw else engine.material_result()
+
+        cur_result = result if nn_side == 0 else -result
+        if cur_result > 0.5:    cur_wins   += 1
+        elif cur_result < -0.5: cur_losses += 1
+        else:                   cur_draws  += 1
+
+        for board_np, pol, side in positions:
+            v = result if side == 0 else -result
+            all_samples.append(pack_sample(board_np, pol, float(v)))
+
+    del lagged_net
+    total = cur_wins + cur_draws + cur_losses
+    wr = (cur_wins + 0.5 * cur_draws) / total if total > 0 else 0.0
+    print(f"  Lagged NN: {num_games} партий | NN: +{cur_wins}/={cur_draws}/-{cur_losses} "
+          f"| wr={wr:.1%} | {len(all_samples)} позиций")
+    return all_samples, cur_wins, cur_draws, cur_losses
 
 
 import queue
@@ -373,6 +501,22 @@ class Config:
     curriculum_demote_threshold: float = 0.35   # avg winrate ниже → снижаем nodes
     curriculum_window: int = 3        # итераций для усреднения winrate
 
+    # Lagged opponent: играть против чекпоинта N итераций назад
+    # Заполняет разрыв между Random и FSF-1, не требуя внешнего движка.
+    # lag_opponent_interval=5 → каждые 5 итераций сохраняем снимок весов.
+    # lag_opponent_ratio=0.3 → 30% self-play игр vs lagged, 70% vs current.
+    lag_opponent_interval: int = 0    # 0 = отключено
+    lag_opponent_ratio: float = 0.0   # доля self-play vs lagged model
+    lag_opponent_pool_size: int = 5   # сколько снимков хранить
+    lag_opponent_sims: int = 50       # MCTS sims для lagged модели
+
+    # Softened FSF: FSF иногда ходит случайно → промежуточный уровень сложности
+    # 0.0 = детерминированный FSF, 0.4 = 40% ходов случайные
+    fsf_noise_prob: float = 0.0
+
+    # При таймауте (партия дошла до max_game_length): True = ничья, False = оценка по материалу
+    timeout_as_draw: bool = False
+
 
 CompactSample = Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], float]
 Sample = CompactSample
@@ -408,6 +552,7 @@ class ReplayBuffer:
 
     def push(self, samples: List[Sample]):
         for s in samples:
+            self._ptr = self._ptr % self.max_size  # защита от загрузки с другим max_size
             if not self._full:
                 self.data.append(s)
                 if len(self.data) == self.max_size:
@@ -611,11 +756,11 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 # Используем root value из MCTS (уже вычислен выше)
                 # sign: value с точки зрения стороны которая только что сделала ход
                 if move_num >= cfg.resign_min_move:
-                    # values_np[j] = оценка ПОСЛЕ хода с т.з. нового side_to_move.
-                    # Инвертируем чтобы получить оценку с т.з. того кто только что ходил.
-                    # Если v_for_mover < -0.95 — он проигрывает → сдаётся.
-                    # j — уже правильный индекс в active (не нужен .index() = O(n))
-                    v_before_move = -float(values_np[j]) if j < len(values_np) else 0.0
+                    # root.wl для white-root = из perspective чёрных (backup через black leaf).
+                    # root.wl для black-root = −(оценка белых) = тоже из perspective чёрных.
+                    # Для текущего игрока (side=0: белые→ negate, side=1: чёрные→ напрямую):
+                    _raw_v = float(values_np[j]) if j < len(values_np) else 0.0
+                    v_before_move = -_raw_v if side == 0 else _raw_v
                     _resign_thr = (cfg.resign_threshold_early
                                    if iteration < cfg.resign_warmup_iters
                                    else cfg.resign_threshold)
@@ -665,8 +810,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 elif result == -1.0: black_wins += 1
                 else:               draws += 1
             else:
-                # Настоящий таймаут — мягкая материальная оценка
-                result = eng.material_result()
+                result = 0.0 if cfg.timeout_as_draw else eng.material_result()
                 timeouts += 1
 
             for entry in histories[i]:
@@ -912,12 +1056,25 @@ def train(cfg: Config = None):
     buffer = ReplayBuffer(cfg.buffer_max)
 
     curriculum_winrate_history: List[float] = []
+    lagged_pool = LaggedOpponentPool(max_snapshots=cfg.lag_opponent_pool_size)
 
     buffer_path = os.path.join(cfg.checkpoint_dir, "buffer.pkl")
     if os.path.exists(buffer_path):
         try:
             with open(buffer_path, "rb") as f:
                 buffer.data, buffer._ptr, buffer._full = pickle.load(f)
+            # Санируем после загрузки: _ptr и _full могли быть сохранены с другим max_size.
+            # Если data > max_size — обрезаем до max_size (оставляем самые свежие).
+            if len(buffer.data) > buffer.max_size:
+                buffer.data = list(buffer.data[-buffer.max_size:])
+                buffer._full = True
+                buffer._ptr  = 0
+            elif len(buffer.data) == buffer.max_size:
+                buffer._full = True
+                buffer._ptr  = buffer._ptr % buffer.max_size
+            else:
+                buffer._full = False
+                buffer._ptr  = len(buffer.data) % buffer.max_size
             buffer.rebuild_val_arr()
             print(f"📦 Загружен буфер: {len(buffer):,} позиций\n")
         except Exception as e:
@@ -1039,12 +1196,30 @@ def train(cfg: Config = None):
                   f"  self={sp_count}  fsf={fsf_count}")
             samples = []
             if sp_count > 0:
-                orig_games = cfg.games_per_iter
-                cfg.games_per_iter = sp_count
-                net.eval()
-                with torch.inference_mode():
-                    samples = generate_games(net, cfg, device, iteration)
-                cfg.games_per_iter = orig_games
+                # Разбиваем self-play на pure (vs current) + lagged (vs old checkpoint)
+                has_lagged = cfg.lag_opponent_ratio > 0 and len(lagged_pool) > 0
+                lag_count  = int(sp_count * cfg.lag_opponent_ratio) if has_lagged else 0
+                pure_sp    = sp_count - lag_count
+
+                if pure_sp > 0:
+                    orig_games = cfg.games_per_iter
+                    cfg.games_per_iter = pure_sp
+                    net.eval()
+                    with torch.inference_mode():
+                        samples = generate_games(net, cfg, device, iteration)
+                    cfg.games_per_iter = orig_games
+
+                if lag_count > 0:
+                    lag_snap = lagged_pool.sample()
+                    if lag_snap is not None:
+                        lag_iter, lag_sd = lag_snap
+                        print(f"  ⚔️  Lagged {lag_count} игр vs iter-{lag_iter} чекпоинт "
+                              f"({cfg.lag_opponent_sims} sims)...")
+                        net.eval()
+                        with torch.inference_mode():
+                            lag_samps, lw, ld, ll = generate_lagged_games(
+                                net, lag_sd, cfg, device, lag_count, cfg.lag_opponent_sims)
+                        samples = samples + lag_samps
             net.eval()
             with torch.inference_mode():
                 fsf_samples, fsf_w, fsf_d, fsf_l = generate_fsf_games(
@@ -1129,11 +1304,16 @@ def train(cfg: Config = None):
         stats = policy_diversity_stats(samples)
         print_diversity(stats)
 
-        # Автоадаптация температуры: если policy схлопнулась — поднимаем tau
-        if stats.get('top1_mean', 0) > 0.85 and cfg.temperature < 2.0:
-            cfg.temperature = min(cfg.temperature * 1.2, 2.0)
-            print(f"  ⚠️  top1>{0.85:.2f} → temperature поднята до {cfg.temperature:.2f}")
-        elif stats.get('entropy_mean', 0) > 3.5 and cfg.temperature > 0.8:
+        # Проактивный контроль температуры по энтропии (не реагируем ПОСЛЕ коллапса,
+        # а предотвращаем его заранее). Для 7000 outputs норма: 2.5-4.0 bits.
+        entropy = stats.get('entropy_mean', 2.0)
+        if entropy < 1.0:
+            cfg.temperature = min(cfg.temperature * 1.25, 2.5)
+            print(f"  ⚠️  entropy={entropy:.3f} < 1.0 → temperature→{cfg.temperature:.2f}")
+        elif entropy < 1.6:
+            cfg.temperature = min(cfg.temperature * 1.10, 2.0)
+            print(f"  ⚡ entropy={entropy:.3f} < 1.6 → temperature→{cfg.temperature:.2f}")
+        elif entropy > 3.5 and cfg.temperature > 0.8:
             cfg.temperature = max(cfg.temperature * 0.95, 0.8)
         print()
 
@@ -1175,6 +1355,9 @@ def train(cfg: Config = None):
 
         # ── Чекпоинт ─────────────────────────────────────────────────────────
         if not collapsed:
+            # Сохраняем снимок для lagged pool ПОСЛЕ обучения (несёт знания этой итерации)
+            lagged_pool.maybe_save(net, iteration, cfg.lag_opponent_interval)
+
             model_to_save = net._orig_mod if hasattr(net, "_orig_mod") else net
             ckpt_data = {
                 "iteration": iteration,
@@ -1293,6 +1476,29 @@ if __name__ == "__main__":
                         help="Winrate для снижения сложности FSF (default: 0.35)")
     parser.add_argument("--curriculum-window",    type=int,   default=3,
                         help="Итераций для усреднения winrate (default: 3)")
+
+    # Lagged opponent: играть против старого чекпоинта
+    parser.add_argument("--lag-interval",     type=int,   default=0,
+                        help="Сохранять снимок весов каждые N итераций (0=отключено, рек. 5)")
+    parser.add_argument("--lag-ratio",        type=float, default=0.0,
+                        help="Доля self-play игр против lagged чекпоинта (0.0=отключено, рек. 0.3)")
+    parser.add_argument("--lag-pool-size",    type=int,   default=5,
+                        help="Максимальное число хранимых снимков (default: 5)")
+    parser.add_argument("--lag-sims",         type=int,   default=50,
+                        help="MCTS симуляций для lagged оппонента (default: 50)")
+
+    # Softened FSF
+    parser.add_argument("--fsf-random-prob",  type=float, default=0.0,
+                        help="Вероятность случайного хода FSF (0=детерминированный, 0.4=40%% рандом)")
+
+    # Размер окна буфера и длина партии
+    parser.add_argument("--buffer-max",       type=int,   default=1_000_000,
+                        help="Максимальный размер replay буфера (default: 1000000, рек. 300000 при большом потоке данных)")
+    parser.add_argument("--max-game-length",  type=int,   default=110,
+                        help="Максимальная длина партии в полуходах (default: 110, рек. 80 на ранних итерациях)")
+    parser.add_argument("--timeout-as-draw",  action="store_true", default=False,
+                        help="Таймаут = ничья (0.0) вместо оценки по материалу")
+
     args = parser.parse_args()
 
     # Сброс буфера если запрошен
@@ -1344,5 +1550,13 @@ if __name__ == "__main__":
         curriculum_promote_threshold=args.curriculum_promote,
         curriculum_demote_threshold=args.curriculum_demote,
         curriculum_window=args.curriculum_window,
+        lag_opponent_interval=args.lag_interval,
+        lag_opponent_ratio=args.lag_ratio,
+        lag_opponent_pool_size=args.lag_pool_size,
+        lag_opponent_sims=args.lag_sims,
+        fsf_noise_prob=args.fsf_random_prob,
+        buffer_max=args.buffer_max,
+        max_game_length=args.max_game_length,
+        timeout_as_draw=args.timeout_as_draw,
     )
     train(cfg)

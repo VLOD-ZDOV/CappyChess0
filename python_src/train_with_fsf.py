@@ -227,7 +227,7 @@ def generate_fsf_games(
         elif engine.is_game_over():
             result = engine.game_result()
         else:
-            result = engine.material_result()
+            result = 0.0 if cfg.timeout_as_draw else engine.material_result()
 
         if result > 0.5:    wins   += 1
         elif result < -0.5: losses += 1
@@ -588,6 +588,8 @@ def main():
                         help="Лимит узлов FSF (500=быстро/слабо, 2000=медленно/сильно)")
     parser.add_argument("--fsf-mcts-sims", type=int, default=100,
                         help="MCTS симуляций при игре против FSF (меньше = быстрее)")
+    parser.add_argument("--timeout-as-draw", action="store_true", default=False,
+                        help="Таймаут = ничья (0.0) вместо оценки по материалу")
 
     args = parser.parse_args()
 
@@ -623,6 +625,7 @@ def main():
         collapse_threshold=args.collapse_threshold,
         use_ema=getattr(args, 'use_ema', True),
         ema_decay=getattr(args, 'ema_decay', 0.999),
+        timeout_as_draw=args.timeout_as_draw,
     )
 
     train_with_fsf(cfg, args)

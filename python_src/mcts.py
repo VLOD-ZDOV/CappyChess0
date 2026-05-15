@@ -20,7 +20,7 @@ except ImportError:
 
 POLICY_SIZE   = 7000
 VIRTUAL_LOSS  = 3
-PARALLEL_SIMS = 32   # было 16: больше листьев за шаг → меньше round-trips → GPU загружен плотнее
+PARALLEL_SIMS = 64   # 64: оптимальный баланс GPU-утилизации vs качества поиска для 256x15 сети
 
 
 class MCTSNode:
@@ -87,7 +87,10 @@ class UltraFastMCTS:
 
         arr = tensors.reshape(n, 20, 8, 10)
         if n_pad > 0:
-            arr = np.concatenate([arr, np.repeat(arr[-1:], n_pad, axis=0)], axis=0)
+            # Случайный паддинг из батча вместо repeat-last:
+            # repeat-last перекашивает BatchNorm/GroupNorm статистики к одной позиции.
+            pad_idx = np.random.randint(0, n, n_pad)
+            arr = np.concatenate([arr, arr[pad_idx]], axis=0)
         n_total = arr.shape[0]
 
         if n_total <= self.pinned_size:
@@ -311,7 +314,15 @@ class UltraFastMCTS:
             for m in legal
         ], dtype=np.float64)
         s = priors.sum()
-        priors = priors / s if s > 1e-12 else np.ones(n) / n
+        if s > 1e-12:
+            priors = priors / s
+        else:
+            # dead policy: все priors ≈ 0 → uniform fallback
+            # Частые такие случаи = policy collapse
+            priors = np.ones(n) / n
+            if not hasattr(self, '_dead_policy_count'):
+                self._dead_policy_count = 0
+            self._dead_policy_count += 1
         if add_noise and n > 0:
             priors = 0.75 * priors + 0.25 * np.random.dirichlet([0.3] * n)
         for j, m in enumerate(legal):

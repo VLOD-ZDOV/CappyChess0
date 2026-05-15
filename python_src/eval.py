@@ -147,6 +147,7 @@ def play_batch(
     mcts_batch: int,
     verbose: bool = False,
     pgn_path: str = None,
+    timeout_as_draw: bool = False,
     white_name: str = "White",
     black_name: str = "Black",
 ) -> List[float]:
@@ -198,7 +199,7 @@ def play_batch(
             if eng.is_game_over():
                 results[gi] = eng.game_result()
             elif move_counts[gi] >= max_moves:
-                results[gi] = eng.material_result()
+                results[gi] = 0.0 if timeout_as_draw else eng.material_result()
             else:
                 new_active.append(gi)
                 continue
@@ -257,6 +258,7 @@ def run_match(
     mcts_batch: int,
     verbose: bool = False,
     pgn_dir: str = None,
+    timeout_as_draw: bool = False,
 ) -> Dict:
     """
     Играет games партий между A и B (половина — A белые, половина — B белые).
@@ -280,7 +282,8 @@ def run_match(
     res1 = play_batch(net_a, net_b, device, n1, simulations,
                       max_moves, temperature_moves, mcts_batch,
                       verbose=verbose, pgn_path=pgn1,
-                      white_name=name_a, black_name=name_b)
+                      white_name=name_a, black_name=name_b,
+                      timeout_as_draw=timeout_as_draw)
     for r in res1:
         if r > 0:   wins_a += 1
         elif r < 0: wins_b += 1
@@ -297,7 +300,8 @@ def run_match(
     res2 = play_batch(net_b, net_a, device, half, simulations,
                       max_moves, temperature_moves, mcts_batch,
                       verbose=verbose, pgn_path=pgn2,
-                      white_name=name_b, black_name=name_a)
+                      white_name=name_b, black_name=name_a,
+                      timeout_as_draw=timeout_as_draw)
     for r in res2:
         # r — результат белых (= B), конвертируем в результат A
         r_a = -r
@@ -440,6 +444,8 @@ def main():
                         help="Показывать первые 10 ходов каждой партии")
     parser.add_argument("--pgn-dir",      type=str, default=None,
                         help="Папка для сохранения PGN партий (напр. games/)")
+    parser.add_argument("--timeout-as-draw", action="store_true", default=False,
+                        help="Таймаут = ничья (0.0) вместо оценки по материалу")
     args = parser.parse_args()
 
     # Устройство
@@ -495,6 +501,7 @@ def main():
             mcts_batch=args.mcts_batch,
             verbose=args.verbose,
             pgn_dir=args.pgn_dir,
+            timeout_as_draw=args.timeout_as_draw,
         )
         match_results.append(result)
 
