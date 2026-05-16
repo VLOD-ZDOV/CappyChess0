@@ -147,7 +147,7 @@ class UltraFastMCTS:
 
             for step in range(steps + 1):
                 if step < steps:
-                    leaf_matrix = rust_mcts.collect_leaves()
+                    leaf_matrix = rust_mcts.collect_leaves(simulations)
                     has_leaves  = leaf_matrix.shape[0] > 0
                     if has_leaves:
                         curr_counts = rust_mcts.get_current_batch_counts()
@@ -204,7 +204,7 @@ class UltraFastMCTS:
         for step in range(steps + 1):
             # Собираем следующий батч (если ещё есть шаги)
             if step < steps:
-                leaf_matrix = rust_mcts.collect_leaves()
+                leaf_matrix = rust_mcts.collect_leaves(simulations)
                 has_leaves  = leaf_matrix.shape[0] > 0
                 if has_leaves:
                     # Сохраняем counts ЭТОГО батча — он не изменится при следующем collect
@@ -297,7 +297,9 @@ class UltraFastMCTS:
             sqrt_n = math.sqrt(max(node.visits + node.virtual_loss, 1))
             best, best_s = None, -1e18
             for child in node.children.values():
-                s = child.q() + self.c_puct * child.prior * sqrt_n / (1 + child.visits + child.virtual_loss)
+                # Negamax: child.q() в POV ребёнка (противник родителя) → инвертируем для POV родителя.
+                q_in_parent = -child.q() if child.visits > 0 else 0.0
+                s = q_in_parent + self.c_puct * child.prior * sqrt_n / (1 + child.visits + child.virtual_loss)
                 if s > best_s: best_s = s; best = child
             node = best; stack.append(node.move)
         return node, stack

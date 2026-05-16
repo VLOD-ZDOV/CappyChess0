@@ -63,7 +63,8 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
         n = min(batch_sz, args.games - b * batch_sz)
         engines       = [CapablancaEngine() for _ in range(n)]
         move_counts   = [0] * n
-        resign_counts = [0] * n
+        # Счётчики на КАЖДУЮ сторону — v чередует знак ply-to-ply.
+        resign_counts = [[0, 0] for _ in range(n)]
         resigned      = [False] * n
         adjudicated   = [None] * n
 
@@ -75,7 +76,7 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
         while active and move_num < args.max_game_length:
             steps = max(1, (args.simulations + args.parallel_sims - 1) // args.parallel_sims)
             for _ in range(steps):
-                lm = rust_mcts.collect_leaves()
+                lm = rust_mcts.collect_leaves(args.simulations)
                 if lm.shape[0] == 0:
                     break
                 rp, rv = mcts._infer(lm)
@@ -97,7 +98,10 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
                 if not legal:
                     continue
 
-                pol = policies[j]
+                # get_policies/get_values возвращают по записи на КАЖДУЮ игру,
+                # индексировать по game_idx (не j), иначе после первого завершения
+                # игры в батче остальные получают чужие policy/value.
+                pol = policies[game_idx]
                 side = eng.side_to_move()
 
                 # Выбор хода с температурой
@@ -119,13 +123,12 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
 
                 # Сдача (если не отключена)
                 if not args.no_resign and move_num >= args.resign_min_move:
-                    _raw_v = float(values_np[j]) if j < len(values_np) else 0.0
-                    v = -_raw_v if side == 0 else _raw_v
+                    v = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
                     if v < args.resign_threshold:
-                        resign_counts[game_idx] += 1
+                        resign_counts[game_idx][side] += 1
                     else:
-                        resign_counts[game_idx] = 0
-                    if resign_counts[game_idx] >= args.resign_consec:
+                        resign_counts[game_idx][side] = 0
+                    if resign_counts[game_idx][side] >= args.resign_consec:
                         resigned[game_idx] = True
                         continue
 

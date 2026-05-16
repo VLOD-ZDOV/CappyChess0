@@ -423,18 +423,19 @@ class Config:
     num_res_blocks: int = 5
 
     # Self-play
-    simulations: int = 80
+    simulations: int = 100
 
     # Playout Cap Randomization (AlphaZero, lc0):
     # На fast_sim_fraction ходов делаем fast_simulations вместо simulations.
-    # Только полные поиски попадают в обучающий буфер при playout_cap_train_only_full=True.
-    fast_simulations: int = 100
+    # Только полные поиски (simulations, БОЛЬШЕ) попадают в обучающий буфер
+    # при playout_cap_train_only_full=True — стандартная PCR.
+    fast_simulations: int = 80
     fast_sim_fraction: float = 0.75
     playout_cap_train_only_full: bool = True
     c_puct: float = 1.25
-    temperature_moves: int = 30       # FIX: 30→50, больше исследования в начале партии
+    temperature_moves: int = 50       # больше исследования в начале партии
     temperature: float = 1.0          # tau для первых temperature_moves ходов (1.0 = пропорционально visit counts)
-    temperature_late: float = 0.25     # tau после temperature_moves: 0.0 = жёсткий argmax (лучше матует)
+    temperature_late: float = 0.0     # tau после temperature_moves: 0.0 = жёсткий argmax (лучше матует)
     games_per_iter: int = 128
     max_game_length: int = 110
     mcts_batch: int = 128
@@ -579,6 +580,9 @@ class ReplayBuffer:
 
         Использует _val_arr для O(N) векторного поиска без Python-цикла по data.
         Если один класс отсутствует — балансирует по доступным.
+        Защита от overfit: если bin маленький (редкий класс), ограничиваем дубликаты —
+        каждый элемент не более ~3 раз в батче. Иначе на старте 10 побед на 50K позиций
+        размножились бы тысячи раз за эпоху.
         """
         n = len(self.data)
         if n == 0:
@@ -592,14 +596,22 @@ class ReplayBuffer:
         if len(bins) < 2:
             return self.sample(batch_size)
 
+        # Если самый маленький bin слишком мал — балансировка бесполезна, идём в plain sample
+        min_bin = min(len(b) for b in bins)
+        if min_bin < 50:
+            return self.sample(batch_size)
+
         per_bin = batch_size // len(bins)
         result = []
         for b in bins:
-            local_idx = np.random.randint(0, len(b), per_bin)
+            # Cap: не более len(b)*3 дубликатов из одного bin
+            take = min(per_bin, len(b) * 3)
+            local_idx = np.random.randint(0, len(b), take)
             result.extend([self.data[int(b[i])] for i in local_idx])
+        # Добор из большого bin (обычно draw) если небольшие bins сократились
+        big_bin = max(bins, key=len)
         while len(result) < batch_size:
-            b = bins[np.random.randint(len(bins))]
-            result.append(self.data[int(b[np.random.randint(len(b))])])
+            result.append(self.data[int(big_bin[np.random.randint(len(big_bin))])])
         np.random.shuffle(result)
         return result[:batch_size]
 
@@ -670,7 +682,9 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         n = min(batch_sz, cfg.games_per_iter - start)
         engines = [CapablancaEngine() for _ in range(n)]
         histories: List[List] = [[] for _ in range(n)]
-        resign_counts = [0] * n
+        # Счётчики на КАЖДУЮ сторону отдельно: v чередует знак ply-to-ply
+        # (root в перспективе ходящего), общий счётчик сбрасывался бы каждый второй полуход.
+        resign_counts = [[0, 0] for _ in range(n)]
         resigned = [False] * n
 
         active = list(range(n))
@@ -692,10 +706,9 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             current_sims = cfg.simulations if use_full_search else cfg.fast_simulations
 
             # Tree reuse inference loop (без создания нового RustMCTS каждый ход)
-            cur_engines = [engines[i] for i in active]
             steps = max(1, (current_sims + _parallel - 1) // _parallel)
             for _step in range(steps):
-                _lm = rust_mcts_reuse.collect_leaves()
+                _lm = rust_mcts_reuse.collect_leaves(current_sims)
                 if _lm.shape[0] == 0:
                     break
                 _rp, _rv = mcts._infer(_lm)
@@ -706,6 +719,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 )
             raw_pols  = rust_mcts_reuse.get_policies()
             raw_vals  = rust_mcts_reuse.get_values()
+            # get_policies()/get_values() возвращают по одной записи на КАЖДУЮ игру
+            # из rust_mcts_reuse.games (длина = n, не len(active)).
+            # Индексируем по game_idx, иначе после первого завершения игры в батче
+            # все остальные игры начинают получать чужие policy/value.
             policies  = [np.array(p, dtype=np.float32) for p in raw_pols]
             values_np = np.array(raw_vals, dtype=np.float32)
 
@@ -718,18 +735,16 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
 
                 board_np = np.array(eng.get_board_tensor(), dtype=np.float32)
                 side = eng.side_to_move()
-                pol = policies[j]
-                # Сохраняем root_v и метку full_search для resign/timeout/playout-cap
-                root_v_raw = float(values_np[j]) if j < len(values_np) else 0.0
+                pol = policies[game_idx]
+                root_v_raw = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
                 histories[game_idx].append((board_np, pol.copy(), side, root_v_raw, use_full_search))
 
-                # Temperature decay с защитой от деления на ноль
+                # Temperature decay (argmax-ветка ниже ловит tau ≈ 0)
                 if move_num < cfg.temperature_moves:
                     tau = cfg.temperature
                 elif move_num < cfg.temperature_moves + 20:
                     progress = (move_num - cfg.temperature_moves) / 20.0
                     tau = cfg.temperature * (1 - progress) + cfg.temperature_late * progress
-                    tau = max(tau, 0.01)
                 else:
                     tau = cfg.temperature_late
 
@@ -756,20 +771,16 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 # Используем root value из MCTS (уже вычислен выше)
                 # sign: value с точки зрения стороны которая только что сделала ход
                 if move_num >= cfg.resign_min_move:
-                    # root.wl для white-root = из perspective чёрных (backup через black leaf).
-                    # root.wl для black-root = −(оценка белых) = тоже из perspective чёрных.
-                    # Для текущего игрока (side=0: белые→ negate, side=1: чёрные→ напрямую):
-                    _raw_v = float(values_np[j]) if j < len(values_np) else 0.0
-                    v_before_move = -_raw_v if side == 0 else _raw_v
+                    v_before_move = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
                     _resign_thr = (cfg.resign_threshold_early
                                    if iteration < cfg.resign_warmup_iters
                                    else cfg.resign_threshold)
                     if v_before_move < _resign_thr:
-                        resign_counts[game_idx] += 1
+                        resign_counts[game_idx][side] += 1
                     else:
-                        resign_counts[game_idx] = 0
+                        resign_counts[game_idx][side] = 0
 
-                    if resign_counts[game_idx] >= cfg.resign_consec:
+                    if resign_counts[game_idx][side] >= cfg.resign_consec:
                         resigned[game_idx] = True
                         continue
 
@@ -873,7 +884,7 @@ class SelfPlayDataset(torch.utils.data.Dataset):
 
 def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
                 buffer: ReplayBuffer, cfg: Config, device: torch.device,
-                scaler: torch.amp.GradScaler, iteration: int):
+                iteration: int):
     net.train()
 
     max_steps_by_buffer = len(buffer) // cfg.batch_size
@@ -927,8 +938,9 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
 
             loss = policy_loss + cfg.value_loss_weight * value_loss
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
+        # bfloat16 имеет тот же диапазон экспоненты, что и fp32 — GradScaler не нужен
+        # и опасен (continue ниже сломал бы scaler.update() стейт-машину).
+        loss.backward()
         # Проверка NaN/Inf в градиентах — защита от взрывного градиента
         grad_ok = True
         for p in net.parameters():
@@ -940,8 +952,7 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
             optimizer.zero_grad(set_to_none=True)
             continue
         nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        optimizer.step()
 
         total_loss += loss.item()
         total_policy_loss += policy_loss.item()
@@ -1000,9 +1011,6 @@ def train(cfg: Config = None):
         weight_decay=cfg.weight_decay,
         fused=True,
     )
-
-    # FIX: новый API без deprecation warning
-    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == "cuda"))
 
     # EMA копия весов для self-play (AlphaZero-style стабилизация)
     ema = ModelEMA(net, decay=cfg.ema_decay) if cfg.use_ema else None
@@ -1126,17 +1134,19 @@ def train(cfg: Config = None):
         else:
             print("ℹ️  Оптимайзер инициализирован заново (несовместимая архитектура)")
 
-        # Принудительно устанавливаем LR
-        for pg in optimizer.param_groups:
-            pg['lr'] = cfg.learning_rate
-
-        if cfg.reset_scheduler or "scheduler" not in ckpt:
+        # LR override только если шедулер сбрасывается или архитектура несовместима.
+        # Иначе ломаем фазу косинусного цикла, который ожидает текущий LR.
+        if cfg.reset_scheduler or incompatible_keys or "scheduler" not in ckpt:
+            for pg in optimizer.param_groups:
+                pg['lr'] = cfg.learning_rate
             print("🔄 Scheduler сброшен (начинается новый косинусный цикл)\n")
         else:
             try:
                 scheduler.load_state_dict(ckpt["scheduler"])
             except Exception as e:
                 print(f"⚠️  Scheduler не загружен ({e}), используем свежий\n")
+                for pg in optimizer.param_groups:
+                    pg['lr'] = cfg.learning_rate
 
         # Загружаем EMA если есть
         if ema is not None and "ema" in ckpt:
@@ -1204,10 +1214,12 @@ def train(cfg: Config = None):
                 if pure_sp > 0:
                     orig_games = cfg.games_per_iter
                     cfg.games_per_iter = pure_sp
-                    net.eval()
-                    with torch.inference_mode():
-                        samples = generate_games(net, cfg, device, iteration)
-                    cfg.games_per_iter = orig_games
+                    try:
+                        net.eval()
+                        with torch.inference_mode():
+                            samples = generate_games(net, cfg, device, iteration)
+                    finally:
+                        cfg.games_per_iter = orig_games
 
                 if lag_count > 0:
                     lag_snap = lagged_pool.sample()
@@ -1267,10 +1279,12 @@ def train(cfg: Config = None):
                   + (f" + fsf={fsf_games_n}" if fsf_games_n else ""))
             orig_games = cfg.games_per_iter
             cfg.games_per_iter = self_games_n
-            net.eval()
-            with torch.inference_mode():
-                samples = generate_games(net, cfg, device, iteration)
-            cfg.games_per_iter = orig_games
+            try:
+                net.eval()
+                with torch.inference_mode():
+                    samples = generate_games(net, cfg, device, iteration)
+            finally:
+                cfg.games_per_iter = orig_games
             if fsf_games_n > 0:
                 print(f"  ⚔️  FSF: {fsf_games_n} игр vs Stockfish ({args.fsf_nodes} nodes)...")
                 net.eval()
@@ -1327,7 +1341,7 @@ def train(cfg: Config = None):
 
         print(f"  🏋️  Тренировка (до {cfg.train_steps} шагов, ≤1 эпохи)...")
         train_start = time.time()
-        metrics = train_epoch(net, optimizer, buffer, cfg, device, scaler, iteration)
+        metrics = train_epoch(net, optimizer, buffer, cfg, device, iteration)
         # Обновляем EMA после каждой итерации обучения
         if ema is not None:
             ema.update(net)
@@ -1398,9 +1412,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Capablanca Chess AlphaZero Training")
     parser.add_argument("--channels",           type=int,   default=64)
     parser.add_argument("--res-blocks",          type=int,   default=5)
-    parser.add_argument("--simulations",         type=int,   default=80)
-    parser.add_argument("--fast-simulations",     type=int,   default=100,
-                        help="Симуляций на быстрых ходах playout cap (default: 100)")
+    parser.add_argument("--simulations",         type=int,   default=100,
+                        help="Полные симуляции (для PCR — больше fast_simulations, обучается на этих позициях)")
+    parser.add_argument("--fast-simulations",     type=int,   default=80,
+                        help="Симуляций на быстрых ходах playout cap (default: 80, меньше simulations)")
     parser.add_argument("--fast-sim-fraction",    type=float, default=0.75,
                         help="Доля ходов с быстрым поиском (0.75 = 75 пр. быстрых, 25 пр. полных)")
     parser.add_argument("--no-playout-cap",       dest="playout_cap_train_only_full",
