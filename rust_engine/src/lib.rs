@@ -409,6 +409,7 @@ fn bb_iter(mut bb: BB) -> impl Iterator<Item = u32> {
 pub struct CapablancaEngine {
     board: Board,
     legal_cache: Option<Vec<(u32, u32, Option<usize>)>>,
+    position_history: Vec<u64>,
 }
 
 impl CapablancaEngine {
@@ -421,7 +422,11 @@ impl CapablancaEngine {
 
 #[pymethods]
 impl CapablancaEngine {
-    #[new] pub fn new() -> Self { CapablancaEngine { board: Board::start(), legal_cache: None } }
+    #[new] pub fn new() -> Self {
+        let board = Board::start();
+        let h = compute_board_hash(&board);
+        CapablancaEngine { board, legal_cache: None, position_history: vec![h] }
+    }
     pub fn copy(&self) -> Self { self.clone() }
     pub fn side_to_move(&self) -> usize { self.board.side }
     pub fn get_board_tensor(&self) -> Vec<f32> { self.board.to_tensor() }
@@ -441,6 +446,12 @@ impl CapablancaEngine {
         let p = if p_val == 0 { None } else { Some((p_val - 1) as usize) };
         self.board.apply_move(f, t, p);
         self.legal_cache = None; // сброс кэша после хода
+        // Поддерживаем историю позиций для 3-fold repetition.
+        // При необратимом ходе (взятие/пешка) halfmove_clock=0 → старые позиции не повторятся.
+        if self.board.halfmove_clock == 0 {
+            self.position_history.clear();
+        }
+        self.position_history.push(compute_board_hash(&self.board));
         true
     }
 
@@ -455,6 +466,10 @@ impl CapablancaEngine {
     pub fn is_game_over(&mut self) -> bool {
         if self.board.halfmove_clock >= 100 { return true; }
         if self.board.is_insufficient_material() { return true; }
+        // 3-fold: текущая позиция уже в history (push в make_move_int + new()).
+        let cur = compute_board_hash(&self.board);
+        let repeats = self.position_history.iter().filter(|&&h| h == cur).count();
+        if repeats >= 3 { return true; }
         self.ensure_legal_cache();
         self.legal_cache.as_ref().unwrap().is_empty()
     }
@@ -462,6 +477,10 @@ impl CapablancaEngine {
     pub fn game_result(&mut self) -> f32 {
         if self.board.halfmove_clock >= 100 { return 0.0; }
         if self.board.is_insufficient_material() { return 0.0; }
+        // 3-fold repetition = ничья
+        let cur = compute_board_hash(&self.board);
+        let repeats = self.position_history.iter().filter(|&&h| h == cur).count();
+        if repeats >= 3 { return 0.0; }
         self.ensure_legal_cache();
         if self.legal_cache.as_ref().unwrap().is_empty() {
             if self.board.in_check(self.board.side) {
@@ -725,22 +744,24 @@ struct SingleMcts {
     leaf_tensor_buf: Vec<f32>,
 }
 
-impl SingleMcts {
-    fn board_hash(b: &Board) -> u64 {
-        let mut h: u64 = b.side as u64 * 0x9e3779b97f4a7c15;
-        for c in 0..2usize {
-            for p in 0..8usize {
-                let lo = b.pieces[c][p] as u64;
-                let hi = (b.pieces[c][p] >> 64) as u64;
-                h ^= lo.wrapping_mul(0x517cc1b727220a95u64.wrapping_add((c * 8 + p) as u64));
-                h ^= hi.wrapping_mul(0xbf58476d1ce4e5b9u64.wrapping_add((c * 8 + p) as u64));
-                h = h.rotate_left(17);
-            }
+fn compute_board_hash(b: &Board) -> u64 {
+    let mut h: u64 = b.side as u64 * 0x9e3779b97f4a7c15;
+    for c in 0..2usize {
+        for p in 0..8usize {
+            let lo = b.pieces[c][p] as u64;
+            let hi = (b.pieces[c][p] >> 64) as u64;
+            h ^= lo.wrapping_mul(0x517cc1b727220a95u64.wrapping_add((c * 8 + p) as u64));
+            h ^= hi.wrapping_mul(0xbf58476d1ce4e5b9u64.wrapping_add((c * 8 + p) as u64));
+            h = h.rotate_left(17);
         }
-        h ^= (b.castling as u64).wrapping_mul(0x6c62272e07bb0142);
-        h ^= b.ep_square.map(|s| s as u64 + 1).unwrap_or(0).wrapping_mul(0x94d049bb133111eb);
-        h
     }
+    h ^= (b.castling as u64).wrapping_mul(0x6c62272e07bb0142);
+    h ^= b.ep_square.map(|s| s as u64 + 1).unwrap_or(0).wrapping_mul(0x94d049bb133111eb);
+    h
+}
+
+impl SingleMcts {
+    fn board_hash(b: &Board) -> u64 { compute_board_hash(b) }
 
     fn new(board: Board) -> Self {
         let side = board.side as u8;
@@ -816,7 +837,9 @@ impl SingleMcts {
             for ci_pos in 0..n_ch {
                 let ci = self.arena.get(idx).children[ci_pos];
                 let c = self.arena.get(ci);
-                let q_val = if c.visits > 0 { c.q() } else { fpu };
+                // Negamax: child.q() в POV ребёнка (противник). Чтобы получить POV родителя — инвертируем.
+                // FPU (parent_q - reduction) уже в POV родителя.
+                let q_val = if c.visits > 0 { -c.q() } else { fpu };
                 let score = q_val + cpuct * c.prior * sqrt_n / (1 + c.visits + c.virtual_loss) as f32;
                 if !score.is_nan() && score > best { best = score; best_ci = ci; }
             }
@@ -832,10 +855,52 @@ impl SingleMcts {
         }
     }
 
+    /// 3-fold detection для позиции на листе: считает occurences хэша
+    /// в (position_history + позиции вдоль пути от root к leaf).
+    /// Возвращает true если суммарно >= 3 → ничья по правилу.
+    /// Хэш позиции включает только piece bitboards/side/castling/ep — необратимые ходы
+    /// (взятия, пешки) меняют bitboards → хэши гарантированно разные → счёт авто-корректен.
+    fn is_3fold_at_leaf(&self, leaf_idx: usize, leaf_board: &Board) -> bool {
+        let leaf_hash = compute_board_hash(leaf_board);
+        let history_count = self.position_history.iter()
+            .filter(|&&h| h == leaf_hash).count();
+
+        // Собираем ходы leaf → root, потом проигрываем их вперёд от root_board.
+        let mut moves = Vec::new();
+        let mut cur = leaf_idx;
+        while cur != self.root {
+            let node = self.arena.get(cur);
+            moves.push(node.move_from_parent);
+            match node.parent { Some(p) => cur = p, None => break }
+        }
+        let mut board = self.root_board.clone();
+        let mut path_count = 0usize;
+        for &m in moves.iter().rev() {
+            if m != 0 {
+                let pv = m & 0b111;
+                let t  = (m >> 3) & 0x7F;
+                let f  = (m >> 10) & 0x7F;
+                let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                board.apply_move(f, t, p);
+            }
+            if compute_board_hash(&board) == leaf_hash {
+                path_count += 1;
+            }
+        }
+        history_count + path_count >= 3
+    }
+
     // board передаётся снаружи (уже восстановлен через board_at или хранится в pending_boards)
     fn expand(&mut self, idx: usize, board: &Board, policy: &[f32], add_noise: bool, rng: &mut u64) {
         let legal = board.gen_legal();
-        if legal.is_empty() {
+        // Терминалы: нет легальных (мат/пат), либо ничья по правилу
+        // (50 ходов, insufficient material, 3-fold на пути от root к leaf).
+        // Раньше внутри дерева очевидная ничья (K vs K, повтор) шла на NN → MCTS принимал за выигрыш.
+        if legal.is_empty()
+            || board.halfmove_clock >= 100
+            || board.is_insufficient_material()
+            || self.is_3fold_at_leaf(idx, board)
+        {
             self.arena.get_mut(idx).is_terminal = true;
             self.arena.get_mut(idx).is_expanded = true;
             return;
@@ -912,6 +977,10 @@ impl SingleMcts {
         for _ in 0..parallel {
             if let Some(leaf) = self.select() {
                 if self.arena.get(leaf).is_terminal { continue; }
+                // Защита от дубликатов: select() возвращает один и тот же нераскрытый узел
+                // повторно (vloss не помогает для unexpanded — мы не доходим до PUCT-цикла).
+                // Без этой проверки visits раздуваются + GPU считает одинаковые позиции.
+                if self.pending.contains(&leaf) { continue; }
                 self.apply_vloss(leaf, VIRTUAL_LOSS_V);
                 let board = self.board_at(leaf);
                 // extend_from_slice — пишем прямо в reusable буфер
@@ -955,7 +1024,22 @@ impl SingleMcts {
                 }
             }
             let side = self.arena.get(leaf).side as usize;
-            let v = if side == 0 { values[i] } else { -values[i] };
+            // Negamax: v ВСЕГДА в POV стороны на листе.
+            // Терминал: если есть легальные ходы → ничья по правилу (50-move/insufficient/3-fold) → 0;
+            // иначе mate если шах, пат иначе.
+            let v = if self.arena.get(leaf).is_terminal {
+                if let Some(board) = boards.get(i) {
+                    if !board.gen_legal().is_empty() {
+                        0.0
+                    } else if board.in_check(side) {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                } else { 0.0 }
+            } else {
+                values[i]
+            };
             self.backup(leaf, v);
         }
     }
@@ -979,7 +1063,22 @@ impl SingleMcts {
                 }
             }
             let side = self.arena.get(leaf).side as usize;
-            let v = if side == 0 { values[i] } else { -values[i] };
+            // Negamax: v ВСЕГДА в POV стороны на листе.
+            // Терминал: если есть легальные ходы → ничья по правилу (50-move/insufficient/3-fold) → 0;
+            // иначе mate если шах, пат иначе.
+            let v = if self.arena.get(leaf).is_terminal {
+                if let Some(board) = boards.get(i) {
+                    if !board.gen_legal().is_empty() {
+                        0.0
+                    } else if board.in_check(side) {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                } else { 0.0 }
+            } else {
+                values[i]
+            };
             self.backup(leaf, v);
         }
                             }
@@ -1006,10 +1105,11 @@ impl SingleMcts {
                             fn is_over(&mut self) -> bool {
                                 if self.root_board.halfmove_clock >= 100 { return true; }
                                 if self.root_board.is_insufficient_material() { return true; }
-                                // Троекратное повторение позиции
+                                // Троекратное повторение: текущая позиция уже в history (push в make_move),
+                                // 3-fold = эта позиция встречалась >= 3 раз.
                                 let cur_hash = Self::board_hash(&self.root_board);
                                 let repeats = self.position_history.iter().filter(|&&h| h == cur_hash).count();
-                                if repeats >= 2 { return true; }
+                                if repeats >= 3 { return true; }
                                 self.root_board.gen_legal().is_empty()
                             }
 
@@ -1071,6 +1171,24 @@ impl SingleMcts {
                                 }
                                 self.position_history.push(new_hash);
                             }
+
+                            /// Перенаносит Dirichlet noise на priors детей текущего корня.
+                            /// Вызывается после make_move при tree reuse — иначе исследовательский
+                            /// шум применяется только на ПЕРВОМ ходу всей партии.
+                            fn renoise_root(&mut self, rng: &mut u64) {
+                                let root_idx = self.root;
+                                let children: Vec<usize> = self.arena.get(root_idx).children.clone();
+                                let n = children.len();
+                                if n == 0 { return; }
+                                let dynamic_alpha = (10.0_f64 / n as f64).max(0.1);
+                                let noise = dirichlet_noise(dynamic_alpha, n, rng);
+                                for (i, ci) in children.into_iter().enumerate() {
+                                    let p = self.arena.get(ci).prior;
+                                    let mixed = (1.0 - DIRICHLET_EPS_V as f32) * p
+                                              + DIRICHLET_EPS_V as f32 * noise[i] as f32;
+                                    self.arena.get_mut(ci).prior = mixed;
+                                }
+                            }
 }
 
 /// BatchState хранит leaf_counts вместе с данными батча.
@@ -1096,13 +1214,24 @@ impl RustMCTS {
     #[new]
     pub fn new(engines: Vec<PyRef<CapablancaEngine>>, parallel_sims: usize) -> Self {
         let games = engines.iter().map(|e| SingleMcts::new(e.board.clone())).collect();
-        RustMCTS { games, parallel_sims, rng: 0xdeadbeefcafe1234u64,
+        // Сид из системного времени — чтобы параллельные RustMCTS (fsf/lagged
+        // создают по объекту на игру) не получали одинаковый Dirichlet noise.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0xdeadbeefcafe1234u64)
+            .wrapping_mul(0x9e3779b97f4a7c15)
+            .wrapping_add(0xbf58476d1ce4e5b9);
+        RustMCTS { games, parallel_sims, rng: seed,
             leaf_game_map: Vec::new(), leaf_counts: Vec::new(), prev_batch: None }
     }
 
     /// Собирает листья для inference.
     /// Возвращает 2D NumPy массив формы (N, 1600) — прямой доступ к памяти, без Python float объектов.
-    pub fn collect_leaves<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+    /// target_sims_per_game = сколько всего симуляций планируется для каждой игры
+    /// (для честной оценки sims_remaining в best_move_is_decided).
+    #[pyo3(signature = (target_sims_per_game=0))]
+    pub fn collect_leaves<'py>(&mut self, py: Python<'py>, target_sims_per_game: i32) -> Bound<'py, PyArray2<f32>> {
         self.leaf_game_map.clear();
         let mut new_counts = vec![0usize; self.games.len()];
         let mut flat: Vec<f32> = Vec::new();
@@ -1110,13 +1239,14 @@ impl RustMCTS {
 
         for (g, game) in self.games.iter_mut().enumerate() {
             if game.is_over() { continue; }
-            // FIX: передаём реальное оставшееся число симуляций,
-            // а не размер одного батча. Раньше sims_left=parallel_sims (32)
-            // и поиск прекращался уже после первого батча на очевидных позициях,
-            // но в неочевидных тоже — что ломало качество.
+            // Честный остаток: target - visits. Раньше формула давала parallel_sims - visits%parallel_sims,
+            // что хаотично прыгало между 1 и parallel_sims и заставляло MCTS обрывать поиск слишком рано.
+            // target_sims_per_game=0 = не использовать early-stop.
             let visits_so_far = game.arena.get(game.root).visits;
-            let sims_remaining = (self.parallel_sims as i32) - visits_so_far % (self.parallel_sims as i32);
-            if game.best_move_is_decided(sims_remaining) { continue; }
+            if target_sims_per_game > 0 {
+                let sims_remaining = (target_sims_per_game - visits_so_far).max(0);
+                if game.best_move_is_decided(sims_remaining) { continue; }
+            }
             // Используем буферизованный сбор без лишних аллокаций Vec<Vec<f32>>
             let count = game.collect_leaves_into_buf(self.parallel_sims, &mut self.rng);
             new_counts[g] = count;
@@ -1164,23 +1294,42 @@ impl RustMCTS {
         // Суммируем чтобы убедиться что совпадает с n_leaves.
         let total: usize = self.leaf_counts.iter().sum();
         if total != n_leaves {
-            // Размер батча не совпадает с leaf_counts — пропускаем безопасно.
-            // Это может случиться при двойной буферизации если батч был пустой.
+            eprintln!(
+                "apply_inference: size mismatch (leaf_counts.sum={} != n_leaves={}) — resetting vloss",
+                total, n_leaves
+            );
+            let n = self.games.len();
+            self.drain_pending_vloss(0, n);
             return;
         }
 
         let mut offset = 0;
-        for (g, &count) in self.leaf_counts.iter().enumerate() {
+        let mut break_at: Option<usize> = None;
+        // Снимаем self.leaf_counts чтобы не держать borrow одновременно с self.games[g]
+        let counts = std::mem::take(&mut self.leaf_counts);
+        for (g, &count) in counts.iter().enumerate() {
             if count == 0 { continue; }
-            let rng = &mut self.rng;
             let start = offset * policy_size;
             let end   = (offset + count) * policy_size;
-            if end > pol_flat.len() { break; }  // защита от edge cases
+            if end > pol_flat.len() {
+                eprintln!(
+                    "apply_inference: pol_flat overflow at game {} — resetting vloss for remaining",
+                    g
+                );
+                break_at = Some(g);
+                break;
+            }
+            let rng = &mut self.rng;
             self.games[g].apply_inference_flat(
                 &pol_flat[start..end], policy_size,
                 &val[offset..offset + count], rng,
             );
             offset += count;
+        }
+        self.leaf_counts = counts;
+        if let Some(g) = break_at {
+            let n = self.games.len();
+            self.drain_pending_vloss(g, n);
         }
     }
 
@@ -1188,6 +1337,20 @@ impl RustMCTS {
     /// в apply_inference_buffered при двойной буферизации.
     pub fn get_current_batch_counts(&self) -> Vec<usize> {
         self.leaf_counts.clone()
+    }
+
+    /// Снимает накопленный virtual_loss и очищает pending для игр в диапазоне [from, to).
+    /// Нужен на error-paths: иначе vloss остался бы навсегда и поиск был бы отравлен.
+    fn drain_pending_vloss(&mut self, from: usize, to: usize) {
+        let end = to.min(self.games.len());
+        for g in from..end {
+            let game = &mut self.games[g];
+            let pending = std::mem::take(&mut game.pending);
+            game.pending_boards.clear();
+            for leaf in pending {
+                game.apply_vloss(leaf, -VIRTUAL_LOSS_V);
+            }
+        }
     }
 
     /// apply_inference с явным batch_counts для правильной двойной буферизации.
@@ -1203,20 +1366,43 @@ impl RustMCTS {
         let n_leaves    = shape[0];
         let policy_size = shape[1];
         let total: usize = batch_counts.iter().sum();
-        if total != n_leaves { return; }
+
+        if total != n_leaves {
+            // Рассинхрон Python/Rust state machine. Тихий return оставлял бы vloss
+            // на pending листьях навсегда → дерево поиска отравлено до конца партии.
+            eprintln!(
+                "apply_inference_buffered: size mismatch (batch_counts.sum={} != n_leaves={}) — resetting vloss",
+                total, n_leaves
+            );
+            let n = self.games.len();
+            self.drain_pending_vloss(0, n);
+            return;
+        }
 
         let mut offset = 0;
+        let mut break_at: Option<usize> = None;
         for (g, &count) in batch_counts.iter().enumerate() {
             if count == 0 { continue; }
-            let rng   = &mut self.rng;
             let start = offset * policy_size;
             let end   = (offset + count) * policy_size;
-            if end > pol_flat.len() { break; }
+            if end > pol_flat.len() {
+                eprintln!(
+                    "apply_inference_buffered: pol_flat overflow at game {} (end={} > len={}) — resetting vloss for remaining",
+                    g, end, pol_flat.len()
+                );
+                break_at = Some(g);
+                break;
+            }
+            let rng = &mut self.rng;
             self.games[g].apply_inference_flat(
                 &pol_flat[start..end], policy_size,
                 &val[offset..offset + count], rng,
             );
             offset += count;
+        }
+        if let Some(g) = break_at {
+            let n = self.games.len();
+            self.drain_pending_vloss(g, n);
         }
     }
 
@@ -1236,9 +1422,13 @@ impl RustMCTS {
     }
 
     /// Применяет ход к конкретной игре (для tree reuse).
+    /// После переноса корня — добавляем свежий Dirichlet noise, иначе exploration
+    /// падает до нуля начиная со 2-го полухода партии.
     pub fn make_move(&mut self, game_idx: usize, m_int: u32) {
         if game_idx < self.games.len() {
             self.games[game_idx].make_move(m_int);
+            let rng = &mut self.rng;
+            self.games[game_idx].renoise_root(rng);
         }
     }
 
