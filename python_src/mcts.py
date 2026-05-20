@@ -1,7 +1,7 @@
 # mcts.py — Python-обёртка над RustMCTS
 #
 # ОПТИМИЗАЦИИ v2:
-#   - _infer теперь принимает np.ndarray (N,1600) напрямую — убран list comprehension
+#   - _infer теперь принимает np.ndarray (N, FLAT_SIZE) напрямую — убран list comprehension
 #   - PARALLEL_SIMS поднят до 32: меньше round-trips Python↔Rust↔GPU за игру
 #   - _infer: убран промежуточный np.stack (leaf_matrix уже готовая матрица)
 #   - cuda.synchronize убран — non_blocking=True + autocast достаточно
@@ -9,7 +9,23 @@
 
 import numpy as np
 import torch
+from collections import OrderedDict
 from typing import List
+
+# NVIDIA оптимизации (повторяет настройки train.py — гарантирует включение
+# при импорте из gui.py / game_stats.py, когда train.py не загружается).
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision('high')
+    except AttributeError:
+        pass
+    try:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+    except AttributeError:
+        pass
 
 try:
     from capablanca_engine import RustMCTS as _RustMCTS
@@ -18,9 +34,25 @@ except ImportError:
     RUST_MCTS_AVAILABLE = False
     print("⚠️  RustMCTS не найден — нужно пересобрать: maturin develop --release")
 
+# Импортируем константы инпута — все размеры/reshape должны идти от них
+from model import CapablancaNet
+INPUT_PLANES = CapablancaNet.INPUT_PLANES   # 139 (8 history × 17 + 3 meta)
+BOARD_H = CapablancaNet.BOARD_H              # 8
+BOARD_W = CapablancaNet.BOARD_W              # 10
+FLAT_SIZE = INPUT_PLANES * BOARD_H * BOARD_W # 11120
+
 POLICY_SIZE   = 7000
 VIRTUAL_LOSS  = 3
-PARALLEL_SIMS = 64   # 64: оптимальный баланс GPU-утилизации vs качества поиска для 256x15 сети
+# Высокий parallel_sims (>64) насыщает virtual_loss → exploration ломается,
+# PUCT начинает выбирать слабые ветки. Низкий (<16) недогружает GPU.
+# 32 — sweet spot для большинства сетей.
+PARALLEL_SIMS = 32
+
+# LC0 transposition cache: одна и та же позиция оценивается NN один раз.
+# Полезно: транспозиции в MCTS, повторяющиеся корни между играми, tree reuse.
+# Ключ — bytes view тензора (FLAT_SIZE float32 ≈ 44KB при history planes). Хеш bytes быстрый (cityhash в CPython).
+# 50K записей × ~30KB на запись (тензор+policy+q+d) ≈ 1.5GB — устанавливаем выше при необходимости.
+NN_CACHE_DEFAULT_MAX = 50_000
 
 
 class MCTSNode:
@@ -45,69 +77,277 @@ class UltraFastMCTS:
 
     def __init__(self, net: torch.nn.Module, device: torch.device,
                  c_puct: float = 1.25, batch_size: int = 256,
-                 add_dirichlet: bool = True, parallel_sims: int = None):
-        self.net = net
+                 add_dirichlet: bool = True, parallel_sims: int = None,
+                 nn_cache: bool = False, nn_cache_max: int = NN_CACHE_DEFAULT_MAX,
+                 compile_mode: str = None, bf16_weights: bool = True,
+                 kld_threshold: float = 0.0, kld_check_every: int = 4,
+                 kld_min_sims_frac: float = 0.25):
+        # compile_mode: None (без compile), 'default', 'reduce-overhead', 'max-autotune'.
+        # 'default' — самый безопасный, ~15-25% speedup, минимальный warmup.
+        # 'reduce-overhead' — использует CUDA graphs, до 50% speedup, но recompile при смене shape.
+        # 'max-autotune' — лучший speedup, но warmup 1-2 минуты.
+        #
+        # bf16_weights: True → создаёт BF16-копию весов для inference. Training-net остаётся FP32.
+        # ~1.5-2x speedup vs autocast(bf16) — нет cast FP32→BF16 на каждом read of weights.
+        # VRAM: дополнительная BF16-копия (~½ от FP32 размера; для 128ch×10 это ~6 MB).
+        self._bf16_weights = bf16_weights and torch.cuda.is_available()
+        if self._bf16_weights:
+            import copy as _copy
+            # Распаковываем _orig_mod если net уже под torch.compile.
+            src = net._orig_mod if hasattr(net, '_orig_mod') else net
+            inference_net = _copy.deepcopy(src).to(torch.bfloat16).eval()
+            self.net = inference_net
+            # Сохраняем ссылку на оригинальный FP32 net чтобы потом обновлять BF16-копию
+            # через update_inference_weights() после train epoch.
+            self._fp32_src = src
+        else:
+            self.net = net
+            self._fp32_src = None
         self.device = device
         self.c_puct = c_puct
         self.batch_size = batch_size
         self.add_dirichlet = add_dirichlet
         self._parallel_sims = parallel_sims if parallel_sims is not None else PARALLEL_SIMS
+        if self._parallel_sims > 64:
+            print(f"⚠️  parallel_sims={self._parallel_sims} > 64: PUCT exploration "
+                  f"может ломаться из-за насыщения virtual_loss. Рекомендуется 16-64.")
 
-        # Pinned memory: batch_size × parallel_sims листьев максимум
-        # Больше parallel_sims = меньше GPU вызовов = быстрее, но хуже качество MCTS
+        # torch.compile: компилирует forward в оптимизированный CUDA graph.
+        # На Blackwell с BF16 даёт +15-50% к raw inference. Применяется поверх
+        # BF16-копии (если bf16_weights=True) либо оригинального net.
+        self._compile_mode = compile_mode
+        if compile_mode is not None and hasattr(torch, 'compile'):
+            try:
+                # dynamic=False: shapes фиксированы (padding к multiple of parallel_sims),
+                # позволяет агрессивные оптимизации. Если shape всё-таки меняется,
+                # torch.compile сам сделает recapture.
+                self.net = torch.compile(self.net, mode=compile_mode, dynamic=False)
+                print(f"🔥 torch.compile(mode={compile_mode!r}) — первый inference будет медленнее (warmup).")
+            except Exception as e:
+                print(f"⚠️  torch.compile failed: {e}. Откат на eager mode.")
+
+        # Pinned memory: batch_size × parallel_sims листьев максимум.
+        # BF16 pinned: tensor.copy_(fp32_tensor) делает CPU-side cast FP32→BF16 за O(N),
+        # затем H2D copy уже идёт в BF16 — в 2 раза меньше PCIe bandwidth (44KB → 22KB на сэмпл).
+        # На больших батчах (8192 leaves × 22KB = 176MB вместо 352MB) — заметный win.
         MAX_LEAVES = max(8192, batch_size * self._parallel_sims * 2)
-        self.pinned_buf = torch.empty(MAX_LEAVES, 20, 8, 10,
-                                      pin_memory=True, dtype=torch.float32)
+        self.pinned_buf = torch.empty(MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W,
+                                      pin_memory=True, dtype=torch.bfloat16)
         self.pinned_size = MAX_LEAVES
         self.net.eval()
 
+        # NN transposition cache. Включается ТОЛЬКО для inference (gui/play),
+        # для self-play обычно выключен — ветки чаще уникальны + кеш растёт.
+        self.nn_cache_enabled = nn_cache
+        self.nn_cache_max = nn_cache_max
+        self.nn_cache: "OrderedDict[bytes, tuple]" = OrderedDict() if nn_cache else None
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+        # KLD-early-exit (Lc0 smart pruning).
+        # После каждых kld_check_every parallel-шагов проверяем KL(prev_visits || curr_visits)
+        # для всех живых игр. Если max KL < threshold AND visits >= min_frac*total → break.
+        # threshold=0 отключает фичу.
+        self.kld_threshold = float(kld_threshold)
+        self.kld_check_every = max(1, int(kld_check_every))
+        self.kld_min_sims_frac = float(kld_min_sims_frac)
+        self._kld_early_exits = 0       # сколько раз сработал early-exit
+        self._kld_total_calls = 0       # всего поисковых вызовов
+        self._kld_sims_saved = 0        # суммарно сэкономлено sims
+        self._kld_sims_requested = 0    # суммарно запрошено sims
+
+    def clear_nn_cache(self) -> None:
+        """Сбрасывает кеш — нужно вызывать после обновления весов сети."""
+        if self.nn_cache is not None:
+            self.nn_cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    @staticmethod
+    def _max_kl_divergence(prev: np.ndarray, curr: np.ndarray, eps: float = 1e-8) -> float:
+        """Max KL(prev || curr) по играм. prev/curr: (N_games, POLICY_SIZE), стохастические.
+
+        KL(P||Q) = Σ P * log(P/Q). Используется L0-style smart-pruning gate.
+        Возвращает +inf если массивы пусты.
+        """
+        if prev.shape != curr.shape or prev.size == 0:
+            return float('inf')
+        p = prev + eps
+        q = curr + eps
+        kl = np.sum(p * (np.log(p) - np.log(q)), axis=1)  # (N_games,)
+        return float(np.max(kl))
+
+    def kld_stats(self) -> dict:
+        """Статистика KLD-early-exit. Полезно для логирования."""
+        if self._kld_total_calls == 0:
+            return {"exit_rate": 0.0, "savings": 0.0, "calls": 0}
+        return {
+            "exit_rate": self._kld_early_exits / self._kld_total_calls,
+            "savings": (self._kld_sims_saved / self._kld_sims_requested
+                        if self._kld_sims_requested > 0 else 0.0),
+            "calls": self._kld_total_calls,
+        }
+
+    def update_inference_weights(self, fp32_net: torch.nn.Module = None) -> None:
+        """Синхронизирует BF16-копию весов inference-сети с актуальным FP32 net.
+
+        Вызывать после каждого train_epoch / EMA apply, чтобы selfplay использовал
+        свежие веса. Если bf16_weights=False — ничего не делает.
+
+        fp32_net: опционально передать другой FP32 net (например, EMA shadow).
+                  По умолчанию использует self._fp32_src (тот net что был при init).
+        """
+        if not self._bf16_weights:
+            return
+        src = fp32_net if fp32_net is not None else self._fp32_src
+        if src is None:
+            return
+        # Распаковываем компилированную обёртку если есть
+        src_inner = src._orig_mod if hasattr(src, '_orig_mod') else src
+        # Распаковываем target если он под torch.compile
+        target = self.net._orig_mod if hasattr(self.net, '_orig_mod') else self.net
+        with torch.no_grad():
+            target_state = target.state_dict()
+            for k, v in src_inner.state_dict().items():
+                if k not in target_state:
+                    continue
+                if target_state[k].dtype.is_floating_point:
+                    target_state[k].copy_(v.detach().to(target_state[k].dtype))
+                else:
+                    target_state[k].copy_(v.detach())
+        self.clear_nn_cache()
+
+    def nn_cache_stats(self) -> dict:
+        total = self._cache_hits + self._cache_misses
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "hit_rate": (self._cache_hits / total) if total > 0 else 0.0,
+            "size": len(self.nn_cache) if self.nn_cache is not None else 0,
+        }
+
     @torch.no_grad()
-    def _infer(self, tensors):
+    def _infer(self, tensors, hashes=None):
         """
-        Батчевый GPU inference.
-        tensors: np.ndarray (N, 1600) из Rust,
-                 ИЛИ List[np.ndarray (1600,)] из gui.py / python fallback.
-        Оба формата поддерживаются.
+        Батчевый GPU inference с опциональным NN-кешем (transposition table).
+
+        tensors: np.ndarray (N, FLAT_SIZE) или List.
+        hashes:  опциональный List[int] u64 — board hashes как ключи кеша.
+
+        Возвращает (policies, q_values, d_values, mlh_values).
         """
-        # Нормализуем: list → matrix
         if isinstance(tensors, list):
             if len(tensors) == 0:
-                return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty((0,), dtype=np.float32)
-            tensors = np.stack(tensors, axis=0).reshape(len(tensors), 1600)
+                empty_p = np.empty((0, POLICY_SIZE), dtype=np.float32)
+                empty_v = np.empty((0,), dtype=np.float32)
+                return empty_p, empty_v, empty_v.copy(), empty_v.copy()
+            tensors = np.stack(tensors, axis=0).reshape(len(tensors), FLAT_SIZE)
 
         n = tensors.shape[0]
         if n == 0:
-            return np.empty((0, POLICY_SIZE), dtype=np.float32), np.empty((0,), dtype=np.float32)
+            empty_p = np.empty((0, POLICY_SIZE), dtype=np.float32)
+            empty_v = np.empty((0,), dtype=np.float32)
+            return empty_p, empty_v, empty_v.copy(), empty_v.copy()
+
+        # === NN cache fast-path ===
+        if self.nn_cache_enabled and self.nn_cache is not None:
+            if hashes is not None and len(hashes) == n:
+                keys: list = list(hashes) if not isinstance(hashes, list) else hashes
+            else:
+                arr_for_keys = np.ascontiguousarray(tensors.reshape(n, -1), dtype=np.float32)
+                keys = [bytes(arr_for_keys[i].data) for i in range(n)]
+            uncached_idx = []
+            policies = np.empty((n, POLICY_SIZE), dtype=np.float32)
+            q_values = np.empty(n, dtype=np.float32)
+            d_values = np.empty(n, dtype=np.float32)
+            m_values = np.empty(n, dtype=np.float32)
+            for i, k in enumerate(keys):
+                cached = self.nn_cache.get(k)
+                if cached is None:
+                    uncached_idx.append(i)
+                else:
+                    p, q, d, m = cached
+                    policies[i] = p
+                    q_values[i] = q
+                    d_values[i] = d
+                    m_values[i] = m
+                    self.nn_cache.move_to_end(k)
+            self._cache_hits   += (n - len(uncached_idx))
+            self._cache_misses += len(uncached_idx)
+            if not uncached_idx:
+                return policies, q_values, d_values, m_values
+            uncached_tensors = tensors[uncached_idx]
+            p_un, q_un, d_un, m_un = self._infer_raw_nn(uncached_tensors)
+            for j, i in enumerate(uncached_idx):
+                policies[i] = p_un[j]
+                q_values[i] = q_un[j]
+                d_values[i] = d_un[j]
+                m_values[i] = m_un[j]
+                self.nn_cache[keys[i]] = (p_un[j].copy(), float(q_un[j]),
+                                          float(d_un[j]), float(m_un[j]))
+                if len(self.nn_cache) > self.nn_cache_max:
+                    self.nn_cache.popitem(last=False)
+            return policies, q_values, d_values, m_values
+
+        return self._infer_raw_nn(tensors)
+
+    @torch.no_grad()
+    def _infer_raw_nn(self, tensors):
+        """Прямой батчевый вызов NN без кеша. tensors: ndarray (N, FLAT_SIZE).
+        Возвращает (policies, q, d, m)."""
+        n = tensors.shape[0]
+        if n == 0:
+            empty_p = np.empty((0, POLICY_SIZE), dtype=np.float32)
+            empty_v = np.empty((0,), dtype=np.float32)
+            return empty_p, empty_v, empty_v.copy(), empty_v.copy()
 
         # Паддинг до кратного parallel_sims: маленькие батчи плохо утилизируют GPU.
-        # Паддируем дублированием последней позиции, обрезаем результат до n в конце.
+        # Паддируем дублированием случайных позиций, обрезаем результат до n в конце.
         ps = self._parallel_sims
         target = ((n + ps - 1) // ps) * ps
         n_pad = target - n
 
-        arr = tensors.reshape(n, 20, 8, 10)
+        arr = tensors.reshape(n, INPUT_PLANES, BOARD_H, BOARD_W)
         if n_pad > 0:
-            # Случайный паддинг из батча вместо repeat-last:
-            # repeat-last перекашивает BatchNorm/GroupNorm статистики к одной позиции.
             pad_idx = np.random.randint(0, n, n_pad)
             arr = np.concatenate([arr, arr[pad_idx]], axis=0)
         n_total = arr.shape[0]
 
         if n_total <= self.pinned_size:
             buf = self.pinned_buf[:n_total]
+            # copy_(fp32) → CPU-side cast в BF16 (pinned_buf — bfloat16).
             buf.copy_(torch.from_numpy(arr))
             x = buf.to(self.device, non_blocking=True)
         else:
-            x = torch.from_numpy(np.ascontiguousarray(arr)).to(self.device, non_blocking=True)
+            # Fallback при превышении pinned-буфера: всё равно кастим в BF16 до H2D.
+            cpu_t = torch.from_numpy(np.ascontiguousarray(arr)).to(torch.bfloat16)
+            x = cpu_t.to(self.device, non_blocking=True)
 
         x = x.to(memory_format=torch.channels_last)
-        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, values = self.net(x)
+        if self._bf16_weights:
+            # И веса и input в BF16 → autocast не нужен (избегаем overhead context manager).
+            out = self.net(x)
+        else:
+            # FP32 веса: autocast делает все matmul/conv в BF16 на лету.
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                out = self.net(x)
+
+        # Поддерживаем варианты сети:
+        #   - 4 выхода: (policy, wdl, mlh, future) — модель с future-головой
+        #   - 3 выхода: (policy, wdl, mlh)         — модель с MLH
+        #   - 2 выхода: (policy, wdl)              — старые чекпоинты
+        # future-голова в inference не нужна → игнорируем.
+        if isinstance(out, tuple) and len(out) == 4:
+            logits, values, mlh_raw, _ = out
+        elif isinstance(out, tuple) and len(out) == 3:
+            logits, values, mlh_raw = out
+        else:
+            logits, values = out
+            mlh_raw = None
 
         logits_f = logits.float()
         values_f = values.float()
 
-        # Проверка на NaN/inf — может возникнуть при несовместимости весов
         if torch.isnan(logits_f).any() or torch.isinf(logits_f).any():
             print(f"⚠️  _infer: NaN/inf в logits! Возвращаем равномерное распределение.")
             logits_f = torch.zeros_like(logits_f)
@@ -117,18 +357,24 @@ class UltraFastMCTS:
 
         policies = torch.softmax(logits_f, dim=1).cpu().numpy()
 
-        # WDL → Q: сеть возвращает (N,3) logits [Win,Draw,Loss]
-        # Q = P(Win) - P(Loss) ∈ [-1, 1] — скалярная оценка для MCTS backup
-        # Если values (N,1) — старая модель, конвертируем напрямую
         if values_f.shape[-1] == 3:
             wdl_probs = torch.softmax(values_f, dim=1)
             q_values  = (wdl_probs[:, 0] - wdl_probs[:, 2]).cpu().numpy()
+            d_values  = wdl_probs[:, 1].cpu().numpy()
         else:
-            # Совместимость со старыми скалярными чекпоинтами
             q_values = values_f.view(-1).cpu().numpy()
+            d_values = np.zeros_like(q_values)
 
-        # Убираем паддинг — возвращаем только реальные n позиций
-        return policies[:n], q_values[:n]
+        # MLH: sigmoid raw → ∈ [0, 1] (нормализованная "доля до конца игры").
+        if mlh_raw is not None:
+            mlh_f = mlh_raw.float()
+            if torch.isnan(mlh_f).any() or torch.isinf(mlh_f).any():
+                mlh_f = torch.zeros_like(mlh_f)
+            m_values = torch.sigmoid(mlh_f).view(-1).cpu().numpy()
+        else:
+            m_values = np.zeros_like(q_values)
+
+        return policies[:n], q_values[:n], d_values[:n], m_values[:n]
 
     def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
         if RUST_MCTS_AVAILABLE:
@@ -136,14 +382,29 @@ class UltraFastMCTS:
         return self._search_python(engines, simulations)
 
     def search_games_with_values(self, engines: List, simulations: int = 80):
-        """Возвращает (policies, values). values нужны для resign логики."""
+        """Возвращает (policies, values). values нужны для resign логики.
+
+        Если self.kld_threshold > 0, MCTS может остановиться досрочно когда
+        визит-распределение перестало меняться (Lc0 smart pruning).
+        """
         if RUST_MCTS_AVAILABLE:
             rust_mcts = _RustMCTS(engines, self._parallel_sims)
             steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
 
             prev_policies = None
             prev_values   = None
+            prev_draws    = None
+            prev_mlhs     = None
             prev_counts   = None
+
+            # KLD-early-exit (Rust-side compute, минимум marshalling).
+            kld_enabled = self.kld_threshold > 0.0
+            kld_min_steps = int(np.ceil(steps * self.kld_min_sims_frac))
+            if kld_enabled:
+                rust_mcts.kld_reset_all()
+            self._kld_total_calls += 1
+            self._kld_sims_requested += simulations
+            early_exit_step = None  # для отчёта
 
             for step in range(steps + 1):
                 if step < steps:
@@ -151,21 +412,50 @@ class UltraFastMCTS:
                     has_leaves  = leaf_matrix.shape[0] > 0
                     if has_leaves:
                         curr_counts = rust_mcts.get_current_batch_counts()
+                        # Получаем хеши ДО apply_inference, т.к. apply_inference очищает pending.
+                        curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
                 else:
                     has_leaves = False
 
                 if prev_policies is not None and prev_counts is not None:
                     rust_mcts.apply_inference_buffered(
-                        prev_policies, prev_values, prev_counts
+                        prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
                     )
+                    prev_policies = prev_values = prev_draws = prev_mlhs = prev_counts = None
 
                 if has_leaves:
-                    p, v = self._infer(leaf_matrix)
+                    p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
                     prev_policies = np.ascontiguousarray(p, dtype=np.float32)
                     prev_values   = np.ascontiguousarray(v, dtype=np.float32)
+                    prev_draws    = np.ascontiguousarray(d, dtype=np.float32)
+                    prev_mlhs     = np.ascontiguousarray(m, dtype=np.float32)
                     prev_counts   = curr_counts
-                else:
-                    prev_policies = prev_values = prev_counts = None
+
+                # === KLD-early-exit check (Lc0-style smart pruning) ===
+                # Rust считает max KL gain — Python получает 1 float.
+                if (kld_enabled and step >= kld_min_steps and step < steps
+                        and (step + 1) % self.kld_check_every == 0):
+                    # Применяем pending inference чтобы KL отражал свежие визиты.
+                    if prev_policies is not None and prev_counts is not None:
+                        rust_mcts.apply_inference_buffered(
+                            prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
+                        )
+                        prev_policies = prev_values = prev_draws = prev_mlhs = prev_counts = None
+                    max_kl = rust_mcts.kld_snapshot_and_check()
+                    if max_kl != float('inf'):
+                        sims_added = self.kld_check_every * self._parallel_sims
+                        kl_gain = max_kl / max(1, sims_added)
+                        if kl_gain < self.kld_threshold:
+                            self._kld_early_exits += 1
+                            self._kld_sims_saved += (steps - step - 1) * self._parallel_sims
+                            early_exit_step = step
+                            break
+
+            # Финальный pending — если break не произошёл, может остаться один apply.
+            if prev_policies is not None and prev_counts is not None:
+                rust_mcts.apply_inference_buffered(
+                    prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
+                )
 
             raw_policies = rust_mcts.get_policies()
             raw_values   = rust_mcts.get_values()
@@ -199,6 +489,8 @@ class UltraFastMCTS:
 
         prev_policies  = None
         prev_values    = None
+        prev_draws     = None
+        prev_mlhs      = None
         prev_counts    = None
 
         for step in range(steps + 1):
@@ -209,24 +501,29 @@ class UltraFastMCTS:
                 if has_leaves:
                     # Сохраняем counts ЭТОГО батча — он не изменится при следующем collect
                     curr_counts = rust_mcts.get_current_batch_counts()
+                    curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
             else:
                 has_leaves = False
 
             # Применяем результаты предыдущего inference с ПРАВИЛЬНЫМИ counts
             if prev_policies is not None and prev_counts is not None:
                 rust_mcts.apply_inference_buffered(
-                    prev_policies, prev_values, prev_counts
+                    prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
                 )
 
             # Запускаем inference для текущего батча
             if has_leaves:
-                p, v = self._infer(leaf_matrix)
+                p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
                 prev_policies = np.ascontiguousarray(p, dtype=np.float32)
                 prev_values   = np.ascontiguousarray(v, dtype=np.float32)
+                prev_draws    = np.ascontiguousarray(d, dtype=np.float32)
+                prev_mlhs     = np.ascontiguousarray(m, dtype=np.float32)
                 prev_counts   = curr_counts
             else:
                 prev_policies = None
                 prev_values   = None
+                prev_draws    = None
+                prev_mlhs     = None
                 prev_counts   = None
 
         raw = rust_mcts.get_policies()
@@ -241,8 +538,8 @@ class UltraFastMCTS:
         roots = [MCTSNode(None, -1, 1.0) for _ in range(num_games)]
         root_tensors = np.stack([
             np.array(e.get_board_tensor(), dtype=np.float32) for e in engines
-        ]).reshape(num_games, 1600)
-        policies, _ = self._infer(root_tensors)
+        ]).reshape(num_games, FLAT_SIZE)
+        policies, _, _, _ = self._infer(root_tensors)
         for i in range(num_games):
             self._expand_node_py(roots[i], engines[i], policies[i],
                                  add_noise=self.add_dirichlet)
@@ -267,8 +564,8 @@ class UltraFastMCTS:
                     all_meta.append((g, node, stack))
                     self._vloss_py(node, VIRTUAL_LOSS)
             if not all_tensors: continue
-            tensor_matrix = np.stack(all_tensors).reshape(len(all_tensors), 1600)
-            pols, vals = self._infer(tensor_matrix)
+            tensor_matrix = np.stack(all_tensors).reshape(len(all_tensors), FLAT_SIZE)
+            pols, vals, _, _ = self._infer(tensor_matrix)
             for i, (g, node, stack) in enumerate(all_meta):
                 sim = engines[g].copy()
                 for m in stack: sim.make_move_int(m)
@@ -292,14 +589,20 @@ class UltraFastMCTS:
 
     def _select_py(self, root):
         import math
+        FPU_REDUCTION = 0.330
         node, stack = root, []
         while node.is_expanded and node.children and not node.is_terminal:
+            parent_q = node.q()
             sqrt_n = math.sqrt(max(node.visits + node.virtual_loss, 1))
+            # Relative FPU: fpu = parent_q - 0.330 * sqrt(sum_of_visited_priors)
+            visited_pol = sum(c.prior for c in node.children.values()
+                              if c.visits > 0 or c.virtual_loss > 0)
+            fpu = max(parent_q - FPU_REDUCTION * math.sqrt(visited_pol), -1.0)
             best, best_s = None, -1e18
             for child in node.children.values():
-                # Negamax: child.q() в POV ребёнка (противник родителя) → инвертируем для POV родителя.
-                q_in_parent = -child.q() if child.visits > 0 else 0.0
-                s = q_in_parent + self.c_puct * child.prior * sqrt_n / (1 + child.visits + child.virtual_loss)
+                started = child.visits + child.virtual_loss
+                q_in_parent = -child.q() if started > 0 else fpu
+                s = q_in_parent + self.c_puct * child.prior * sqrt_n / (1 + started)
                 if s > best_s: best_s = s; best = child
             node = best; stack.append(node.move)
         return node, stack

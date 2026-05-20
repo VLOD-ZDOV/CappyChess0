@@ -296,14 +296,19 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
         elif nn_result < -0.5: nn_losses += 1
         else:                  nn_draws  += 1
 
-        for board_np, pol, side, fsf_eval in nn_positions:
+        total_nn = len(nn_positions)
+        for k, (board_np, pol, side, fsf_eval) in enumerate(nn_positions):
             v_game = result if side == 0 else -result
             if not use_random and fsf_eval is not None:
                 # Смешиваем: FSF eval (плотный, позиционный) + game result (долгосрочный)
                 v = fsf_value_alpha * fsf_eval + (1.0 - fsf_value_alpha) * v_game
             else:
                 v = v_game
-            all_samples.append(pack_sample(board_np, pol, float(v)))
+            # MLH: позиции NN записаны в порядке игры (только NN-ходы, не FSF). Используем
+            # позицию NN в его последовательности — позиций мало, нормализация всё равно [0,1].
+            remaining = max(0, total_nn - 1 - k)
+            mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
+            all_samples.append(pack_sample(board_np, pol, float(v), float(mlh_norm)))
 
     if fsf is not None:
         fsf.close()
@@ -333,7 +338,13 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
 
     from model import CapablancaNet
 
-    lagged_net = CapablancaNet(cfg.num_channels, cfg.num_res_blocks).to(device)
+    lagged_net = CapablancaNet(
+        cfg.num_channels, cfg.num_res_blocks,
+        enable_mlh=cfg.enable_mlh,
+        num_transformer_blocks=cfg.num_transformer_blocks,
+        transformer_heads=cfg.transformer_heads,
+        enable_future=cfg.enable_future,
+    ).to(device)
     lagged_net.load_state_dict(lagged_sd, strict=False)
     lagged_net.eval()
 
@@ -386,9 +397,12 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
         elif cur_result < -0.5: cur_losses += 1
         else:                   cur_draws  += 1
 
-        for board_np, pol, side in positions:
+        total_pos = len(positions)
+        for k, (board_np, pol, side) in enumerate(positions):
             v = result if side == 0 else -result
-            all_samples.append(pack_sample(board_np, pol, float(v)))
+            remaining = max(0, total_pos - 1 - k)
+            mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
+            all_samples.append(pack_sample(board_np, pol, float(v), float(mlh_norm)))
 
     del lagged_net
     total = cur_wins + cur_draws + cur_losses
@@ -413,6 +427,15 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
+# PyTorch 2.0+: устанавливает FP32 matmul precision = TF32 для любых FP32 GEMM,
+# которые не попали под autocast (fallback paths, gradient ops).
+torch.set_float32_matmul_precision('high')
+# Blackwell+: разрешает BF16 matmul использовать BF16 accumulator (вместо FP32).
+# Внутри autocast(bfloat16) даёт ~10-15% speedup на attention/FFN. Безопасно при batch_norm/GroupNorm.
+try:
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+except AttributeError:
+    pass  # старая версия PyTorch
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 
@@ -421,6 +444,15 @@ class Config:
     # Модель
     num_channels: int = 64
     num_res_blocks: int = 5
+    # LC0 BT3+ inspired: трансформер блоки с RPB (Relative Position Bias) после ResNet tower.
+    # Даёт глобальное "понимание позиции" — связывает любые две клетки за 1 шаг.
+    # 2 блоков обычно достаточно. Установите =0 чтобы откатить на чистый ResNet.
+    num_transformer_blocks: int = 2
+    transformer_heads: int = 8
+    enable_mlh: bool = True
+    # Future move head (LC0 BT4-inspired): предсказание нашего хода через 2 полухода.
+    # Auxiliary task — улучшает планирующие представления trunk. В inference не используется.
+    enable_future: bool = True
 
     # Self-play
     simulations: int = 100
@@ -437,9 +469,25 @@ class Config:
     temperature: float = 1.0          # tau для первых temperature_moves ходов (1.0 = пропорционально visit counts)
     temperature_late: float = 0.0     # tau после temperature_moves: 0.0 = жёсткий argmax (лучше матует)
     games_per_iter: int = 128
-    max_game_length: int = 110
+    max_game_length: int = 300  # ply (LC0=450 для шахмат, Капабланка длиннее на 1.5x но осторожно)
     mcts_batch: int = 128
     mcts_parallel_sims: int = 32  # листьев за шаг MCTS (больше = реже round-trip Python↔GPU)
+    # torch.compile mode для inference net: None / 'default' / 'reduce-overhead' / 'max-autotune'.
+    # None = без компиляции (быстрый старт). 'reduce-overhead' = CUDA graphs, до 50% speedup на Blackwell.
+    compile_inference: str = None
+
+    # KLD-early-exit (Lc0 style smart pruning).
+    # Per-visit KLD gain = max KL(prev || curr) / Δsims. Если для всех игр gain < threshold
+    # AND визитов >= kld_min_sims_frac * total → MCTS останавливается.
+    # Идея: если визит-распределение перестало меняться, дополнительные sims не дадут новой информации.
+    # Замеры на 64-game батчах: per-visit gain падает с ~1.4e-2 (step 7/13) до ~4-7e-3 (step 11/13).
+    # threshold=5e-3 — компромисс: экономит 15-20% sims на простых позициях, не трогает сложные.
+    # ВАЖНО: при simulations<200 фича редко срабатывает (мало snapshots между check_every).
+    # 0 = disable.
+    kld_threshold: float = 5e-3
+    kld_check_every: int = 2             # проверять KL каждые N parallel-steps (2*32=64 sims между snapshots)
+    kld_min_sims_frac: float = 0.30      # минимум 30% от полных sims обязательны
+    kld_enabled: bool = True
 
     # Тренировка
     batch_size: int = 512
@@ -448,6 +496,17 @@ class Config:
     train_steps: int = 200
     min_train_steps: int = 20
     value_loss_weight: float = 1.0
+    # LC0 MLH loss weight. Слишком большой → MLH доминирует над policy/value.
+    # 0.1 — стандартное значение в LC0.
+    mlh_loss_weight: float = 0.1
+    # Future move loss weight. Auxiliary — держим небольшим, чтобы не доминировал.
+    future_loss_weight: float = 0.15
+
+    # Дистилляция: N эпох supervised обучения на загруженном буфере ПЕРЕД self-play.
+    # Буфер от сильной старой сети = teacher-данные (policy = MCTS-визиты). Новая большая
+    # сеть быстро достигает ≈ силы учителя без дорогого self-play. 0 = выкл.
+    pretrain_epochs: int = 0
+    pretrain_only: bool = False  # выйти сразу после дистилляции (не входить в self-play цикл)
 
     # Буфер
     buffer_max: int = 1_000_000
@@ -459,11 +518,23 @@ class Config:
     # На ранних итерациях (< resign_warmup_iters) порог жёсткий (-0.99),
     # потом переходит к resign_threshold (-0.95).
     # Это защищает от ошибок слабой сети в оценке позиции.
-    resign_threshold: float = -0.95   # порог оценки (финальный)
-    resign_threshold_early: float = -0.99  # порог на ранних итерациях
+    resign_threshold: float = -0.95   # порог Q (финальный) — fallback если нет WDL
+    resign_threshold_early: float = -0.99  # порог Q на ранних итерациях
     resign_warmup_iters: int = 30     # итераций до перехода к resign_threshold
     resign_consec: int = 3            # ходов подряд ниже порога
     resign_min_move: int = 20         # не сдаёмся раньше этого хода
+    # WDL-based resign (LC0-style): P(L) > resign_wdl_threshold.
+    # Q-based threshold путает "жёсткую ничью" с проигрышем (q=-0.95 может быть P(D)=0.95,
+    # P(L)=0.05 — это не проигрыш!). WDL разделяет однозначно.
+    # 0.85 = "вероятность проиграть > 85%" → сдаёмся.
+    resign_wdl_threshold: float = 0.85
+    resign_wdl_early: float = 0.95    # жёстче на ранних итерациях
+    # Resign playthrough (LC0 tournament.cc:388): доля игр, где resign ОТКЛЮЧЁН.
+    # Без этого:
+    #   1) Нет калибровки threshold — false-positives (выиграл/ничейная позиция, сдали) не отлавливаются
+    #   2) Сеть не учится защищаться в трудных позициях (resigns обрывают данные)
+    # 0.10 = 10% игр играем до конца, остальные с resign.
+    resign_playthrough: float = 0.10
 
     # Инфраструктура
     device: str = "cuda"
@@ -480,7 +551,7 @@ class Config:
 
     # EMA весов модели (AlphaZero стабилизация self-play)
     use_ema: bool = True
-    ema_decay: float = 0.999
+    ema_decay: float = 0.9999  # per-step: окно ~10K шагов ≈ 10 итераций (LC0 selfplay)
     # EMA не применяется к self-play до этой итерации: ранние веса EMA = усреднение
     # случайных весов → worse чем live NN. Обновляется всегда, используется только с ema_start_iter.
     ema_start_iter: int = 10
@@ -519,16 +590,22 @@ class Config:
     timeout_as_draw: bool = False
 
 
-CompactSample = Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], float]
+# Tuple: (board_f16, sparse_policy, value, mlh_norm)
+# mlh_norm = remaining_plies / MLH_PLY_NORM ∈ [0, 1], 0.0 для старых сэмплов без MLH
+CompactSample = Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], float, float, int]
 Sample = CompactSample
+MLH_PLY_NORM = 200.0   # должно совпадать с CapablancaNet.MLH_PLY_NORM
 
 
-def pack_sample(board: np.ndarray, policy: np.ndarray, value: float) -> CompactSample:
+def pack_sample(board: np.ndarray, policy: np.ndarray, value: float,
+                mlh_norm: float = 0.0, future_idx: int = -1) -> CompactSample:
+    """future_idx: policy-индекс нашего хода через 2 полухода (-1 = неизвестно/нет)."""
     board_f16 = board.astype(np.float16)
     nz = np.nonzero(policy)[0]
     pol_idx = nz.astype(np.int16)
     pol_val = policy[nz].astype(np.float16)
-    return (board_f16, (pol_idx, pol_val), np.float32(value))
+    return (board_f16, (pol_idx, pol_val), np.float32(value),
+            np.float32(mlh_norm), np.int32(future_idx))
 
 
 def unpack_policy(pol_sparse: Tuple[np.ndarray, np.ndarray],
@@ -671,7 +748,13 @@ def print_diversity(stats: dict, prefix: str = "  Diversity"):
 # ── Self-play ─────────────────────────────────────────────────────────────────
 
 def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration: int = 0) -> List[Sample]:
-    mcts = UltraFastMCTS(net, device, cfg.c_puct, batch_size=cfg.mcts_batch, parallel_sims=cfg.mcts_parallel_sims)
+    kld_thr = cfg.kld_threshold if cfg.kld_enabled else 0.0
+    mcts = UltraFastMCTS(net, device, cfg.c_puct, batch_size=cfg.mcts_batch,
+                         parallel_sims=cfg.mcts_parallel_sims,
+                         compile_mode=cfg.compile_inference,
+                         kld_threshold=kld_thr,
+                         kld_check_every=cfg.kld_check_every,
+                         kld_min_sims_frac=cfg.kld_min_sims_frac)
     all_samples: List[Sample] = []
 
     batch_sz = cfg.mcts_batch
@@ -686,6 +769,9 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         # (root в перспективе ходящего), общий счётчик сбрасывался бы каждый второй полуход.
         resign_counts = [[0, 0] for _ in range(n)]
         resigned = [False] * n
+        # LC0 resign playthrough: с вероятностью resign_playthrough играем БЕЗ resign
+        # (чтобы калибровать порог и собирать данные про "тяжёлые позиции").
+        enable_resign = [np.random.random() >= cfg.resign_playthrough for _ in range(n)]
 
         active = list(range(n))
         move_num = 0
@@ -705,26 +791,51 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             use_full_search = np.random.random() >= cfg.fast_sim_fraction
             current_sims = cfg.simulations if use_full_search else cfg.fast_simulations
 
-            # Tree reuse inference loop (без создания нового RustMCTS каждый ход)
+            # Tree reuse inference loop (без создания нового RustMCTS каждый ход).
+            # KLD-early-exit считается в Rust → marshalling = 1 float вместо 7000*128
+            # на каждой проверке. Сбрасываем snapshot перед серией sims текущего хода
+            # т.к. tree reuse может перенести root.
             steps = max(1, (current_sims + _parallel - 1) // _parallel)
+            _kld_active = mcts.kld_threshold > 0.0
+            _kld_min_steps = int(np.ceil(steps * mcts.kld_min_sims_frac)) if _kld_active else steps + 1
+            if _kld_active:
+                rust_mcts_reuse.kld_reset_all()
+            mcts._kld_total_calls += 1
+            mcts._kld_sims_requested += current_sims
             for _step in range(steps):
                 _lm = rust_mcts_reuse.collect_leaves(current_sims)
                 if _lm.shape[0] == 0:
                     break
-                _rp, _rv = mcts._infer(_lm)
+                _lh = rust_mcts_reuse.get_leaf_hashes() if mcts.nn_cache_enabled else None
+                _rp, _rv, _rd, _rm = mcts._infer(_lm, hashes=_lh)
                 rust_mcts_reuse.apply_inference_buffered(
                     np.ascontiguousarray(_rp, dtype=np.float32),
                     np.ascontiguousarray(_rv, dtype=np.float32),
+                    np.ascontiguousarray(_rd, dtype=np.float32),
+                    np.ascontiguousarray(_rm, dtype=np.float32),
                     rust_mcts_reuse.get_current_batch_counts(),
                 )
+                # KLD-early-exit (Rust-side compute)
+                if (_kld_active and _step >= _kld_min_steps
+                        and (_step + 1) % mcts.kld_check_every == 0
+                        and _step + 1 < steps):
+                    _max_kl = rust_mcts_reuse.kld_snapshot_and_check()
+                    if _max_kl != float('inf'):
+                        _gain = _max_kl / max(1, mcts.kld_check_every * _parallel)
+                        if _gain < mcts.kld_threshold:
+                            mcts._kld_early_exits += 1
+                            mcts._kld_sims_saved += (steps - _step - 1) * _parallel
+                            break
             raw_pols  = rust_mcts_reuse.get_policies()
             raw_vals  = rust_mcts_reuse.get_values()
+            raw_draws = rust_mcts_reuse.get_draws()
             # get_policies()/get_values() возвращают по одной записи на КАЖДУЮ игру
             # из rust_mcts_reuse.games (длина = n, не len(active)).
             # Индексируем по game_idx, иначе после первого завершения игры в батче
             # все остальные игры начинают получать чужие policy/value.
             policies  = [np.array(p, dtype=np.float32) for p in raw_pols]
-            values_np = np.array(raw_vals, dtype=np.float32)
+            values_np = np.array(raw_vals,  dtype=np.float32)
+            draws_np  = np.array(raw_draws, dtype=np.float32)
 
             new_active = []
             for j, game_idx in enumerate(active):
@@ -737,7 +848,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 side = eng.side_to_move()
                 pol = policies[game_idx]
                 root_v_raw = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
-                histories[game_idx].append((board_np, pol.copy(), side, root_v_raw, use_full_search))
+                # 6-й элемент (move_idx) — policy-индекс выбранного хода, патчится
+                # ниже после семплинга. Список (не tuple) чтобы можно было дописать.
+                histories[game_idx].append(
+                    [board_np, pol.copy(), side, root_v_raw, use_full_search, -1])
 
                 # Temperature decay (argmax-ветка ниже ловит tau ≈ 0)
                 if move_num < cfg.temperature_moves:
@@ -761,21 +875,33 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
                     move = int(np.random.choice(legal, p=probs))
 
+                # Записываем canonical policy-индекс выбранного хода в history —
+                # это будущий target для future-головы соседних позиций.
+                _mpidx = eng.move_int_to_policy_idx(move)
+                histories[game_idx][-1][5] = _mpidx if _mpidx is not None else -1
+
                 eng.make_move_int(move)
                 rust_mcts_reuse.make_move(game_idx, move)  # tree reuse
 
                 if eng.is_game_over():
                     continue
 
-                # Resign: проверяем оценку позиции после хода
-                # Используем root value из MCTS (уже вычислен выше)
-                # sign: value с точки зрения стороны которая только что сделала ход
-                if move_num >= cfg.resign_min_move:
-                    v_before_move = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
-                    _resign_thr = (cfg.resign_threshold_early
-                                   if iteration < cfg.resign_warmup_iters
-                                   else cfg.resign_threshold)
-                    if v_before_move < _resign_thr:
+                # Resign: WDL-based (LC0-style), с playthrough probability.
+                # P(L) = (1 - Q - D) / 2 — точная вероятность проигрыша.
+                # enable_resign[g]=False → играем до конца (для калибровки + данных).
+                if move_num >= cfg.resign_min_move and enable_resign[game_idx]:
+                    q = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
+                    d = float(draws_np[game_idx])  if game_idx < len(draws_np)  else 0.0
+                    p_loss = max(0.0, min(1.0, (1.0 - q - d) / 2.0))
+                    _wdl_thr = (cfg.resign_wdl_early
+                                if iteration < cfg.resign_warmup_iters
+                                else cfg.resign_wdl_threshold)
+                    _q_thr = (cfg.resign_threshold_early
+                              if iteration < cfg.resign_warmup_iters
+                              else cfg.resign_threshold)
+                    # Срабатывает если ИЛИ P(L) высокий ИЛИ Q низкий (на старых чекпоинтах D=0)
+                    should_resign = p_loss > _wdl_thr or q < _q_thr
+                    if should_resign:
                         resign_counts[game_idx][side] += 1
                     else:
                         resign_counts[game_idx][side] = 0
@@ -798,7 +924,9 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             move_num += 1
 
         batch_positions = 0
-        white_wins = black_wins = draws = timeouts = adjudications = 0
+        # Категории игры. resigns — отдельная категория, НЕ перекрывается с timeouts.
+        # Раньше resign засчитывался И в timeouts И в white/black_wins → числа не сходились.
+        white_wins = black_wins = draws = resigns = adjudications = timeouts = 0
 
         for i, eng in enumerate(engines):
             if resigned[i]:
@@ -806,9 +934,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 # Определяем кто сдался по side_to_move (ходит противник → предыдущий сдался)
                 last_side = histories[i][-1][2] if histories[i] else 0
                 result = -1.0 if last_side == 0 else 1.0
-                timeouts += 1  # считаем как незавершённую для статистики
-                if result > 0: white_wins += 1
-                else:          black_wins += 1
+                resigns += 1  # отдельная категория, без двойного учёта
             elif adjudicated[i] is not None:
                 # Досрочное присуждение — решающий материальный перевес
                 result = adjudicated[i]
@@ -824,19 +950,39 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 result = 0.0 if cfg.timeout_as_draw else eng.material_result()
                 timeouts += 1
 
-            for entry in histories[i]:
+            total_plies = len(histories[i])
+            for k, entry in enumerate(histories[i]):
                 board_np, pol, side = entry[0], entry[1], entry[2]
                 # Playout cap: пропускаем fast-search позиции при обучении
                 if cfg.playout_cap_train_only_full and len(entry) > 4 and not entry[4]:
                     continue
                 v = result if side == 0 else -result
-                all_samples.append(pack_sample(board_np, pol, float(v)))
+                # MLH target: сколько полуходов ОСТАЛОСЬ от этой позиции до конца игры.
+                # Нормализуем к [0, 1] делением на MLH_PLY_NORM.
+                # (При timeout позиция конечная неизвестна → ёмко, используем "хвост" игры как есть.)
+                remaining = max(0, total_plies - 1 - k)
+                mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
+                # Future move target: ход на k+2 (наш следующий ход — та же сторона,
+                # та же каноническая ориентация policy-индексов). -1 если партия кончилась.
+                future_idx = histories[i][k + 2][5] if k + 2 < total_plies else -1
+                all_samples.append(
+                    pack_sample(board_np, pol, float(v), float(mlh_norm), int(future_idx)))
                 batch_positions += 1
 
+        # Все категории взаимоисключающие → сумма = n (sanity check).
+        total_counted = white_wins + black_wins + draws + resigns + adjudications + timeouts
+        sanity = "" if total_counted == n else f" ⚠️ sanity {total_counted}/{n}"
         print(f"  Batch {b+1}/{num_batches}: {n} games, "
               f"{batch_positions} positions, {move_num} ходов | "
               f"бел={white_wins} чёрн={black_wins} пат={draws} "
-              f"adj={adjudications} timeout={timeouts}")
+              f"resign={resigns} adj={adjudications} timeout={timeouts}{sanity}")
+
+    # KLD-early-exit статистика
+    if cfg.kld_enabled and cfg.kld_threshold > 0.0:
+        _ks = mcts.kld_stats()
+        if _ks['calls'] > 0:
+            print(f"  KLD: exit_rate={_ks['exit_rate']*100:.0f}% "
+                  f"savings={_ks['savings']*100:.0f}% (за {_ks['calls']} MCTS вызовов)")
 
     return all_samples
 
@@ -845,29 +991,42 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
 
 def value_to_wdl(v: float) -> np.ndarray:
     """
-    Мягкая конвертация v∈[-1,1] → [P(Win), P(Draw), P(Loss)] без жёстких порогов.
-    sqrt-нелинейность даёт более чёткий сигнал при материальном перевесе:
-      v=0.5 → [0.71, 0.29, 0.0]   (раньше через порог: то же [0.71, 0.29, 0])
-      v=0.9 → [0.95, 0.05, 0.0]   (раньше: жёсткий [1, 0, 0] — потеря информации)
-      v=1.0 → [1.00, 0.00, 0.0]
-    Преимущество: плавный градиент даже при v близком к ±1.
+    Конвертация v∈[-1,1] → [P(Win), P(Draw), P(Loss)].
+
+    Линейный маппинг, ТОЧНО сохраняющий Q = P(Win) - P(Loss) = v:
+      p_win = max(0, v), p_loss = max(0, -v), p_draw = 1 - |v|
+      v=+1.0 → [1.0, 0.0, 0.0]
+      v=+0.5 → [0.5, 0.5, 0.0]   (Q восстанавливается ровно 0.5)
+      v= 0.0 → [0.0, 1.0, 0.0]
+    Старый sqrt-вариант давал v=0.5 → [0.71, 0.29, 0] → Q=0.71 ≠ 0.5: WDL-голова
+    обучалась на рассогласованном таргете. Для целочисленных исходов игры
+    (v ∈ {-1,0,+1}, чистый self-play) оба варианта идентичны.
     """
     v = float(np.clip(v, -1.0, 1.0))
-    p_win  = float(max(0.0, v) ** 0.5)
-    p_loss = float(max(0.0, -v) ** 0.5)
-    p_draw = max(0.0, 1.0 - p_win - p_loss)
-    total = p_win + p_draw + p_loss
-    if total > 0:
-        p_win /= total; p_draw /= total; p_loss /= total
+    p_win  = max(0.0, v)
+    p_loss = max(0.0, -v)
+    p_draw = max(0.0, 1.0 - abs(v))
     return np.array([p_win, p_draw, p_loss], dtype=np.float32)
 
 
 class SelfPlayDataset(torch.utils.data.Dataset):
     def __init__(self, samples: List[CompactSample]):
-        self.boards   = np.stack([s[0].astype(np.float32) for s in samples]).reshape(-1, 20, 8, 10)
+        self.boards   = np.stack([s[0].astype(np.float32) for s in samples]).reshape(
+            -1, CapablancaNet.INPUT_PLANES, CapablancaNet.BOARD_H, CapablancaNet.BOARD_W
+        )
         self.policies = np.stack([unpack_policy(s[1]) for s in samples])
         # WDL: каждый скалярный value → soft one-hot [Win, Draw, Loss]
         self.wdl = np.stack([value_to_wdl(float(s[2])) for s in samples])
+        # MLH target: норма ∈ [0, 1]. Старые сэмплы без MLH (len=3) → 0.0.
+        self.mlh = np.array(
+            [float(s[3]) if len(s) > 3 else 0.0 for s in samples],
+            dtype=np.float32,
+        )
+        # Future move target: policy-индекс хода k+2. Старые сэмплы (len<5) → -1 (masked).
+        self.future = np.array(
+            [int(s[4]) if len(s) > 4 else -1 for s in samples],
+            dtype=np.int64,
+        )
 
     def __len__(self):
         return len(self.wdl)
@@ -876,7 +1035,9 @@ class SelfPlayDataset(torch.utils.data.Dataset):
         return (
             torch.from_numpy(self.boards[idx]),
             torch.from_numpy(self.policies[idx]),
-            torch.from_numpy(self.wdl[idx]),   # (3,) float32
+            torch.from_numpy(self.wdl[idx]),    # (3,) float32
+            torch.tensor(self.mlh[idx]),        # scalar float32 ∈ [0, 1]
+            torch.tensor(self.future[idx]),     # scalar int64 (policy idx или -1)
         )
 
 
@@ -884,7 +1045,12 @@ class SelfPlayDataset(torch.utils.data.Dataset):
 
 def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
                 buffer: ReplayBuffer, cfg: Config, device: torch.device,
-                iteration: int):
+                iteration: int, ema=None):
+    """ema: ModelEMA или None. Если задан — обновляется ПОСЛЕ КАЖДОГО step (LC0/AlphaZero).
+    Раньше EMA обновлялся раз в итерацию → с decay=0.999 и 900 step/iter к моменту
+    переключения (iter 10) EMA ≈ 99% случайные веса → self-play играл "вслепую",
+    все игры таймаут, resigns не срабатывали.
+    """
     net.train()
 
     max_steps_by_buffer = len(buffer) // cfg.batch_size
@@ -901,7 +1067,9 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
         dataset,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=2,
+        # SelfPlayDataset — чистый in-memory numpy. num_workers>0 = fork процессов
+        # и IPC сериализация для каждого батча → накладные расходы без пользы (нет I/O).
+        num_workers=0,
         pin_memory=True,
         drop_last=True,
     )
@@ -909,9 +1077,11 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
     total_loss = 0.0
     total_policy_loss = 0.0
     total_value_loss = 0.0
+    total_mlh_loss = 0.0
+    total_future_loss = 0.0
     steps = 0
 
-    for boards, policies, values in loader:
+    for boards, policies, values, mlh_targets, future_targets in loader:
         if steps >= effective_steps:
             break
 
@@ -919,11 +1089,13 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
                            memory_format=torch.channels_last)
         policies = policies.to(device, non_blocking=True)
         values = values.to(device, non_blocking=True)  # WDL: (batch, 3)
+        mlh_targets = mlh_targets.to(device, non_blocking=True)  # (batch,) ∈ [0,1]
+        future_targets = future_targets.to(device, non_blocking=True)  # (batch,) int64
 
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            logits, wdl_logits = net(boards)
+            logits, wdl_logits, mlh_raw, future_logits = net(boards)
             logits     = logits.float()
             wdl_logits = wdl_logits.float()
 
@@ -932,11 +1104,34 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
             policy_loss = -(policies * log_probs).sum(dim=1).mean()
 
             # WDL: cross-entropy с soft one-hot [Win, Draw, Loss]
-            # Эквивалентно KL-divergence от target к предсказанию
             log_wdl    = F.log_softmax(wdl_logits, dim=1)
             value_loss = -(values * log_wdl).sum(dim=1).mean()
 
-            loss = policy_loss + cfg.value_loss_weight * value_loss
+            # MLH: MSE между sigmoid(predict) и target ∈ [0, 1]
+            # Weight 0.1 (LC0 калибровка) — небольшое влияние, чтобы не доминировать.
+            if mlh_raw is not None:
+                mlh_pred = torch.sigmoid(mlh_raw.float().squeeze(-1))
+                mlh_loss = F.mse_loss(mlh_pred, mlh_targets)
+            else:
+                mlh_loss = torch.zeros((), device=device)
+
+            # Future move: cross-entropy с hard target (policy idx хода k+2).
+            # Маскируем сэмплы с future_idx < 0 (конец партии / старые сэмплы без таргета).
+            if future_logits is not None:
+                fmask = future_targets >= 0
+                if fmask.any():
+                    future_loss = F.cross_entropy(
+                        future_logits.float()[fmask], future_targets[fmask]
+                    )
+                else:
+                    future_loss = torch.zeros((), device=device)
+            else:
+                future_loss = torch.zeros((), device=device)
+
+            loss = (policy_loss
+                    + cfg.value_loss_weight * value_loss
+                    + cfg.mlh_loss_weight * mlh_loss
+                    + cfg.future_loss_weight * future_loss)
 
         # bfloat16 имеет тот же диапазон экспоненты, что и fp32 — GradScaler не нужен
         # и опасен (continue ниже сломал бы scaler.update() стейт-машину).
@@ -953,25 +1148,36 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
             continue
         nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         optimizer.step()
+        # EMA per-step (LC0/AlphaZero-style). С decay=0.999 и ~900 step/iter
+        # к концу 10 итерации EMA пройдёт 9000 обновлений → decay^9000 ≈ 1e-4 →
+        # практически совпадает с current net (модель уже "разогрета").
+        if ema is not None:
+            ema.update(net)
 
         total_loss += loss.item()
         total_policy_loss += policy_loss.item()
         total_value_loss += value_loss.item()
+        total_mlh_loss += float(mlh_loss.item())
+        total_future_loss += float(future_loss.item())
         steps += 1
 
         if steps % cfg.log_every == 0:
             avg_p = total_policy_loss / steps
             avg_v = total_value_loss / steps
+            avg_m = total_mlh_loss / steps
+            avg_f = total_future_loss / steps
             avg_t = total_loss / steps
             print(f"    step {steps:4d}/{effective_steps} | "
                   f"policy_loss={avg_p:.4f}  value_loss={avg_v:.4f}  "
-                  f"total={avg_t:.4f}")
+                  f"mlh_loss={avg_m:.4f}  future_loss={avg_f:.4f}  total={avg_t:.4f}")
 
     n = max(steps, 1)
     return {
         "loss": total_loss / n,
         "policy_loss": total_policy_loss / n,
         "value_loss": total_value_loss / n,
+        "mlh_loss": total_mlh_loss / n,
+        "future_loss": total_future_loss / n,
         "steps": steps,
     }
 
@@ -995,7 +1201,13 @@ def train(cfg: Config = None):
     print(f"   LR:            {cfg.learning_rate:.2e}  weight_decay={cfg.weight_decay}")
     print(f"   Precision:     BF16 + TF32\n")
 
-    net = CapablancaNet(cfg.num_channels, cfg.num_res_blocks).to(device)
+    net = CapablancaNet(
+        cfg.num_channels, cfg.num_res_blocks,
+        enable_mlh=cfg.enable_mlh,
+        num_transformer_blocks=cfg.num_transformer_blocks,
+        transformer_heads=cfg.transformer_heads,
+        enable_future=cfg.enable_future,
+    ).to(device)
     net = net.to(memory_format=torch.channels_last)
 
     if hasattr(torch, "compile"):
@@ -1148,13 +1360,20 @@ def train(cfg: Config = None):
                 for pg in optimizer.param_groups:
                     pg['lr'] = cfg.learning_rate
 
-        # Загружаем EMA если есть
+        # Загружаем EMA если есть, ИЛИ сбрасываем если флаг --reset-ema
         if ema is not None and "ema" in ckpt:
-            try:
-                ema.load_state_dict(ckpt["ema"])
-                print("✅ EMA загружен")
-            except Exception as e:
-                print(f"⚠️  EMA не загружен: {e}")
+            if getattr(args, 'reset_ema', False):
+                # Реинициализируем EMA от текущей сети — нужно когда чекпоинт сохранён
+                # старым кодом с per-iter обновлением EMA (decay=0.999 → 99% случайные веса).
+                src = net._orig_mod if hasattr(net, '_orig_mod') else net
+                ema.shadow = {k: v.clone().detach() for k, v in src.state_dict().items()}
+                print("🔄 EMA сброшен на текущие веса (--reset-ema)")
+            else:
+                try:
+                    ema.load_state_dict(ckpt["ema"])
+                    print("✅ EMA загружен")
+                except Exception as e:
+                    print(f"⚠️  EMA не загружен: {e}")
         start_iter = ckpt.get("iteration", 0) + 1
         print(f"📂 Загружен чекпоинт: {path} (итерация {start_iter})")
         if cfg.curriculum_mode:
@@ -1172,6 +1391,53 @@ def train(cfg: Config = None):
                 print("   ⚠️  Рассмотри перезапуск с --reset-buffer\n")
             else:
                 print()
+
+    # ── Дистилляция / pretrain на teacher-буфере ─────────────────────────────
+    # Буфер заполнен данными сильной старой сети: policy = MCTS-визиты (улучшенная
+    # поиском политика), value = исход партии. Обучая новую большую сеть чисто
+    # supervised на этом буфере, мы переносим знания учителя: student-raw policy
+    # учится воспроизводить teacher-searched policy → быстрый старт ≈ силы учителя.
+    if cfg.pretrain_epochs > 0:
+        if len(buffer) < cfg.batch_size * 10:
+            print(f"⚠️  Буфер мал ({len(buffer):,}) для дистилляции — пропускаем pretrain.\n")
+        else:
+            print(f"\n🎓 Дистилляция: {cfg.pretrain_epochs} эпох supervised на буфере "
+                  f"({len(buffer):,} позиций), без self-play")
+            for pe in range(1, cfg.pretrain_epochs + 1):
+                net.train()
+                t0 = time.time()
+                metrics = train_epoch(net, optimizer, buffer, cfg, device, 0, ema=ema)
+                scheduler.step()
+                lr = scheduler.get_last_lr()[0]
+                print(f"  🎓 Эпоха {pe}/{cfg.pretrain_epochs} за {time.time()-t0:.1f}s | "
+                      f"policy={metrics['policy_loss']:.4f} value={metrics['value_loss']:.4f} "
+                      f"mlh={metrics['mlh_loss']:.4f} future={metrics.get('future_loss',0.0):.4f} "
+                      f"total={metrics['loss']:.4f} lr={lr:.2e}")
+            # EMA после дистилляции ресинкаем на текущие веса — иначе self-play
+            # стартовал бы со смеси (random_init ⊕ distilled) из-за лага decay.
+            if ema is not None:
+                ema = ModelEMA(net, decay=cfg.ema_decay)
+                print("  🔄 EMA ресинхронизирован на дистиллированные веса")
+            # Сохраняем дистиллированную сеть
+            model_to_save = net._orig_mod if hasattr(net, "_orig_mod") else net
+            distill_ckpt = {
+                "iteration": start_iter,
+                "model": model_to_save.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "metrics": metrics,
+                "curriculum_fsf_nodes": cfg.fsf_nodes_current,
+                "curriculum_winrate_history": list(curriculum_winrate_history),
+            }
+            if ema is not None:
+                distill_ckpt["ema"] = ema.state_dict()
+            torch.save(distill_ckpt, os.path.join(cfg.checkpoint_dir, "distilled.pth"))
+            torch.save(distill_ckpt, os.path.join(cfg.checkpoint_dir, "latest.pth"))
+            print(f"  💾 distilled.pth + latest.pth — дистилляция завершена.\n")
+            if cfg.pretrain_only:
+                print("✅ pretrain_only: выходим. Перезапусти без --pretrain-epochs "
+                      "для перехода в self-play.\n")
+                return
 
     for iteration in range(start_iter, 100_000):
         iter_start = time.time()
@@ -1341,10 +1607,8 @@ def train(cfg: Config = None):
 
         print(f"  🏋️  Тренировка (до {cfg.train_steps} шагов, ≤1 эпохи)...")
         train_start = time.time()
-        metrics = train_epoch(net, optimizer, buffer, cfg, device, iteration)
-        # Обновляем EMA после каждой итерации обучения
-        if ema is not None:
-            ema.update(net)
+        # EMA обновляется ВНУТРИ train_epoch после каждого step (правильная per-step семантика).
+        metrics = train_epoch(net, optimizer, buffer, cfg, device, iteration, ema=ema)
         train_time = time.time() - train_start
 
         scheduler.step()
@@ -1357,6 +1621,8 @@ def train(cfg: Config = None):
         print(f"\n  ✅ Тренировка за {train_time:.1f}s ({metrics['steps']} шагов)")
         print(f"     policy_loss = {metrics['policy_loss']:.4f}{collapse_warn}")
         print(f"     value_loss  = {metrics['value_loss']:.4f}")
+        print(f"     mlh_loss    = {metrics['mlh_loss']:.4f}")
+        print(f"     future_loss = {metrics.get('future_loss', 0.0):.4f}")
         print(f"     total_loss  = {metrics['loss']:.4f}")
         print(f"     lr          = {current_lr:.2e}")
 
@@ -1412,6 +1678,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Capablanca Chess AlphaZero Training")
     parser.add_argument("--channels",           type=int,   default=64)
     parser.add_argument("--res-blocks",          type=int,   default=5)
+    parser.add_argument("--transformer-blocks", type=int,   default=2,
+                        help="Кол-во transformer encoder блоков с RPB ПОСЛЕ ResNet tower. "
+                             "0 = чистый ResNet (для совместимости со старыми чекпоинтами).")
+    parser.add_argument("--transformer-heads",  type=int,   default=8,
+                        help="Кол-во attention heads. Должно делить --channels.")
+    parser.add_argument("--no-mlh",             dest="enable_mlh", action="store_false",
+                        default=True, help="Отключить Moves-Left-Head.")
+    parser.add_argument("--no-future",          dest="enable_future", action="store_false",
+                        default=True, help="Отключить Future Move Head.")
     parser.add_argument("--simulations",         type=int,   default=100,
                         help="Полные симуляции (для PCR — больше fast_simulations, обучается на этих позициях)")
     parser.add_argument("--fast-simulations",     type=int,   default=80,
@@ -1431,6 +1706,21 @@ if __name__ == "__main__":
                         help="Ходов с высокой температурой")
     parser.add_argument("--mcts-parallel-sims", type=int, default=32,
                         help="Листьев за шаг MCTS. Больше = меньше round-trips GPU.")
+    parser.add_argument("--compile-inference", type=str, default=None,
+                        choices=[None, "default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode для inference (selfplay). None=off. "
+                             "'default'=безопасный +15-25%%. 'reduce-overhead'=CUDA graphs +30-50%%. "
+                             "'max-autotune'=макс. speedup но warmup 1-2 мин.")
+    parser.add_argument("--kld-threshold", type=float, default=5e-3,
+                        help="KLD-early-exit per-visit gain порог. Меньше = строже. "
+                             "Реалистичный диапазон 1e-3..1e-2 для 100-400 sims. 0=disable.")
+    parser.add_argument("--kld-check-every", type=int, default=2,
+                        help="Проверять KL каждые N parallel-steps MCTS.")
+    parser.add_argument("--kld-min-sims-frac", type=float, default=0.30,
+                        help="Минимум доли sims перед early-exit (0.30 = 30%%).")
+    parser.add_argument("--no-kld", dest="kld_enabled", action="store_false",
+                        help="Отключить KLD-early-exit.")
+    parser.set_defaults(kld_enabled=True)
     parser.add_argument("--batch-size",          type=int,   default=512)
     parser.add_argument("--train-steps",         type=int,   default=200)
     parser.add_argument("--min-train-steps",     type=int,   default=20)
@@ -1440,6 +1730,14 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint-dir",      type=str,   default="checkpoints")
     parser.add_argument("--save-every",          type=int,   default=5)
     parser.add_argument("--value-loss-weight",   type=float, default=1.0)
+    parser.add_argument("--mlh-loss-weight",     type=float, default=0.1,
+                        help="LC0 MLH loss weight (default: 0.1)")
+    parser.add_argument("--future-loss-weight",  type=float, default=0.15,
+                        help="Future move head loss weight (default: 0.15)")
+    parser.add_argument("--pretrain-epochs",     type=int,   default=0,
+                        help="Дистилляция: N эпох supervised на teacher-буфере перед self-play. 0=выкл.")
+    parser.add_argument("--pretrain-only",       action="store_true",
+                        help="Выйти сразу после дистилляции (не входить в self-play цикл)")
     parser.add_argument("--reset-scheduler",     action="store_true",
                         help="Пересоздать LR scheduler при загрузке чекпоинта")
     parser.add_argument("--reset-buffer",        action="store_true",
@@ -1449,12 +1747,20 @@ if __name__ == "__main__":
                         help="Использовать EMA веса для self-play (default: True)")
     parser.add_argument("--no-ema",              dest="use_ema", action="store_false",
                         help="Отключить EMA")
-    parser.add_argument("--ema-decay",           type=float, default=0.999,
-                        help="EMA decay coefficient (default: 0.999)")
+    parser.add_argument("--ema-decay",           type=float, default=0.9999,
+                        help="EMA decay coefficient (default: 0.9999, per-step). "
+                             "0.9999 = окно ~10K шагов ≈ 10 итераций (LC0 selfplay-style).")
     parser.add_argument("--ema-start-iter",      type=int,   default=10,
                         help="Не использовать EMA для self-play до этой итерации (default: 10)")
+    parser.add_argument("--reset-ema",            action="store_true",
+                        help="Сбросить EMA веса из чекпоинта (= скопировать из текущей сети). "
+                             "Нужно если EMA испорчен (например, чекпоинт из старой версии где EMA "
+                             "обновлялся раз в итерацию вместо per-step).")
     parser.add_argument("--resign-threshold",      type=float, default=-0.95,
                         help="Финальный порог сдачи (default: -0.95)")
+    parser.add_argument("--resign-playthrough",    type=float, default=0.10,
+                        help="Доля игр без resign для калибровки (LC0-style). "
+                             "0.10 = 10%% играем до конца. (default: 0.10)")
     parser.add_argument("--resign-threshold-early", type=float, default=-0.99,
                         help="Порог сдачи на ранних итерациях (default: -0.99)")
     parser.add_argument("--resign-warmup-iters",  type=int,   default=30,
@@ -1509,7 +1815,7 @@ if __name__ == "__main__":
     # Размер окна буфера и длина партии
     parser.add_argument("--buffer-max",       type=int,   default=1_000_000,
                         help="Максимальный размер replay буфера (default: 1000000, рек. 300000 при большом потоке данных)")
-    parser.add_argument("--max-game-length",  type=int,   default=110,
+    parser.add_argument("--max-game-length",  type=int,   default=300,
                         help="Максимальная длина партии в полуходах (default: 110, рек. 80 на ранних итерациях)")
     parser.add_argument("--timeout-as-draw",  action="store_true", default=False,
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
@@ -1526,6 +1832,9 @@ if __name__ == "__main__":
     cfg = Config(
         num_channels=args.channels,
         num_res_blocks=args.res_blocks,
+        num_transformer_blocks=args.transformer_blocks,
+        transformer_heads=args.transformer_heads,
+        enable_mlh=args.enable_mlh,
         simulations=args.simulations,
         fast_simulations=args.fast_simulations,
         fast_sim_fraction=args.fast_sim_fraction,
@@ -1536,6 +1845,11 @@ if __name__ == "__main__":
         temperature_late=args.temperature_late,
         temperature_moves=args.temperature_moves,
         mcts_parallel_sims=args.mcts_parallel_sims,
+        compile_inference=args.compile_inference,
+        kld_threshold=args.kld_threshold,
+        kld_check_every=args.kld_check_every,
+        kld_min_sims_frac=args.kld_min_sims_frac,
+        kld_enabled=args.kld_enabled,
         batch_size=args.batch_size,
         train_steps=args.train_steps,
         min_train_steps=args.min_train_steps,
@@ -1545,6 +1859,11 @@ if __name__ == "__main__":
         checkpoint_dir=args.checkpoint_dir,
         save_every=args.save_every,
         value_loss_weight=args.value_loss_weight,
+        mlh_loss_weight=args.mlh_loss_weight,
+        future_loss_weight=args.future_loss_weight,
+        enable_future=args.enable_future,
+        pretrain_epochs=args.pretrain_epochs,
+        pretrain_only=args.pretrain_only,
         reset_scheduler=args.reset_scheduler,
         collapse_threshold=args.collapse_threshold,
         use_ema=args.use_ema,
@@ -1556,6 +1875,7 @@ if __name__ == "__main__":
         resign_warmup_iters=args.resign_warmup_iters,
         resign_consec=args.resign_consec,
         resign_min_move=args.resign_min_move,
+        resign_playthrough=args.resign_playthrough,
         force_save=args.force_save,
         curriculum_mode=args.curriculum,
         fsf_nodes_current=args.fsf_nodes_start,

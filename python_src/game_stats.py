@@ -79,10 +79,13 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
                 lm = rust_mcts.collect_leaves(args.simulations)
                 if lm.shape[0] == 0:
                     break
-                rp, rv = mcts._infer(lm)
+                lh = rust_mcts.get_leaf_hashes() if mcts.nn_cache_enabled else None
+                rp, rv, rd, rm = mcts._infer(lm, hashes=lh)
                 rust_mcts.apply_inference_buffered(
                     np.ascontiguousarray(rp, dtype=np.float32),
                     np.ascontiguousarray(rv, dtype=np.float32),
+                    np.ascontiguousarray(rd, dtype=np.float32),
+                    np.ascontiguousarray(rm, dtype=np.float32),
                     rust_mcts.get_current_batch_counts(),
                 )
 

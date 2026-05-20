@@ -25,10 +25,13 @@ PIECE_CHARS = {
     (1, 5): 'a', (1, 6): 'c', (1, 7): '♚'
 }
 
-# Индексы для превращения (Promotion)
-# В Rust: KNIGHT=1, BISHOP=2, ROOK=3, QUEEN=4, ARCH=5, CHANC=6
-_PROMO_FROM_VAL = [None, 'n', 'b', 'r', 'q', 'a', 'c']
-_PROMO_TO_VAL   = {'n': 1, 'b': 2, 'r': 3, 'q': 4, 'a': 5, 'c': 6}
+# Индексы для превращения (Promotion).
+# ВАЖНО: m_int хранит p_val = piece_const + 1 (см. lib.rs encode_move),
+# где piece_const: KNIGHT=1, BISHOP=2, ROOK=3, QUEEN=4, ARCH=5, CHANC=6.
+# То есть в m_int: p_val=0 нет промоции, 2=конь, 3=слон, 4=ладья, 5=ферзь, 6=арх, 7=канцлер.
+# Таблица индексируется по p_val напрямую (индекс 1 = пешка, промоция невозможна → None).
+_PROMO_FROM_VAL = [None, None, 'n', 'b', 'r', 'q', 'a', 'c']
+_PROMO_TO_VAL   = {'n': 2, 'b': 3, 'r': 4, 'q': 5, 'a': 6, 'c': 7}
 _PROMO_NAMES    = {
     'n': 'Конь', 'b': 'Слон', 'r': 'Ладья',
     'q': 'Ферзь', 'a': 'Архиепископ', 'c': 'Канцлер'
@@ -112,7 +115,8 @@ class MCTSThread(QThread):
 
             # Начальный expansion корня (1 инференс)
             tensor = np.array(engine.get_board_tensor(), dtype=np.float32)
-            policy, _ = mcts._infer([tensor])
+            # _infer возвращает 4-tuple: (policy, q, d, m). MLH/D головы не используем в GUI.
+            policy, _, _, _ = mcts._infer([tensor])
             mcts._expand_node(root, engine, policy[0])
 
             total_sims = 0
@@ -153,7 +157,8 @@ class MCTSThread(QThread):
 
                 # --- Батчевый инференс на GPU ---
                 if tensors:
-                    policies, values = mcts._infer(tensors)
+                    # _infer возвращает 4-tuple (policy, q, d, m). Backup делаем по q.
+                    policies, values, _draws, _mlhs = mcts._infer(tensors)
 
                     for i, (node, move_stack) in enumerate(metas):
                         sim_eng = engine.copy()
@@ -232,7 +237,6 @@ class BoardWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        tensor = self.engine.get_board_tensor()
 
         # Клетки
         painter.setFont(QFont("Segoe UI", 10, QFont.Bold))
@@ -256,21 +260,13 @@ class BoardWidget(QWidget):
                     painter.drawText(rect.adjusted(4, 4, 0, 0),
                                      Qt.AlignTop | Qt.AlignLeft, str(r + 1))
 
-        # Фигуры
+        # Фигуры — берём RAW позиции напрямую (get_board_tensor теперь канонический,
+        # для отрисовки нужно raw без вертикального флипа).
         painter.setFont(QFont("Arial", int(self.height() / 8 * 0.65)))
-        for sq in range(80):
-            piece = None
-            for i in range(8):
-                if tensor[i * 80 + sq] > 0.5:
-                    piece = (0, i)
-                    break
-                if tensor[(8 + i) * 80 + sq] > 0.5:
-                    piece = (1, i)
-                    break
-            if piece:
-                painter.setPen(Qt.black)
-                painter.drawText(self.get_sq_rect(sq), Qt.AlignCenter,
-                                 PIECE_CHARS.get(piece, '?'))
+        painter.setPen(Qt.black)
+        for (color, piece_type, sq) in self.engine.get_pieces():
+            painter.drawText(self.get_sq_rect(int(sq)), Qt.AlignCenter,
+                             PIECE_CHARS.get((color, piece_type), '?'))
 
         # Подсветка легальных ходов
         if self.selected_sq is not None:
