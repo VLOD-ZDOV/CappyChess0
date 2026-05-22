@@ -19,6 +19,10 @@ def parse_args():
                         help="Количество партий")
     parser.add_argument("--fsf-nodes", type=int, default=500,
                         help="Лимит узлов FSF")
+    parser.add_argument("--mcts-sims", type=int, default=300,
+                        help="Узлов MCTS (симуляций) на ход нейросети")
+    parser.add_argument("--max-moves", type=int, default=200,
+                        help="Максимум полуходов в партии")
     parser.add_argument("--output-buffer", type=str, default="checkpoints/buffer.pkl",
                         help="Путь к буферу для обновления")
     return parser.parse_args()
@@ -137,26 +141,42 @@ class FairyStockfishWrapper:
 # ==========================================
 # Главный цикл
 # ==========================================
-def generate_fsf_games():
+def generate_fsf_games(args):
     cfg = Config(num_channels=256, num_res_blocks=15) # Твои настройки сети
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    GAMES_TO_PLAY = args.games
+    FSF_NODES_LIMIT = args.fsf_nodes
+    MCTS_SIMULATIONS = args.mcts_sims
+    MAX_MOVES = args.max_moves
 
     # 1. Загрузка сети
     net = CapablancaNet(cfg.num_channels, cfg.num_res_blocks).to(device)
     net = net.to(memory_format=torch.channels_last)
 
-    ckpts = sorted([f for f in os.listdir(cfg.checkpoint_dir) if f.endswith(".pth")])
-    if not ckpts:
-        print("❌ Чекпоинты не найдены!")
+    # Выбор чекпоинта: либо явный --model, либо последний из cfg.checkpoint_dir
+    if args.model is not None:
+        latest_ckpt = args.model
+        if not os.path.exists(latest_ckpt):
+            print(f"❌ Чекпоинт не найден: {latest_ckpt}")
+            return
+    elif os.path.isdir(cfg.checkpoint_dir):
+        ckpts = sorted([f for f in os.listdir(cfg.checkpoint_dir) if f.endswith(".pth")])
+        if not ckpts:
+            print("❌ Чекпоинты не найдены!")
+            return
+        latest_ckpt = os.path.join(cfg.checkpoint_dir, ckpts[-1])
+    else:
+        print(f"❌ Директория чекпоинтов не найдена: {cfg.checkpoint_dir} "
+              f"(укажи --model явно)")
         return
 
-    latest_ckpt = os.path.join(cfg.checkpoint_dir, ckpts[-1])
     ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
 
-    if hasattr(net, "_orig_mod"):
-        net._orig_mod.load_state_dict(ckpt["model"])
-    else:
-        net.load_state_dict(ckpt["model"])
+    raw_sd = ckpt.get("model", ckpt)
+    raw_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
+              for k, v in raw_sd.items()}
+    net.load_state_dict(raw_sd, strict=False)
     net.eval()
 
     print(f"🤖 Сеть загружена: {latest_ckpt}")
@@ -264,7 +284,8 @@ def generate_fsf_games():
 
     # 3. Обновление буфера (buffer.pkl)
     if len(all_samples) > 0:
-        buffer_path = os.path.join(cfg.checkpoint_dir,"buffer.pkl")
+        buffer_path = args.output_buffer
+        os.makedirs(os.path.dirname(buffer_path) or ".", exist_ok=True)
         from train import ReplayBuffer
         buffer = ReplayBuffer(cfg.buffer_max)
 
@@ -310,4 +331,4 @@ def update_buffer(new_samples, buffer_path="checkpoints/buffer.pkl"):
 
 if __name__ == "__main__":
     args = parse_args()
-    generate_fsf_games()
+    generate_fsf_games(args)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""game_stats.py — Статистика партий без обучения и без буфера.
+"""game_stats.py — Game statistics without training or replay buffer.
 
-Пример:
+Example:
     python game_stats.py checkpoints/latest.pth --games 256 --simulations 128
     python game_stats.py checkpoints/model_iter00025.pth --games 128 --simulations 64 --no-resign
 """
@@ -24,7 +24,7 @@ from mcts import UltraFastMCTS
 
 
 def detect_arch(sd: dict) -> tuple[int, int]:
-    """Определяет (num_channels, num_res_blocks) из state_dict без загрузки модели."""
+    """Detects (num_channels, num_res_blocks) from a state_dict without loading the model."""
     stem = sd.get("input_conv.net.0.weight")
     if stem is None:
         stem = sd.get("input_block.0.weight")
@@ -44,12 +44,12 @@ except ImportError:
 # ── Game runner ───────────────────────────────────────────────────────────────
 
 def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
-    """Прогоняет args.games партий, возвращает list[dict] с per-game статистикой.
+    """Runs args.games games, returns list[dict] with per-game statistics.
 
-    Каждый dict:
-        moves   : int   — сколько полуходов сделано
+    Each dict:
+        moves   : int   — number of half-moves made
         reason  : str   — "white" | "black" | "draw" | "adj" | "resign" | "timeout"
-        result  : float — 1=белые победили, -1=чёрные, 0=ничья
+        result  : float — 1=white won, -1=black won, 0=draw
     """
     mcts = UltraFastMCTS(net, device, c_puct=args.c_puct,
                           batch_size=args.mcts_batch,
@@ -63,7 +63,7 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
         n = min(batch_sz, args.games - b * batch_sz)
         engines       = [CapablancaEngine() for _ in range(n)]
         move_counts   = [0] * n
-        # Счётчики на КАЖДУЮ сторону — v чередует знак ply-to-ply.
+        # Per-side counters — v alternates sign ply-to-ply.
         resign_counts = [[0, 0] for _ in range(n)]
         resigned      = [False] * n
         adjudicated   = [None] * n
@@ -101,13 +101,13 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
                 if not legal:
                     continue
 
-                # get_policies/get_values возвращают по записи на КАЖДУЮ игру,
-                # индексировать по game_idx (не j), иначе после первого завершения
-                # игры в батче остальные получают чужие policy/value.
+                # get_policies/get_values return one entry per game,
+                # index by game_idx (not j), otherwise after the first game in the batch ends
+                # the remaining games get wrong policy/value.
                 pol = policies[game_idx]
                 side = eng.side_to_move()
 
-                # Выбор хода с температурой
+                # Move selection with temperature
                 raw = np.array([pol[eng.move_int_to_policy_idx(m) or 0]
                                  for m in legal], dtype=np.float64)
                 if args.temperature < 0.01:
@@ -124,7 +124,7 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
                 if eng.is_game_over():
                     continue
 
-                # Сдача (если не отключена)
+                # Resign (if not disabled)
                 if not args.no_resign and move_num >= args.resign_min_move:
                     v = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
                     if v < args.resign_threshold:
@@ -144,13 +144,13 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
             active   = new_active
             move_num += 1
 
-        # Собираем результаты батча
+        # Collect batch results
         for i, eng in enumerate(engines):
             mc = move_counts[i]
             if resigned[i]:
                 last_side = eng.side_to_move()
-                # last_side = сторона ПОСЛЕ последнего хода (противник сдавшегося).
-                # last_side==0 (белые ходят) → сдались чёрные → white wins.
+                # last_side = side AFTER last move (opponent of the resigning player).
+                # last_side==0 (white to move) → black resigned → white wins.
                 result = 1.0 if last_side == 0 else -1.0
                 reason = "resign"
             elif adjudicated[i] is not None:
@@ -175,7 +175,7 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
     return records
 
 
-# ── Вывод ─────────────────────────────────────────────────────────────────────
+# ── Output ────────────────────────────────────────────────────────────────────
 
 def bar(frac: float, width: int = 30) -> str:
     filled = int(round(frac * width))
@@ -194,7 +194,7 @@ def print_stats(records: list, max_game_length: int):
     print(f"  СТАТИСТИКА: {n} партий")
     print(f"{'═'*62}")
 
-    # ── Исходы ────────────────────────────────────────────────────────────────
+    # ── Outcomes ──────────────────────────────────────────────────────────────
     print("\n  ИСХОДЫ:")
     order  = ["white", "black", "draw", "adj", "resign", "timeout"]
     labels = {
@@ -212,7 +212,7 @@ def print_stats(records: list, max_game_length: int):
         pct = cnt / n * 100
         print(f"    {labels[key]}: {cnt:>4} ({pct:5.1f}%)  {bar(pct/100, 25)}")
 
-    # ── Гистограмма длин ──────────────────────────────────────────────────────
+    # ── Game length histogram ─────────────────────────────────────────────────
     print(f"\n  ДЛИНА ПАРТИЙ (полуходов, N={n}):")
     step       = 10
     max_bin    = ((max_game_length + step) // step) * step
@@ -227,7 +227,7 @@ def print_stats(records: list, max_game_length: int):
         print(f"    {lo:>3}–{hi:<4} [{cnt:>4}]  "
               f"{'█' * bw + '░' * (32 - bw)}  {pct:5.1f}%{suffix}")
 
-    # ── Перцентили ────────────────────────────────────────────────────────────
+    # ── Percentiles ───────────────────────────────────────────────────────────
     p10, p25, p50, p75, p90 = (int(np.percentile(moves, p)) for p in (10, 25, 50, 75, 90))
     print(f"\n  Мин={moves.min()}  "
           f"P10={p10}  P25={p25}  "
@@ -236,7 +236,7 @@ def print_stats(records: list, max_game_length: int):
           f"Макс={moves.max()}")
     print(f"  Среднее={moves.mean():.1f}  Станд.откл={moves.std():.1f}")
 
-    # ── Средняя длина по исходу ───────────────────────────────────────────────
+    # ── Average length by outcome ─────────────────────────────────────────────
     print(f"\n  СРЕДНЯЯ ДЛИНА ПО ИСХОДУ:")
     for key in order:
         subset = [r["moves"] for r in records if r["reason"] == key]
@@ -259,7 +259,7 @@ def main():
                         help="Путь к .pth чекпоинту модели (или 'latest' — "
                              "ищет latest.pth в --checkpoint-dir)")
 
-    # Модель (по умолчанию авто-определение из чекпоинта)
+    # Model (auto-detected from checkpoint by default)
     parser.add_argument("--channels",       type=int,   default=None,
                         help="Каналы модели (авто если не указано)")
     parser.add_argument("--res-blocks",     type=int,   default=None,
@@ -270,7 +270,7 @@ def main():
                         help="Использовать EMA веса если есть (default: True)")
     parser.add_argument("--no-ema",         dest="use_ema", action="store_false")
 
-    # Игровые параметры
+    # Game parameters
     parser.add_argument("--games",           type=int,   default=256)
     parser.add_argument("--simulations",     type=int,   default=128)
     parser.add_argument("--mcts-batch",      type=int,   default=64,
@@ -294,7 +294,7 @@ def main():
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
     args = parser.parse_args()
 
-    # Резолвим путь к чекпоинту
+    # Resolve checkpoint path
     ckpt_path = args.checkpoint
     if ckpt_path == "latest":
         ckpt_path = os.path.join(args.checkpoint_dir, "latest.pth")
@@ -306,7 +306,7 @@ def main():
     if not torch.cuda.is_available() and args.device == "cuda":
         print("⚠️  CUDA не найдена, используется CPU")
 
-    # Загрузка чекпоинта
+    # Load checkpoint
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     iteration = ckpt.get("iteration", "?")
 
@@ -314,7 +314,7 @@ def main():
     raw_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
               for k, v in raw_sd.items()}
 
-    # Авто-определение архитектуры (если не задано явно через --channels/--res-blocks)
+    # Auto-detect architecture (unless --channels/--res-blocks specified explicitly)
     try:
         auto_ch, auto_bl = detect_arch(raw_sd)
     except ValueError as e:
@@ -329,7 +329,7 @@ def main():
     elif args.channels is None or args.res_blocks is None:
         print(f"   Архитектура (авто+ручная): {ch}ch × {bl}bl")
 
-    # Создаём модель с правильной архитектурой
+    # Create model with the correct architecture
     net = CapablancaNet(ch, bl).to(device)
     net = net.to(memory_format=torch.channels_last)
 
@@ -341,7 +341,7 @@ def main():
 
     net_target = net._orig_mod if hasattr(net, "_orig_mod") else net
 
-    # Фильтруем несовместимые слои (напр. value_head при scalar→WDL переходе)
+    # Filter incompatible layers (e.g. value_head during scalar→WDL transition)
     target_sd = net_target.state_dict()
     incompatible = [k for k in raw_sd if k in target_sd and raw_sd[k].shape != target_sd[k].shape]
     for k in incompatible:

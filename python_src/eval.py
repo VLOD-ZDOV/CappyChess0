@@ -1,16 +1,16 @@
-# eval.py — Сравнение моделей через self-play (round-robin турнир)
+# eval.py — Model comparison via self-play (round-robin tournament)
 #
-# Примеры запуска:
-#   # Два конкретных чекпоинта
+# Usage examples:
+#   # Two specific checkpoints
 #   python eval.py checkpoints/model_iter00010.pth checkpoints/model_iter00025.pth --games 100
 #
-#   # Все чекпоинты в папке (round-robin каждый против каждого)
+#   # All checkpoints in a folder (round-robin every pair)
 #   python eval.py checkpoints/ --games 50 --simulations 200
 #
-#   # Только последние N чекпоинтов из папки
+#   # Only the last N checkpoints from a folder
 #   python eval.py checkpoints/ --games 50 --last 4
 #
-#   # Быстрый тест без GPU
+#   # Quick test without GPU
 #   python eval.py checkpoints/ --games 20 --simulations 50 --device cpu
 
 import os
@@ -49,7 +49,7 @@ def move_to_uci(m_int: int) -> str:
 
 def save_pgn(moves: list, result_str: str, pgn_path: str,
              white_name: str = "White", black_name: str = "Black"):
-    """Сохраняет партию в PGN файл (дописывает если файл существует)."""
+    """Saves the game to a PGN file (appends if file exists)."""
     os.makedirs(os.path.dirname(os.path.abspath(pgn_path)), exist_ok=True)
     now = datetime.datetime.now().strftime("%Y.%m.%d")
     uci = [move_to_uci(m) for m in moves]
@@ -70,18 +70,18 @@ def save_pgn(moves: list, result_str: str, pgn_path: str,
         f.write(body + result_str + "\n\n")
 
 
-# ── Загрузка модели ────────────────────────────────────────────────────────────
+# ── Model loading ──────────────────────────────────────────────────────────────
 
 def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
     """
-    Загружает чекпоинт, автоматически определяя архитектуру.
-    Поддерживает старую (scalar value, policy=6880) и новую (WDL, policy=7000).
+    Loads a checkpoint, automatically detecting the architecture.
+    Supports old (scalar value, policy=6880) and new (WDL, policy=7000) formats.
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     raw_sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
     sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in raw_sd.items()}
 
-    # Архитектура из весов
+    # Architecture from weights
     stem_key = next((k for k in sd if ("input_conv" in k or "input_block" in k)
                      and k.endswith(".weight") and "bn" not in k and "bias" not in k), None)
     ch = sd[stem_key].shape[0] if stem_key else 128
@@ -89,7 +89,7 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
 
     net = CapablancaNet(num_channels=ch, num_res_blocks=bl)
 
-    # Фильтруем слои с несовместимой формой (scalar↔WDL переход)
+    # Filter layers with incompatible shapes (scalar↔WDL transition)
     target = net.state_dict()
     skipped = [k for k in sd if k in target and sd[k].shape != target[k].shape]
     for k in skipped: del sd[k]
@@ -98,7 +98,7 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
     net.to(device).eval()
     net = net.to(memory_format=torch.channels_last)
 
-    # Определяем тип value head для информации
+    # Detect value head type for informational purposes
     vkey = next((k for k in sd if "value_head" in k and k.endswith(".weight")
                  and "6." in k), None)
     arch_tag = ""
@@ -107,7 +107,7 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
     if skipped:
         arch_tag += f" ⚠{len(skipped)}skip"
 
-    # Короткое имя: model_iter00025 → iter25
+    # Short name: model_iter00025 → iter25
     name = os.path.splitext(os.path.basename(path))[0]
     if "iter" in name:
         num = name.split("iter")[-1].lstrip("0") or "0"
@@ -117,7 +117,7 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
 
 
 def collect_checkpoints(paths: List[str], last: int = 0) -> List[str]:
-    """Из списка путей/папок собирает .pth файлы."""
+    """Collects .pth files from a list of paths/directories."""
     result = []
     for p in paths:
         if os.path.isdir(p):
@@ -134,7 +134,7 @@ def collect_checkpoints(paths: List[str], last: int = 0) -> List[str]:
     return result
 
 
-# ── Игра ──────────────────────────────────────────────────────────────────────
+# ── Game ──────────────────────────────────────────────────────────────────────
 
 def play_batch(
     net_white: CapablancaNet,
@@ -152,9 +152,9 @@ def play_batch(
     black_name: str = "Black",
 ) -> List[float]:
     """
-    Играет num_games партий: net_white — белые, net_black — чёрные.
-    Возвращает список результатов с точки зрения белых:
-        +1.0 = победа белых, -1.0 = победа чёрных, 0.0 = ничья, 0.5/-0.5 = по материалу
+    Plays num_games games: net_white as white, net_black as black.
+    Returns a list of results from white's perspective:
+        +1.0 = white wins, -1.0 = black wins, 0.0 = draw, 0.5/-0.5 = by material
     """
     mcts_w = UltraFastMCTS(net_white, device, c_puct=1.25,
                             batch_size=mcts_batch, add_dirichlet=False)
@@ -165,14 +165,14 @@ def play_batch(
     active  = list(range(num_games))
     results = [None] * num_games
     move_counts = [0] * num_games
-    histories = [[] for _ in range(num_games)]  # для verbose и PGN
+    histories = [[] for _ in range(num_games)]  # for verbose and PGN
 
     while active:
-        # Разбиваем активные игры по чьему ходу
+        # Split active games by whose turn it is
         white_games = [i for i in active if engines[i].side_to_move() == 0]
         black_games = [i for i in active if engines[i].side_to_move() == 1]
 
-        # MCTS для белых
+        # MCTS for white
         if white_games:
             w_engines = [engines[i] for i in white_games]
             w_policies = mcts_w.search_games(w_engines, simulations)
@@ -182,7 +182,7 @@ def play_batch(
                 if m is not None: histories[gi].append(m)
                 move_counts[gi] += 1
 
-        # MCTS для чёрных
+        # MCTS for black
         if black_games:
             b_engines = [engines[i] for i in black_games]
             b_policies = mcts_b.search_games(b_engines, simulations)
@@ -192,7 +192,7 @@ def play_batch(
                 if m is not None: histories[gi].append(m)
                 move_counts[gi] += 1
 
-        # Проверяем завершение
+        # Check for game completion
         new_active = []
         for gi in active:
             eng = engines[gi]
@@ -203,7 +203,7 @@ def play_batch(
             else:
                 new_active.append(gi)
                 continue
-            # Игра завершилась — verbose и PGN
+            # Game over — verbose and PGN
             r = results[gi]
             if verbose and move_counts[gi] <= 10:
                 print(f"  Партия {gi+1}: {move_counts[gi]} ходов, "
@@ -221,7 +221,7 @@ def play_batch(
 
 def _apply_policy_move(engine: CapablancaEngine, policy: np.ndarray,
                         move_num: int, temperature_moves: int) -> int:
-    """Выбирает и применяет ход согласно policy. Возвращает выбранный ход."""
+    """Selects and applies a move according to the policy. Returns the chosen move."""
     legal = engine.get_legal_moves_int()
     if not legal:
         return None
@@ -245,7 +245,7 @@ def _apply_policy_move(engine: CapablancaEngine, policy: np.ndarray,
     return move
 
 
-# ── Матч двух моделей ─────────────────────────────────────────────────────────
+# ── Match between two models ───────────────────────────────────────────────────
 
 def run_match(
     name_a: str, net_a: CapablancaNet,
@@ -261,8 +261,8 @@ def run_match(
     timeout_as_draw: bool = False,
 ) -> Dict:
     """
-    Играет games партий между A и B (половина — A белые, половина — B белые).
-    Возвращает словарь со статистикой.
+    Plays `games` games between A and B (half with A as white, half with B as white).
+    Returns a dict with statistics.
     """
     half = games // 2
     remainder = games % 2
@@ -274,7 +274,7 @@ def run_match(
     wins_a = draws = wins_b = 0
     result_detail = []
 
-    # --- Блок 1: A = белые ---
+    # --- Block 1: A = white ---
     n1 = half + remainder
     print(f"  [{name_a} белые] {n1} партий...", end="", flush=True)
     t0 = time.time()
@@ -293,7 +293,7 @@ def run_match(
           f"={sum(1 for r in res1 if r==0)}/"
           f"-{sum(1 for r in res1 if r<0)}")
 
-    # --- Блок 2: B = белые ---
+    # --- Block 2: B = white ---
     print(f"  [{name_b} белые] {half} партий...", end="", flush=True)
     t0 = time.time()
     pgn2 = os.path.join(pgn_dir, f"{name_b}_vs_{name_a}.pgn") if pgn_dir else None
@@ -303,20 +303,20 @@ def run_match(
                       white_name=name_b, black_name=name_a,
                       timeout_as_draw=timeout_as_draw)
     for r in res2:
-        # r — результат белых (= B), конвертируем в результат A
+        # r — result for white (= B), convert to result for A
         r_a = -r
         if r_a > 0:   wins_a += 1
         elif r_a < 0: wins_b += 1
         else:         draws  += 1
         result_detail.append(("B_white", r))
-    print(f" {time.time()-t0:.0f}s  →  +{sum(1 for r in res2 if r<0)}/"   # r<0 = B проиграл = A выиграл
+    print(f" {time.time()-t0:.0f}s  →  +{sum(1 for r in res2 if r<0)}/"   # r<0 = B lost = A won
           f"={sum(1 for r in res2 if r==0)}/"
           f"-{sum(1 for r in res2 if r>0)}")
 
     total = wins_a + wins_b + draws
     wr_a = (wins_a + 0.5 * draws) / total if total > 0 else 0.0
 
-    # Доверительный интервал Уилсона (95%)
+    # Wilson confidence interval (95%)
     ci = _wilson_ci(wins_a + 0.5 * draws, total)
 
     print(f"\n  Итог: {name_a} {wins_a}W / {draws}D / {wins_b}L  "
@@ -331,7 +331,7 @@ def run_match(
 
 
 def _wilson_ci(score: float, n: int, z: float = 1.96) -> Tuple[float, float]:
-    """Интервал Уилсона для пропорции (95% по умолчанию)."""
+    """Wilson score confidence interval for a proportion (95% by default)."""
     if n == 0:
         return 0.0, 1.0
     p = score / n
@@ -341,15 +341,15 @@ def _wilson_ci(score: float, n: int, z: float = 1.96) -> Tuple[float, float]:
     return max(0.0, centre - margin), min(1.0, centre + margin)
 
 
-# ── Таблица результатов ────────────────────────────────────────────────────────
+# ── Leaderboard ────────────────────────────────────────────────────────────────
 
 def print_leaderboard(models: List[Tuple[str, CapablancaNet]],
                       match_results: List[Dict]):
-    """Печатает турнирную таблицу и рейтинг по очкам."""
+    """Prints a tournament table and ranking by score."""
     names = [m[0] for m in models]
     n = len(names)
 
-    # Матрица винрейтов [i][j] = винрейт i против j
+    # Win-rate matrix [i][j] = win-rate of i against j
     wr_matrix: Dict[str, Dict[str, float]] = defaultdict(dict)
     points: Dict[str, float] = defaultdict(float)
 
@@ -364,7 +364,7 @@ def print_leaderboard(models: List[Tuple[str, CapablancaNet]],
     print("  ТУРНИРНАЯ ТАБЛИЦА")
     print("═"*70)
 
-    # Заголовок
+    # Header
     col = 14
     header = f"  {'Модель':<{col}}"
     for name in names:
@@ -374,7 +374,7 @@ def print_leaderboard(models: List[Tuple[str, CapablancaNet]],
     print(header)
     print("  " + "─"*68)
 
-    # Строки
+    # Rows
     sorted_names = sorted(names, key=lambda x: points[x], reverse=True)
     for rank, name in enumerate(sorted_names, 1):
         row = f"  {name[-col:] if len(name)>col else name:<{col}}"
@@ -392,7 +392,7 @@ def print_leaderboard(models: List[Tuple[str, CapablancaNet]],
 
     print("═"*70)
 
-    # Итоговый рейтинг
+    # Final ranking
     print("\n  РЕЙТИНГ:")
     for rank, name in enumerate(sorted_names, 1):
         matches_played = sum(
@@ -448,14 +448,14 @@ def main():
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
     args = parser.parse_args()
 
-    # Устройство
+    # Device
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
     print(f"🖥️  Устройство: {device}")
 
-    # Собираем чекпоинты
+    # Collect checkpoints
     ckpt_paths = collect_checkpoints(args.paths, last=args.last)
     if len(ckpt_paths) < 2:
         print(f"❌ Нужно минимум 2 модели, найдено: {len(ckpt_paths)}")
@@ -477,7 +477,7 @@ def main():
         print("❌ Не удалось загрузить минимум 2 модели")
         sys.exit(1)
 
-    # Параметры
+    # Parameters
     pairs = list(itertools.combinations(models, 2))
     total_games = len(pairs) * args.games
     print(f"\n🏆 Турнир: {len(models)} моделей, {len(pairs)} пар, "
@@ -486,7 +486,7 @@ def main():
           f"Макс ходов: {args.max_moves} | "
           f"Температура: первые {args.temperature_moves} ходов")
 
-    # Round-robin турнир
+    # Round-robin tournament
     match_results = []
     t_total = time.time()
 
@@ -505,7 +505,7 @@ def main():
         )
         match_results.append(result)
 
-    # Таблица
+    # Leaderboard
     print_leaderboard(models, match_results)
     print(f"\n⏱️  Общее время: {(time.time()-t_total)/60:.1f} мин")
 

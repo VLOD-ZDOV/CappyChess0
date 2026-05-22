@@ -1,7 +1,7 @@
 # model.py — Neural network for Capablanca Chess (10×8 board)
 # Architecture: AlphaZero-style residual network
 # Input:  (batch, 139, 8, 10)  — 139 feature planes (8 history × 17 + 3 meta)
-# Output: policy (batch, 7000), wdl (batch, 3)  — Win/Draw/Loss логиты
+# Output: policy (batch, 7000), wdl (batch, 3)  — Win/Draw/Loss logits
 
 import torch
 import torch.nn as nn
@@ -10,18 +10,18 @@ import torch.nn.functional as F
 # Policy vector layout (must match Rust engine):
 #   0..6400        : from_sq * 80 + to_sq  (normal moves)
 #   6400..6880     : promotions (6 types × 80 to-squares)
-POLICY_SIZE = 7000  # FIX: было 6880 — макс. индекс промоушена = 6400+99*6+5 = 6999
+POLICY_SIZE = 7000  # FIX: was 6880 — max promotion index = 6400+99*6+5 = 6999
 
-# Кол-во каналов в bottleneck policy/future голов перед финальным Linear.
-# Определяет ранг отображения в 7000-мерный policy. 8 → low-rank, 32 → достаточно.
+# Number of channels in the policy/future head bottleneck before the final Linear.
+# Determines the rank of the mapping to the 7000-dim policy. 8 → low-rank, 32 → sufficient.
 POLICY_HEAD_CHANNELS = 32
 
 
 def _gn_groups(channels: int) -> int:
-    """GroupNorm: 8 каналов на группу (стандартный эвристик).
-    GroupNorm не имеет running stats → работает корректно при batch=1 (MCTS inference)
-    и не накапливает устаревшие статистики при смене распределения данных (curriculum).
-    Веса (weight/bias) совместимы с BatchNorm checkpoint по форме — strict=False загружает корректно.
+    """GroupNorm: 8 channels per group (standard heuristic).
+    GroupNorm has no running stats → works correctly at batch=1 (MCTS inference)
+    and does not accumulate stale statistics when the data distribution shifts (curriculum).
+    Weights (weight/bias) are shape-compatible with BatchNorm checkpoints — strict=False loads correctly.
     """
     return max(1, channels // 8)
 
@@ -29,7 +29,7 @@ def _gn_groups(channels: int) -> int:
 class ConvBnRelu(nn.Module):
     """Conv → GroupNorm → Mish.
     Mish (LC0 BT3+, Misra 2019): f(x) = x * tanh(softplus(x)).
-    Гладкая и self-gated — стабильнее ReLU при глубоком стеке (~10-30 Elo бесплатно).
+    Smooth and self-gated — more stable than ReLU in deep stacks (~10-30 Elo for free).
     """
     def __init__(self, in_ch, out_ch, kernel=3, padding=1):
         super().__init__()
@@ -44,20 +44,20 @@ class ConvBnRelu(nn.Module):
 
 
 class RelativePositionBias(nn.Module):
-    """2D обучаемый position bias по геометрии доски (Swin/T5-style).
+    """2D learnable position bias over board geometry (Swin/T5-style).
 
-    Альтернатива Smolgen из LC0 BT3+. Идея: ход коня — это ВСЕГДА дельта (±1,±2)
-    или (±2,±1) независимо от того, где он стоит. Учим один параметр для каждого
-    смещения (Δrank, Δfile), применяем ко всем парам клеток с таким же смещением.
+    Alternative to Smolgen from LC0 BT3+. Idea: a knight move is ALWAYS a delta (±1,±2)
+    or (±2,±1) regardless of where the piece stands. We learn one parameter for each
+    offset (Δrank, Δfile) and apply it to all square pairs with the same offset.
 
-    Для доски 8×10:
-      Δrank ∈ [-7, +7] = 15 вариантов
-      Δfile ∈ [-9, +9] = 19 вариантов
-    Всего: heads × 15 × 19 = 2280 параметров (vs 1.7M в Smolgen).
+    For an 8×10 board:
+      Δrank ∈ [-7, +7] = 15 values
+      Δfile ∈ [-9, +9] = 19 values
+    Total: heads × 15 × 19 = 2280 parameters (vs 1.7M in Smolgen).
 
-    Скорость: один lookup в таблице вместо 4 GEMM'ов. wall-clock импакт ~2-3%.
-    Геометрический baseline: с первого шага сеть понимает, что "ход коня"
-    — это специфическое смещение, а не случайная пара клеток.
+    Speed: one table lookup instead of 4 GEMMs. Wall-clock impact ~2-3%.
+    Geometric baseline: from the first step the network understands that a "knight move"
+    is a specific offset, not a random pair of squares.
     """
     def __init__(self, heads: int, board_h: int = 8, board_w: int = 10):
         super().__init__()
@@ -66,11 +66,11 @@ class RelativePositionBias(nn.Module):
         self.board_w = board_w
         n_dr = 2 * board_h - 1   # 15
         n_df = 2 * board_w - 1   # 19
-        # Параметры. Инициализация нулём → на старте трансформер ведёт себя
-        # как обычный MHA, потом постепенно учит геометрические биасы.
+        # Zero initialization → at start the transformer behaves like plain MHA,
+        # then gradually learns geometric biases.
         self.bias_table = nn.Parameter(torch.zeros(heads, n_dr * n_df))
 
-        # Предвычисленная карта индексов (n_sq, n_sq) для O(1) lookup при forward.
+        # Precomputed index map (n_sq, n_sq) for O(1) lookup at forward time.
         n_sq = board_h * board_w
         indices = torch.zeros(n_sq, n_sq, dtype=torch.long)
         for i in range(n_sq):
@@ -83,17 +83,17 @@ class RelativePositionBias(nn.Module):
         self.register_buffer("relative_indices", indices)
 
     def forward(self) -> torch.Tensor:
-        # (heads, n_sq, n_sq) — broadcast в attention по batch'у.
+        # (heads, n_sq, n_sq) — broadcast over the batch in attention.
         # Index lookup: bias_table[:, indices] dims (heads, n_sq, n_sq)
         return self.bias_table[:, self.relative_indices]
 
 
 class MultiHeadAttentionRPB(nn.Module):
-    """MHA с Relative Position Bias (без Smolgen). Pre-LN style."""
+    """MHA with Relative Position Bias (no Smolgen). Pre-LN style."""
     def __init__(self, d_model: int, heads: int = 8,
                  board_h: int = 8, board_w: int = 10):
         super().__init__()
-        assert d_model % heads == 0, f"d_model={d_model} должно делиться на heads={heads}"
+        assert d_model % heads == 0, f"d_model={d_model} must be divisible by heads={heads}"
         self.heads = heads
         self.head_dim = d_model // heads
         self.scale = self.head_dim ** -0.5
@@ -121,7 +121,7 @@ class MultiHeadAttentionRPB(nn.Module):
 
 class TransformerBlock(nn.Module):
     """Pre-LN transformer encoder block: LN → MHA(RPB) → residual → LN → FFN → residual.
-    Pre-LN стабильнее post-LN при обучении без warmup'а трансформера.
+    Pre-LN is more stable than post-LN when training without a transformer warmup schedule.
     """
     def __init__(self, d_model: int, heads: int = 8, ffn_mult: int = 2,
                  board_h: int = 8, board_w: int = 10):
@@ -185,13 +185,13 @@ class CapablancaNet(nn.Module):
         num_res_blocks: Number of residual blocks   (10 is a solid baseline)
     """
 
-    # Каноническая форма с историей (LC0-style, см. boards_to_tensor в lib.rs):
-    # Layout: 8 history slots × 17 planes/board + 3 meta = 139 планов.
+    # Canonical input layout with history (LC0-style, see boards_to_tensor in lib.rs):
+    # Layout: 8 history slots × 17 planes/board + 3 meta = 139 planes.
     #   per history slot h ∈ 0..8 (newest=0):
     #     h*17 + 0..7   OUR pieces (P, N, B, R, Q, A, C, K) [canonical-flipped if side=1]
     #     h*17 + 8..15  THEIR pieces
     #     h*17 + 16     repetition flag
-    #   136  castling (4 зоны × 20 клеток)
+    #   136  castling (4 zones × 20 squares)
     #   137  halfmove / 100
     #   138  all-ones (CNN edge helper)
     HISTORY_LEN = 8
@@ -201,8 +201,8 @@ class CapablancaNet(nn.Module):
     BOARD_H = 8
     BOARD_W = 10
 
-    # MLH normalization constant: позиция с N оставшихся полуходов → mlh_target = N/MLH_PLY_NORM ∈ [0,1].
-    # Среднестатистическая партия Капабланки длится ~150-300 ply. 200 = разумная середина.
+    # MLH normalization constant: a position with N remaining half-moves → mlh_target = N/MLH_PLY_NORM ∈ [0,1].
+    # An average Capablanca game lasts ~150-300 ply. 200 is a reasonable midpoint.
     MLH_PLY_NORM = 200.0
 
     def __init__(self, num_channels: int = 128, num_res_blocks: int = 10,
@@ -216,22 +216,22 @@ class CapablancaNet(nn.Module):
         self.enable_future = enable_future
         self.num_transformer_blocks = num_transformer_blocks
 
-        # ── Input tower ─────────────────────────────────────────────────────
+        # ── Input tower ─────────────────────────────────────────────────────────
         self.input_conv = ConvBnRelu(self.INPUT_PLANES, num_channels, kernel=3, padding=1)
 
-        # ── Residual tower ───────────────────────────────────────────────────
+        # ── Residual tower ───────────────────────────────────────────────────────
         self.res_blocks = nn.ModuleList(
             [ResBlock(num_channels) for _ in range(num_res_blocks)]
         )
 
-        # ── Transformer head с RPB (LC0 BT3+ inspired) ──────────────────────
-        # Глобальное "понимание позиции" — связывает любые две клетки за 1 шаг.
-        # Особенно полезно для архиепископа и канцлера (гибридная геометрия:
-        # длинные диагонали/линии + локальные прыжки конём).
-        # RPB вместо Smolgen — 2280 параметров на блок вместо 1.7M.
+        # ── Transformer head with RPB (LC0 BT3+ inspired) ───────────────────────
+        # Global "positional understanding" — connects any two squares in one step.
+        # Especially useful for Archbishop and Chancellor (hybrid geometry:
+        # long diagonals/lines + local knight jumps).
+        # RPB instead of Smolgen — 2280 parameters per block vs 1.7M.
         if num_transformer_blocks > 0:
             assert num_channels % transformer_heads == 0, \
-                f"num_channels={num_channels} должно делиться на transformer_heads={transformer_heads}"
+                f"num_channels={num_channels} must be divisible by transformer_heads={transformer_heads}"
             self.transformer_blocks = nn.ModuleList([
                 TransformerBlock(num_channels, heads=transformer_heads,
                                  board_h=self.BOARD_H, board_w=self.BOARD_W)
@@ -240,15 +240,15 @@ class CapablancaNet(nn.Module):
         else:
             self.transformer_blocks = nn.ModuleList([])
 
-        # ── Policy head ──────────────────────────────────────────────────────
+        # ── Policy head ──────────────────────────────────────────────────────────
         # Outputs POLICY_SIZE logits (7000).
-        # Bottleneck = POLICY_HEAD_CHANNELS каналов перед финальным Linear.
-        # ВАЖНО про ранг: Linear(C_pol*80, 7000) имеет ранг ≤ C_pol*80.
-        # При 8 каналах → 640 фичей → policy физически low-rank (max rank 640 на 7000
-        # выходов) → сеть не может выдавать независимые острые вероятности по всем ходам.
-        # 32 канала → 2560 фичей: тактическая чёткость заметно растёт.
-        # Цена: Linear(2560,7000)=17.9M против (640,7000)=4.5M параметров.
-        # LC0 использует 32-128 каналов в policy bottleneck.
+        # Bottleneck = POLICY_HEAD_CHANNELS channels before the final Linear.
+        # Note on rank: Linear(C_pol*80, 7000) has rank ≤ C_pol*80.
+        # With 8 channels → 640 features → policy is physically low-rank (max rank 640 for 7000
+        # outputs) → the network cannot produce independent sharp probabilities for all moves.
+        # 32 channels → 2560 features: tactical sharpness noticeably improves.
+        # Cost: Linear(2560,7000)=17.9M vs (640,7000)=4.5M parameters.
+        # LC0 uses 32-128 channels in the policy bottleneck.
         self.policy_head = nn.Sequential(
             nn.Conv2d(num_channels, POLICY_HEAD_CHANNELS, kernel_size=1, bias=False),
             nn.GroupNorm(_gn_groups(POLICY_HEAD_CHANNELS), POLICY_HEAD_CHANNELS),
@@ -257,12 +257,12 @@ class CapablancaNet(nn.Module):
             nn.Linear(POLICY_HEAD_CHANNELS * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
         )
 
-        # ── Value head (WDL) ─────────────────────────────────────────────────
-        # Outputs 3 логита: [Win, Draw, Loss].
-        # Ожидаемое значение Q = P(Win) - P(Loss) вычисляется в inference().
-        # WDL даёт лучший градиент чем скалярный Tanh:
-        #   - сеть явно учится различать "острая позиция" vs "мёртвая ничья"
-        #   - cross-entropy loss вместо MSE — стабильнее обучение
+        # ── Value head (WDL) ─────────────────────────────────────────────────────
+        # Outputs 3 logits: [Win, Draw, Loss].
+        # Expected value Q = P(Win) - P(Loss) is computed in inference().
+        # WDL gives better gradients than scalar Tanh:
+        #   - the network explicitly learns to distinguish "sharp position" vs "dead draw"
+        #   - cross-entropy loss instead of MSE — more stable training
         self.value_head = nn.Sequential(
             nn.Conv2d(num_channels, 8, kernel_size=1, bias=False),
             nn.GroupNorm(_gn_groups(8), 8),
@@ -270,13 +270,13 @@ class CapablancaNet(nn.Module):
             nn.Flatten(),
             nn.Linear(8 * self.BOARD_H * self.BOARD_W, 256),
             nn.Mish(inplace=True),
-            nn.Linear(256, 3),   # [Win, Draw, Loss] логиты
+            nn.Linear(256, 3),   # [Win, Draw, Loss] logits
         )
 
-        # ── Moves-Left Head (LC0 MLH) ─────────────────────────────────────────
-        # Скалярный выход — оставшихся полуходов / MLH_PLY_NORM ∈ [0, 1].
-        # Используется в MCTS для предпочтения коротких выигрышей / длинных проигрышей.
-        # 4 канала достаточно — задача проще чем policy/value.
+        # ── Moves-Left Head (LC0 MLH) ─────────────────────────────────────────────
+        # Scalar output — remaining half-moves / MLH_PLY_NORM ∈ [0, 1].
+        # Used in MCTS to prefer shorter wins / longer losses.
+        # 4 channels is sufficient — the task is simpler than policy/value.
         if enable_mlh:
             self.mlh_head = nn.Sequential(
                 nn.Conv2d(num_channels, 4, kernel_size=1, bias=False),
@@ -285,16 +285,16 @@ class CapablancaNet(nn.Module):
                 nn.Flatten(),
                 nn.Linear(4 * self.BOARD_H * self.BOARD_W, 64),
                 nn.Mish(inplace=True),
-                nn.Linear(64, 1),  # raw output, sigmoid в inference()
+                nn.Linear(64, 1),  # raw output, sigmoid applied in inference()
             )
 
-        # ── Future Move Head (LC0 BT4 "future heads" inspired) ───────────────
-        # Предсказывает НАШ следующий ход — тот что будет сыгран через 2 полухода
-        # (k+2: та же сторона, та же каноническая ориентация policy-индексов).
-        # Auxiliary task: заставляет trunk "симулировать" продолжение партии
-        # ещё ДО запуска MCTS → более планирующие представления.
-        # Используется ТОЛЬКО при обучении (форма trunk), в inference не нужен.
-        # Архитектура как у policy head: 32-канальный bottleneck → 7000 logits.
+        # ── Future Move Head (LC0 BT4 "future heads" inspired) ───────────────────
+        # Predicts OUR next move — the one played two half-moves later
+        # (k+2: same side, same canonical policy-index orientation).
+        # Auxiliary task: forces the trunk to "simulate" the game continuation
+        # BEFORE running MCTS → more planning-oriented representations.
+        # Used ONLY during training (trunk shape), not needed at inference.
+        # Architecture like policy head: 32-channel bottleneck → 7000 logits.
         if enable_future:
             self.future_head = nn.Sequential(
                 nn.Conv2d(num_channels, POLICY_HEAD_CHANNELS, kernel_size=1, bias=False),
@@ -318,30 +318,30 @@ class CapablancaNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # Policy head финальный Linear: gain=0.01 → почти равномерный softmax на старте
-        # Это только для свежей сети — на уже обученных весах не влияет
+        # Policy head final Linear: gain=0.01 → nearly uniform softmax at init.
+        # Only affects freshly initialised networks, not pre-trained weights.
         policy_linear = list(self.policy_head.children())[-1]
         if isinstance(policy_linear, nn.Linear):
             nn.init.xavier_uniform_(policy_linear.weight, gain=0.01)
             nn.init.zeros_(policy_linear.bias)
 
-        # Value head финальный Linear (WDL, 3 выхода): gain=0.01 →
-        # логиты ≈ 0 на старте → softmax даёт [0.33, 0.33, 0.33]
-        # Сеть не предпочитает ни победу, ни поражение до обучения
+        # Value head final Linear (WDL, 3 outputs): gain=0.01 →
+        # logits ≈ 0 at init → softmax gives [0.33, 0.33, 0.33].
+        # Network has no prior preference for win or loss before training.
         value_linear = list(self.value_head.children())[-1]
         if isinstance(value_linear, nn.Linear):
             nn.init.xavier_uniform_(value_linear.weight, gain=0.01)
             nn.init.zeros_(value_linear.bias)
 
-        # MLH финальный Linear: gain=0.01 + bias≈0 → output ≈ 0 → sigmoid(0)=0.5
-        # → стартовая оценка "осталось 100 ply" (MLH_PLY_NORM/2). Разумно для middle-game.
+        # MLH final Linear: gain=0.01 + bias≈0 → output ≈ 0 → sigmoid(0)=0.5
+        # → initial estimate of "100 ply remaining" (MLH_PLY_NORM/2). Reasonable for middlegame.
         if self.enable_mlh:
             mlh_linear = list(self.mlh_head.children())[-1]
             if isinstance(mlh_linear, nn.Linear):
                 nn.init.xavier_uniform_(mlh_linear.weight, gain=0.01)
                 nn.init.zeros_(mlh_linear.bias)
 
-        # Future head финальный Linear: gain=0.01 → почти равномерный softmax на старте.
+        # Future head final Linear: gain=0.01 → nearly uniform softmax at init.
         if self.enable_future:
             future_linear = list(self.future_head.children())[-1]
             if isinstance(future_linear, nn.Linear):
@@ -354,15 +354,15 @@ class CapablancaNet(nn.Module):
             x: (batch, 139, 8, 10) float tensor (8 history × 17 + 3 meta)
         Returns:
             policy_logits: (batch, 7000)  — raw logits
-            wdl_logits:    (batch, 3)     — [Win, Draw, Loss] сырые логиты
-            mlh_raw:       (batch, 1)     — raw, sigmoid в inference (None если enable_mlh=False)
-            future_logits: (batch, 7000)  — raw logits хода на k+2 (None если enable_future=False)
+            wdl_logits:    (batch, 3)     — [Win, Draw, Loss] raw logits
+            mlh_raw:       (batch, 1)     — raw, sigmoid applied in inference (None if enable_mlh=False)
+            future_logits: (batch, 7000)  — raw logits for move at k+2 (None if enable_future=False)
         """
         x = self.input_conv(x)
         for block in self.res_blocks:
             x = block(x)
 
-        # Transformer "head": (B, C, 8, 10) → (B, 80, C) → блоки → обратно.
+        # Transformer "head": (B, C, 8, 10) → (B, 80, C) → blocks → back.
         if len(self.transformer_blocks) > 0:
             B, C, H, W = x.shape
             tokens = x.flatten(2).transpose(1, 2).contiguous()  # (B, 80, C)
@@ -378,13 +378,13 @@ class CapablancaNet(nn.Module):
 
     def inference(self, x: torch.Tensor):
         """
-        Для MCTS: возвращает (policy_softmax, Q, D, M).
+        For MCTS: returns (policy_softmax, Q, D, M).
           Q = P(Win) - P(Loss) ∈ [-1, 1]
           D = P(Draw) ∈ [0, 1]
-          M = sigmoid(mlh_raw) ∈ [0, 1] — нормализованное число оставшихся полуходов
-              (умножь на MLH_PLY_NORM для PLY).
-              Если MLH отключён → нули.
-        future-голова в inference не используется (только train-time aux signal).
+          M = sigmoid(mlh_raw) ∈ [0, 1] — normalized remaining half-moves
+              (multiply by MLH_PLY_NORM for PLY).
+              If MLH is disabled → zeros.
+        The future head is not used at inference (training-only auxiliary signal).
         """
         logits, wdl_logits, mlh_raw, _ = self(x)
         wdl = F.softmax(wdl_logits, dim=1)
