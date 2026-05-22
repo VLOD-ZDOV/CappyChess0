@@ -214,21 +214,60 @@ python_src/
   mcts.py            — Python wrapper over the Rust MCTS (batching, double buffering)
   model.py           — CapablancaNet (ResNet + Transformer + 4 heads)
   eval.py            — round-robin tournament between checkpoints
-  gui.py             — Nibbler-style analysis GUI (PyQt5)
+  export_onnx.py     — convert a .pth checkpoint into a self-contained .onnx
+  onnx_engine.py     — onnxruntime inference backend used by the GUI
+  gui.py             — Nibbler-style analysis GUI (PyQt5, GPU via onnxruntime)
   fsf_integration.py — Fairy-Stockfish wrapper
+  requirements.txt   — GUI / inference dependencies
 ```
 
 ---
 
-## 🚀 Build & run
+## 🚀 Running from source
 
-**1. Build the Rust engine** (the `capablanca_engine` module):
+This is the raw, run-it-yourself path — install the dependencies and launch the
+scripts directly. (For shipping a one-click binary instead, see *Packaging* below.)
+
+There are two dependency sets: the **GUI** needs only a lightweight inference
+stack, **training** additionally needs PyTorch.
+
+### Prerequisites
+
+- Python 3.10+
+- A Rust toolchain (`rustup`) — to build the engine
+- For GPU inference: an up-to-date NVIDIA driver (the CUDA runtime itself ships
+  inside the `onnxruntime-gpu` wheel — no CUDA Toolkit install needed)
+
+### 1. Build the Rust engine
+
+The engine compiles into a Python module called `capablanca_engine`. Run inside
+`rust_engine/`:
 
 ```bash
+pip install maturin
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release
 ```
 
-**2. Train from scratch** (self-play):
+### 2. Install Python dependencies
+
+GUI / inference only:
+
+```bash
+pip install -r python_src/requirements.txt
+```
+
+That is `numpy`, `PyQt5` and `onnxruntime-gpu` — for a machine without an NVIDIA
+GPU, replace `onnxruntime-gpu` with `onnxruntime`.
+
+Training additionally needs PyTorch — install the build matching your CUDA:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+```
+
+### 3. Train a network *(optional — needs PyTorch)*
+
+From scratch (self-play):
 
 ```bash
 python train.py --channels 256 --res-blocks 15 \
@@ -236,7 +275,9 @@ python train.py --channels 256 --res-blocks 15 \
                 --simulations 1000 --games 2048
 ```
 
-**3. Train with a Fairy-Stockfish teacher** (curriculum):
+With a Fairy-Stockfish teacher (curriculum) — the opponent's strength rises when
+the win-rate is high and drops when it falls, so the network always plays at the
+edge of its ability:
 
 ```bash
 python train.py --channels 256 --res-blocks 15 \
@@ -244,24 +285,52 @@ python train.py --channels 256 --res-blocks 15 \
                 --curriculum --fsf-nodes-start 1 --curriculum-sp-ratio 0.5
 ```
 
-Curriculum mode raises the opponent's strength when the win-rate is high and
-lowers it when the win-rate drops — the network always plays at the edge of its
-ability.
+### 4. Export the network to ONNX *(needs PyTorch)*
 
-**4. Analysis GUI:**
+The GUI runs an `.onnx` graph, not a `.pth` checkpoint. Convert once:
+
+```bash
+python export_onnx.py checkpoints_big/latest.pth capablanca.onnx
+```
+
+This bakes architecture **and** weights into one binary file and pre-applies the
+softmax / WDL reduction — so the GUI itself carries no PyTorch dependency.
+
+### 5. Run the analysis GUI
 
 ```bash
 python gui.py
 ```
 
-Load a weights file (`.pth`) and analyse positions, play against the network,
-or watch it play itself.
+If `capablanca.onnx` sits next to `gui.py` it loads automatically; otherwise
+pick one through «Загрузить сеть». GPU acceleration is automatic when an NVIDIA
+GPU is present (the status bar shows `GPU · CUDA`), with a silent CPU fallback.
 
-**5. Tournament between two networks:**
+### Tournament between two checkpoints *(needs PyTorch)*
 
 ```bash
 python eval.py <weights_A.pth> <weights_B.pth> --max 100
 ```
+
+---
+
+## 📦 Packaging a standalone build
+
+To distribute the GUI without making users install Python and dependencies:
+
+1. Export the final network with `export_onnx.py` (single `capablanca.onnx`).
+2. Build the Rust engine for the target OS (`.so` on Linux, `.pyd` on Windows).
+3. Bundle with **PyInstaller**:
+
+   ```bash
+   pyinstaller --onedir --windowed --name capablanca-gui gui.py
+   ```
+
+4. Place `capablanca.onnx` next to the produced executable — the GUI auto-loads it.
+
+`onnxruntime-gpu` carries the CUDA runtime, so the bundle runs GPU-accelerated on
+any machine with an NVIDIA driver — no PyTorch, no CUDA Toolkit. Builds are
+per-OS (no cross-compilation): build on Linux for Linux, on Windows for Windows.
 
 ---
 
@@ -276,7 +345,7 @@ A learning / research project. Ideas and thanks:
 
 ---
 
-## По-русски
+## Кратко по-русски
 
 AlphaZero-движок, обучаемый **только** на self-play — без человеческих партий и
 дебютных книг.
