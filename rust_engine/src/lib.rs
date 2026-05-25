@@ -921,6 +921,21 @@ impl MctsNode {
             self.wl
         }
     }
+
+    // Q biased by a contempt factor on the running draw probability.
+    // Q_eff = wl + c * d (per-visit averages). vloss correction matches q():
+    // visits scale up the biased Q, then we subtract vloss and divide by (visits + vloss).
+    fn q_with_contempt(&self, contempt: f32) -> f32 {
+        if contempt == 0.0 { return self.q(); }
+        let biased = self.wl + contempt * self.d;
+        if self.virtual_loss > 0 {
+            let total = self.visits + self.virtual_loss;
+            if total > 0 { (biased * self.visits as f32 - self.virtual_loss as f32) / total as f32 }
+            else { 0.0 }
+        } else {
+            biased
+        }
+    }
 }
 
 struct Arena { nodes: Vec<MctsNode> }
@@ -990,6 +1005,15 @@ struct SingleMcts {
     // sims_done_this_move = root.visits - move_start_visits → honest remaining
     // new budget for best_move_is_decided, without "choking" due to reused visits.
     move_start_visits: i32,
+    // Contempt: PUCT selection uses Q_eff = wl + contempt * d (per node, child POV).
+    // 0.0 = standard MCTS, > 0 = avoid draws (aggressive play vs weaker opponents),
+    // < 0 = accept draws. Applied only inside `select`, never to backup/bounds —
+    // statistics remain valid if contempt changes between moves.
+    contempt: f32,
+    // Dirichlet noise on root priors (Lc0 self-play exploration). True for
+    // training; flipped off for eval / FSF / lagged play where we want a
+    // deterministic measurement of the network's actual choice.
+    add_dirichlet: bool,
 }
 
 fn compute_board_hash(b: &Board) -> u64 {
@@ -1030,6 +1054,8 @@ impl SingleMcts {
             leaf_tensor_buf: Vec::with_capacity(buf_cap),
             kld_prev_snapshot: None,
             move_start_visits: 0,
+            contempt: 0.0,
+            add_dirichlet: true,
         }
     }
 
@@ -1229,7 +1255,8 @@ impl SingleMcts {
                 let c = self.arena.get(ci);
                 let started = c.visits + c.virtual_loss;
                 // Negamax: child.q() in child's POV. Negate to get parent's POV.
-                let q_val = if started > 0 { -c.q() } else { fpu };
+                // Contempt biases Q toward/away from draws — 0.0 means standard MCTS.
+                let q_val = if started > 0 { -c.q_with_contempt(self.contempt) } else { fpu };
                 let mut score = q_val + cpuct * c.prior * sqrt_n / (1 + started) as f32;
                 // Bounds-aware bias (LC0 StickyEndgames):
                 //   c.upper == -1 → child guaranteed losing → parent wins: boost.
@@ -1372,6 +1399,15 @@ impl SingleMcts {
         //     ↑ CRITICAL FIX (Gemini): add 1 at EVERY level going up from leaf.
         //     Leaf — m_ply from leaf. Parent — m_ply+1 (one move earlier = one more move left).
         //     Grandparent — m_ply+2. And so on.
+        // virtual_loss is NOT touched here — it is owned by the caller, which
+        // pairs every collect-time `apply_vloss(+V)` with an explicit
+        // `apply_vloss(-V)` in apply_inference. Decrementing here too caused
+        // a double-removal: each finished leaf zeroed vloss along its path
+        // including the contributions of *other* in-flight leaves through
+        // shared ancestors. That broke virtual-loss-as-divergence: parallel
+        // selects collapsed back onto the same line. Same issue for the
+        // terminal case in `select`, which calls backup directly without a
+        // prior apply_vloss(+V) — now it cannot steal anyone's vloss.
         let mut sign = 1.0f32;
         let mut plies_from_leaf = 0.0f32;
         loop {
@@ -1380,7 +1416,6 @@ impl SingleMcts {
             n.wl += (value * sign - n.wl) / n.visits as f32;
             n.d  += (draw_prob - n.d) / n.visits as f32;
             n.m  += (mlh_ply + plies_from_leaf - n.m) / n.visits as f32;
-            n.virtual_loss = (n.virtual_loss - VIRTUAL_LOSS_V).max(0);
             sign *= -1.0;
             plies_from_leaf += 1.0;
             match n.parent { Some(p) => idx = p, None => break }
@@ -1547,7 +1582,7 @@ impl SingleMcts {
         for (i, leaf) in pending.into_iter().enumerate() {
             if i >= policies.len() { break; }
             self.apply_vloss(leaf, -VIRTUAL_LOSS_V);
-            let is_root = leaf == self.root;
+            let is_root = leaf == self.root && self.add_dirichlet;
             let was_unexpanded = !self.arena.get(leaf).is_expanded;
             if was_unexpanded {
                 if let Some(board) = boards.get(i) {
@@ -1580,7 +1615,7 @@ impl SingleMcts {
         for (i, leaf) in pending.into_iter().enumerate() {
             if i >= values.len() { break; }
             self.apply_vloss(leaf, -VIRTUAL_LOSS_V);
-            let is_root = leaf == self.root;
+            let is_root = leaf == self.root && self.add_dirichlet;
             let was_unexpanded = !self.arena.get(leaf).is_expanded;
             if was_unexpanded {
                 let start = i * policy_size;
@@ -1824,6 +1859,21 @@ impl RustMCTS {
             leaf_game_map: Vec::new(), leaf_counts: Vec::new(), prev_batch: None }
     }
 
+    /// Set the contempt factor on every per-game MCTS. 0.0 = standard play.
+    /// Positive values make the search avoid draws; negative values welcome them.
+    /// Takes effect on the next selection — accumulated wl/d stay valid.
+    pub fn set_contempt(&mut self, contempt: f32) {
+        for g in self.games.iter_mut() { g.contempt = contempt; }
+    }
+
+    /// Toggle root Dirichlet noise across all per-game trees. False = pure
+    /// deterministic policy (eval, FSF, lagged play). Default true (self-play).
+    /// Existing root noise is not retracted — change applies to future root
+    /// expansions and `make_move` shifts.
+    pub fn set_add_dirichlet(&mut self, enabled: bool) {
+        for g in self.games.iter_mut() { g.add_dirichlet = enabled; }
+    }
+
     /// Collects leaves for inference.
     /// Returns 2D NumPy array of shape (N, TOTAL_INPUT_PLANES*80) = (N, 11120) with history planes.
     /// target_sims_per_game = total simulations planned for each game
@@ -2056,8 +2106,13 @@ impl RustMCTS {
     pub fn make_move(&mut self, game_idx: usize, m_int: u32) {
         if game_idx < self.games.len() {
             self.games[game_idx].make_move(m_int);
-            let rng = &mut self.rng;
-            self.games[game_idx].renoise_root(rng);
+            // Re-noise only when the MCTS was constructed in self-play mode;
+            // in eval/FSF/lagged add_dirichlet=false the new root should keep
+            // a deterministic policy distribution.
+            if self.games[game_idx].add_dirichlet {
+                let rng = &mut self.rng;
+                self.games[game_idx].renoise_root(rng);
+            }
             // root changed → old snapshot is invalid
             self.games[game_idx].kld_reset();
         }
