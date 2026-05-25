@@ -311,27 +311,16 @@ def main():
     iteration = ckpt.get("iteration", "?")
 
     raw_sd = ckpt.get("model", ckpt)
-    raw_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
-              for k, v in raw_sd.items()}
-
-    # Auto-detect architecture (unless --channels/--res-blocks specified explicitly)
-    try:
-        auto_ch, auto_bl = detect_arch(raw_sd)
-    except ValueError as e:
-        print(f"⚠️  {e}")
-        auto_ch, auto_bl = 128, 10
-
-    ch = args.channels  if args.channels   is not None else auto_ch
-    bl = args.res_blocks if args.res_blocks is not None else auto_bl
-
-    if args.channels is None and args.res_blocks is None:
-        print(f"   Архитектура определена из чекпоинта: {ch}ch × {bl}bl")
-    elif args.channels is None or args.res_blocks is None:
-        print(f"   Архитектура (авто+ручная): {ch}ch × {bl}bl")
-
-    # Create model with the correct architecture
-    net = CapablancaNet(ch, bl).to(device)
-    net = net.to(memory_format=torch.channels_last)
+    # Recover the FULL architecture from the checkpoint: channels, res blocks,
+    # transformer blocks, heads, mlh/future toggles. Without this, statistics
+    # would silently be computed against a partially-loaded network.
+    from model import build_net_from_state_dict
+    net, raw_sd = build_net_from_state_dict(raw_sd)
+    net = net.to(device).to(memory_format=torch.channels_last)
+    print(f"   Архитектура из чекпоинта: {net.num_channels}ch × "
+          f"{net.num_res_blocks}bl + "
+          f"{net.num_transformer_blocks}tb({net.transformer_heads}h) · "
+          f"mlh={net.enable_mlh} future={net.enable_future}")
 
     if hasattr(torch, "compile"):
         try:
@@ -340,15 +329,6 @@ def main():
             pass
 
     net_target = net._orig_mod if hasattr(net, "_orig_mod") else net
-
-    # Filter incompatible layers (e.g. value_head during scalar→WDL transition)
-    target_sd = net_target.state_dict()
-    incompatible = [k for k in raw_sd if k in target_sd and raw_sd[k].shape != target_sd[k].shape]
-    for k in incompatible:
-        del raw_sd[k]
-    if incompatible:
-        print(f"   Пропущено несовместимых слоёв: {incompatible}")
-
     net_target.load_state_dict(raw_sd, strict=False)
 
     ema_loaded = False

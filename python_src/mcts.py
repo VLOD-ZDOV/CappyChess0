@@ -27,6 +27,27 @@ if torch.cuda.is_available():
     except AttributeError:
         pass
 
+# torch.compile cache: with bucket-padding the inference net sees ~10 unique
+# batch sizes (32, 64, 128, ..., 8192). Default cache_size_limit=8 triggers
+# fallback to eager — raise it so every bucket keeps its compiled CUDA graph.
+try:
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = 32
+except (ImportError, AttributeError):
+    pass
+
+
+def _bucket_size(n: int, step: int) -> int:
+    """Round n up to the next power-of-two multiple of `step`.
+    n=50, step=32 → 64. n=600, step=32 → 1024. Keeps the number of distinct
+    compiled shapes small (log2(max_n/step) ≈ 9), so CUDA graphs stick."""
+    if n <= step:
+        return step
+    target = step
+    while target < n:
+        target *= 2
+    return target
+
 try:
     from capablanca_engine import RustMCTS as _RustMCTS
     RUST_MCTS_AVAILABLE = True
@@ -81,7 +102,8 @@ class UltraFastMCTS:
                  nn_cache: bool = False, nn_cache_max: int = NN_CACHE_DEFAULT_MAX,
                  compile_mode: str = None, bf16_weights: bool = True,
                  kld_threshold: float = 0.0, kld_check_every: int = 4,
-                 kld_min_sims_frac: float = 0.25):
+                 kld_min_sims_frac: float = 0.25,
+                 contempt: float = 0.0):
         # compile_mode: None (no compile), 'default', 'reduce-overhead', 'max-autotune'.
         # 'default' — safest, ~15-25% speedup, minimal warmup.
         # 'reduce-overhead' — uses CUDA graphs, up to 50% speedup, but recompiles on shape change.
@@ -107,6 +129,9 @@ class UltraFastMCTS:
         self.c_puct = c_puct
         self.batch_size = batch_size
         self.add_dirichlet = add_dirichlet
+        # Contempt: 0.0 = standard play. > 0 → avoid draws, < 0 → welcome them.
+        # Applied by RustMCTS.set_contempt on every per-game tree right after creation.
+        self.contempt = float(contempt)
         self._parallel_sims = parallel_sims if parallel_sims is not None else PARALLEL_SIMS
         if self._parallel_sims > 64:
             print(f"⚠️  parallel_sims={self._parallel_sims} > 64: PUCT exploration "
@@ -126,13 +151,23 @@ class UltraFastMCTS:
             except Exception as e:
                 print(f"⚠️  torch.compile failed: {e}. Откат на eager mode.")
 
-        # Pinned memory: up to batch_size × parallel_sims leaves.
-        # BF16 pinned: tensor.copy_(fp32_tensor) does CPU-side FP32→BF16 cast in O(N),
-        # then H2D copy goes in BF16 — 2x less PCIe bandwidth (44KB → 22KB per sample).
-        # On large batches (8192 leaves × 22KB = 176MB instead of 352MB) — notable win.
+        # Pinned memory + BF16 cast both make sense only when there's a GPU to
+        # ship the data to. On CPU pin_memory=True raises RuntimeError, and
+        # passing BF16 input into FP32 weights raises a dtype-mismatch — that
+        # used to make `--device cpu` unusable. With CUDA: BF16 pinned buffer,
+        # H2D copies are half the bytes. Without CUDA: plain FP32 buffer.
+        self._has_cuda = torch.cuda.is_available()
         MAX_LEAVES = max(8192, batch_size * self._parallel_sims * 2)
-        self.pinned_buf = torch.empty(MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W,
-                                      pin_memory=True, dtype=torch.bfloat16)
+        if self._has_cuda:
+            self.pinned_buf = torch.empty(
+                MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W,
+                pin_memory=True, dtype=torch.bfloat16)
+        else:
+            self.pinned_buf = torch.empty(
+                MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W,
+                pin_memory=False, dtype=torch.float32)
+            print("⚠️  CUDA не найдена — inference на CPU. Очень медленно, "
+                  "training/eval скорее иллюстративные. Установите GPU + драйвер.")
         self.pinned_size = MAX_LEAVES
         self.net.eval()
 
@@ -301,10 +336,13 @@ class UltraFastMCTS:
             empty_v = np.empty((0,), dtype=np.float32)
             return empty_p, empty_v, empty_v.copy(), empty_v.copy()
 
-        # Pad to multiple of parallel_sims: small batches under-utilize GPU.
-        # Pad by duplicating random positions, crop result to n at the end.
+        # Pad to a power-of-two bucket (32, 64, 128, 256, ..., 8192) so
+        # torch.compile sees only a handful of unique input shapes — each one
+        # keeps its CUDA graph, no recompile thrash. Without bucketing every
+        # parallel_sims-aligned size (32, 64, 96, 128, ...) was a fresh shape,
+        # dynamo hit cache_size_limit=8 and silently fell back to eager.
         ps = self._parallel_sims
-        target = ((n + ps - 1) // ps) * ps
+        target = _bucket_size(n, ps)
         n_pad = target - n
 
         arr = tensors.reshape(n, INPUT_PLANES, BOARD_H, BOARD_W)
@@ -315,22 +353,27 @@ class UltraFastMCTS:
 
         if n_total <= self.pinned_size:
             buf = self.pinned_buf[:n_total]
-            # copy_(fp32) → CPU-side cast to BF16 (pinned_buf is bfloat16).
-            buf.copy_(torch.from_numpy(arr))
+            # copy_(fp32) casts to buf's dtype (BF16 on CUDA, FP32 on CPU).
+            buf.copy_(torch.from_numpy(np.ascontiguousarray(arr)))
             x = buf.to(self.device, non_blocking=True)
         else:
-            # Fallback when pinned buffer is exceeded: still cast to BF16 before H2D.
-            cpu_t = torch.from_numpy(np.ascontiguousarray(arr)).to(torch.bfloat16)
+            # Fallback when pinned buffer is exceeded. Match the buffer dtype
+            # so we never feed BF16 into FP32 weights on CPU.
+            target_dtype = torch.bfloat16 if self._has_cuda else torch.float32
+            cpu_t = torch.from_numpy(np.ascontiguousarray(arr)).to(target_dtype)
             x = cpu_t.to(self.device, non_blocking=True)
 
         x = x.to(memory_format=torch.channels_last)
         if self._bf16_weights:
-            # Both weights and input are in BF16 → autocast not needed (avoids context manager overhead).
+            # Both weights and input in BF16 — no autocast needed.
             out = self.net(x)
-        else:
-            # FP32 weights: autocast performs all matmul/conv in BF16 on the fly.
+        elif self._has_cuda:
+            # FP32 weights on CUDA: autocast runs matmul/conv in BF16 on the fly.
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 out = self.net(x)
+        else:
+            # Pure CPU path: everything stays in FP32.
+            out = self.net(x)
 
         # Support multiple network output variants:
         #   - 4 outputs: (policy, wdl, mlh, future) — model with future head
@@ -389,58 +432,49 @@ class UltraFastMCTS:
         """
         if RUST_MCTS_AVAILABLE:
             rust_mcts = _RustMCTS(engines, self._parallel_sims)
+            if self.contempt != 0.0:
+                rust_mcts.set_contempt(self.contempt)
+            # add_dirichlet=False (eval/FSF/lagged) must actually disable noise
+            # in Rust — the flag was silently ignored before.
+            if not self.add_dirichlet:
+                rust_mcts.set_add_dirichlet(False)
             steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
 
-            prev_policies = None
-            prev_values   = None
-            prev_draws    = None
-            prev_mlhs     = None
-            prev_counts   = None
-
-            # KLD-early-exit (Rust-side compute, minimal marshalling).
+            # NOTE: this path applies inference *immediately* after each
+            # collect_leaves, in the same step. The previous "double-buffered"
+            # variant overlapped GPU work with the next collect by deferring
+            # apply_inference_buffered by one step — but collect_leaves clears
+            # `game.pending` on the Rust side, so the deferred apply wrote the
+            # previous batch's NN outputs onto the *new* leaves. That was a
+            # silent correctness bug in every search_games_with_values caller
+            # (eval.py, FSF games, lagged games, play_fsf). We trade a tiny
+            # CPU/GPU overlap window for a guaranteed-correct alignment.
             kld_enabled = self.kld_threshold > 0.0
             kld_min_steps = int(np.ceil(steps * self.kld_min_sims_frac))
             if kld_enabled:
                 rust_mcts.kld_reset_all()
             self._kld_total_calls += 1
             self._kld_sims_requested += simulations
-            early_exit_step = None  # for reporting
+            early_exit_step = None
 
-            for step in range(steps + 1):
-                if step < steps:
-                    leaf_matrix = rust_mcts.collect_leaves(simulations)
-                    has_leaves  = leaf_matrix.shape[0] > 0
-                    if has_leaves:
-                        curr_counts = rust_mcts.get_current_batch_counts()
-                        # Get hashes BEFORE apply_inference, since apply_inference clears pending.
-                        curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
-                else:
-                    has_leaves = False
+            for step in range(steps):
+                leaf_matrix = rust_mcts.collect_leaves(simulations)
+                if leaf_matrix.shape[0] == 0:
+                    break
+                curr_counts = rust_mcts.get_current_batch_counts()
+                curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
+                p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
+                rust_mcts.apply_inference_buffered(
+                    np.ascontiguousarray(p, dtype=np.float32),
+                    np.ascontiguousarray(v, dtype=np.float32),
+                    np.ascontiguousarray(d, dtype=np.float32),
+                    np.ascontiguousarray(m, dtype=np.float32),
+                    curr_counts,
+                )
 
-                if prev_policies is not None and prev_counts is not None:
-                    rust_mcts.apply_inference_buffered(
-                        prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
-                    )
-                    prev_policies = prev_values = prev_draws = prev_mlhs = prev_counts = None
-
-                if has_leaves:
-                    p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
-                    prev_policies = np.ascontiguousarray(p, dtype=np.float32)
-                    prev_values   = np.ascontiguousarray(v, dtype=np.float32)
-                    prev_draws    = np.ascontiguousarray(d, dtype=np.float32)
-                    prev_mlhs     = np.ascontiguousarray(m, dtype=np.float32)
-                    prev_counts   = curr_counts
-
-                # === KLD-early-exit check (Lc0-style smart pruning) ===
-                # Rust computes max KL gain — Python receives 1 float.
-                if (kld_enabled and step >= kld_min_steps and step < steps
-                        and (step + 1) % self.kld_check_every == 0):
-                    # Apply pending inference so KL reflects fresh visits.
-                    if prev_policies is not None and prev_counts is not None:
-                        rust_mcts.apply_inference_buffered(
-                            prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
-                        )
-                        prev_policies = prev_values = prev_draws = prev_mlhs = prev_counts = None
+                if (kld_enabled and step >= kld_min_steps
+                        and (step + 1) % self.kld_check_every == 0
+                        and step + 1 < steps):
                     max_kl = rust_mcts.kld_snapshot_and_check()
                     if max_kl != float('inf'):
                         sims_added = self.kld_check_every * self._parallel_sims
@@ -450,12 +484,6 @@ class UltraFastMCTS:
                             self._kld_sims_saved += (steps - step - 1) * self._parallel_sims
                             early_exit_step = step
                             break
-
-            # Final pending — if no break occurred, one more apply may remain.
-            if prev_policies is not None and prev_counts is not None:
-                rust_mcts.apply_inference_buffered(
-                    prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
-                )
 
             raw_policies = rust_mcts.get_policies()
             raw_values   = rust_mcts.get_values()
@@ -471,60 +499,33 @@ class UltraFastMCTS:
 
     def _search_rust_full(self, engines: List, simulations: int) -> List[np.ndarray]:
         rust_mcts = _RustMCTS(engines, self._parallel_sims)
+        if self.contempt != 0.0:
+            rust_mcts.set_contempt(self.contempt)
+        if not self.add_dirichlet:
+            rust_mcts.set_add_dirichlet(False)
         steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
 
         # Correct double buffering:
         # GPU processes batch N while Rust collects batch N+1.
-        # Key: batch_counts are saved TOGETHER with batch N data
-        # and passed to apply_inference_buffered — not overwritten by batch N+1.
-        #
-        # Scheme:
-        #   step 0: collect(0) → counts_0 = get_counts() → infer_start(0)
-        #   step 1: collect(1) [while GPU processes 0] → counts_1
-        #          apply_buffered(result_0, counts_0) → infer_start(1)
-        #   step 2: collect(2) → counts_2
-        #          apply_buffered(result_1, counts_1) → infer_start(2)
-        #   ...
-        #   final: apply_buffered(result_last, counts_last)
-
-        prev_policies  = None
-        prev_values    = None
-        prev_draws     = None
-        prev_mlhs      = None
-        prev_counts    = None
-
-        for step in range(steps + 1):
-            # Collect next batch (if steps remain)
-            if step < steps:
-                leaf_matrix = rust_mcts.collect_leaves(simulations)
-                has_leaves  = leaf_matrix.shape[0] > 0
-                if has_leaves:
-                    # Save counts of THIS batch — they won't change on next collect
-                    curr_counts = rust_mcts.get_current_batch_counts()
-                    curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
-            else:
-                has_leaves = False
-
-            # Apply results of previous inference with CORRECT counts
-            if prev_policies is not None and prev_counts is not None:
-                rust_mcts.apply_inference_buffered(
-                    prev_policies, prev_values, prev_draws, prev_mlhs, prev_counts
-                )
-
-            # Start inference for current batch
-            if has_leaves:
-                p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
-                prev_policies = np.ascontiguousarray(p, dtype=np.float32)
-                prev_values   = np.ascontiguousarray(v, dtype=np.float32)
-                prev_draws    = np.ascontiguousarray(d, dtype=np.float32)
-                prev_mlhs     = np.ascontiguousarray(m, dtype=np.float32)
-                prev_counts   = curr_counts
-            else:
-                prev_policies = None
-                prev_values   = None
-                prev_draws    = None
-                prev_mlhs     = None
-                prev_counts   = None
+        # Inference applied in-step (no double-buffering). The old "collect
+        # next, apply previous" scheme silently wrote previous-batch NN outputs
+        # onto fresh pending leaves: collect_leaves clears Rust's `pending`,
+        # so by the time apply_inference_buffered ran, the leaves it indexed
+        # were already from the next step. Same fix as search_games_with_values.
+        for step in range(steps):
+            leaf_matrix = rust_mcts.collect_leaves(simulations)
+            if leaf_matrix.shape[0] == 0:
+                break
+            curr_counts = rust_mcts.get_current_batch_counts()
+            curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
+            p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
+            rust_mcts.apply_inference_buffered(
+                np.ascontiguousarray(p, dtype=np.float32),
+                np.ascontiguousarray(v, dtype=np.float32),
+                np.ascontiguousarray(d, dtype=np.float32),
+                np.ascontiguousarray(m, dtype=np.float32),
+                curr_counts,
+            )
 
         raw = rust_mcts.get_policies()
         return [np.array(p, dtype=np.float32) for p in raw]

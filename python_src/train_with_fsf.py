@@ -264,8 +264,30 @@ def train_with_fsf(cfg: Config, args):
     print(f"   iter 30-49: 2304 self + 1152 FSF (каждые 5 итераций по ~288 игр)")
     print(f"   iter  50+:  {cfg.games_per_iter} self + 0 FSF\n")
 
-    net = CapablancaNet(cfg.num_channels, cfg.num_res_blocks).to(device)
-    net = net.to(memory_format=torch.channels_last)
+    # Peek at the checkpoint first to size the network correctly. Without this,
+    # a checkpoint trained with non-default transformer/heads/mlh/future would
+    # land in a freshly-built model with the wrong shape — half the transformer
+    # weights would get filtered out as "shape mismatch" and reinitialised.
+    _latest_for_arch = os.path.join(cfg.checkpoint_dir, "latest.pth")
+    _ckpt_for_arch = None
+    if os.path.exists(_latest_for_arch):
+        try:
+            _ckpt_for_arch = torch.load(_latest_for_arch, map_location="cpu",
+                                        weights_only=False)
+        except Exception:
+            _ckpt_for_arch = None
+    if _ckpt_for_arch is not None and "model" in _ckpt_for_arch:
+        from model import build_net_from_state_dict
+        net, _ = build_net_from_state_dict(_ckpt_for_arch["model"])
+        net = net.to(device).to(memory_format=torch.channels_last)
+        print(f"   Архитектура из чекпоинта: {net.num_channels}ch × "
+              f"{net.num_res_blocks}res + {net.num_transformer_blocks}tb "
+              f"({net.transformer_heads}h) · "
+              f"mlh={net.enable_mlh} future={net.enable_future}")
+    else:
+        net = CapablancaNet(cfg.num_channels, cfg.num_res_blocks).to(device)
+        net = net.to(memory_format=torch.channels_last)
+    del _ckpt_for_arch
 
     if hasattr(torch, "compile"):
         try:

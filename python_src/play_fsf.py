@@ -150,10 +150,6 @@ def generate_fsf_games(args):
     MCTS_SIMULATIONS = args.mcts_sims
     MAX_MOVES = args.max_moves
 
-    # 1. Загрузка сети
-    net = CapablancaNet(cfg.num_channels, cfg.num_res_blocks).to(device)
-    net = net.to(memory_format=torch.channels_last)
-
     # Выбор чекпоинта: либо явный --model, либо последний из cfg.checkpoint_dir
     if args.model is not None:
         latest_ckpt = args.model
@@ -172,10 +168,14 @@ def generate_fsf_games(args):
         return
 
     ckpt = torch.load(latest_ckpt, map_location=device, weights_only=False)
-
     raw_sd = ckpt.get("model", ckpt)
-    raw_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
-              for k, v in raw_sd.items()}
+    # Build the net with the architecture the checkpoint actually carries,
+    # not whatever defaults Config() happens to hold. Otherwise a 4-tb network
+    # would be loaded into a 2-tb shell and half the transformer weights would
+    # be silently dropped.
+    from model import build_net_from_state_dict
+    net, raw_sd = build_net_from_state_dict(raw_sd)
+    net = net.to(device).to(memory_format=torch.channels_last)
     net.load_state_dict(raw_sd, strict=False)
     net.eval()
 

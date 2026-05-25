@@ -19,12 +19,12 @@ English.
 """
 
 import math
+import os
 import sys
 import time
 import traceback
 
 import numpy as np
-import torch
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QLabel,
                              QFileDialog, QSpinBox, QGroupBox, QDialog, QComboBox,
@@ -36,8 +36,7 @@ from PyQt5.QtCore import Qt, QRect, QRectF, QPointF, QThread, pyqtSignal
 
 try:
     from capablanca_engine import CapablancaEngine
-    from model import CapablancaNet
-    from mcts import UltraFastMCTS, VIRTUAL_LOSS
+    from onnx_engine import OnnxEngine, VIRTUAL_LOSS
 except ImportError as e:
     print(f"Ошибка импорта! {e}")
     traceback.print_exc()
@@ -61,7 +60,8 @@ GREY = QColor("#6f6f6f")
 
 FPU_REDUCTION = 0.330      # relative first-play-urgency, from lc0
 MAX_SELECT_DEPTH = 160     # hard safety cap on selection descent
-TT_MAX_NODES = 2_000_000   # transposition table soft cap — cleared when exceeded
+TT_MAX_NODES = 500_000     # ttable cap; when exceeded, we drop the dead branches
+PV_DEPTH = 10              # plies of principal variation shown per move
 
 # Theme
 BG = "#262626"
@@ -139,21 +139,28 @@ class _TNode:
     Statistics (visits / value) live on the node and are therefore shared by
     every move order that reaches this position — that is the merge. Move
     priors live on the *edges* instead, since a prior is parent-specific.
+    ``draw_sum`` accumulates the network's draw probability per visit so that
+    a contempt factor can rescale Q at selection time without re-running search.
     """
-    __slots__ = ("visits", "value_sum", "vloss", "is_expanded",
+    __slots__ = ("visits", "value_sum", "draw_sum", "vloss", "is_expanded",
                  "is_terminal", "children")
 
     def __init__(self):
         self.visits = 0
         self.value_sum = 0.0
+        self.draw_sum = 0.0
         self.vloss = 0
         self.is_expanded = False
         self.is_terminal = False
         self.children = {}          # move_int -> _TEdge
 
     def q(self):
+        # Virtual loss penalises in-flight paths: each pending leaf is counted
+        # as if it returned -1 from the side-to-move's POV. Without subtracting
+        # from the numerator (only inflating the denominator) the node stays
+        # equally attractive and parallel selects all collapse onto one move.
         d = self.visits + self.vloss
-        return self.value_sum / d if d > 0 else 0.0
+        return (self.value_sum - self.vloss) / d if d > 0 else 0.0
 
 
 class _TEdge:
@@ -180,12 +187,16 @@ class SearchThread(QThread):
     """
     update = pyqtSignal(object)   # dict payload
 
-    def __init__(self, move_history, mcts, max_sims, ttable):
+    def __init__(self, move_history, mcts, max_sims, ttable, contempt=0.0):
         super().__init__()
         self.move_history = list(move_history)
         self.mcts = mcts
         self.max_sims = max_sims if max_sims > 0 else 50_000_000
         self.c_puct = mcts.c_puct
+        # Contempt (LC0 search.cc): Q_effective = (W - L + contempt * D) / N.
+        # Positive → draws disliked (aggressive); negative → draws acceptable.
+        # Applied only inside the PUCT selection, never to the displayed Q.
+        self.contempt = float(contempt)
         self.running = True
         self.ttable = ttable        # shared, persists across moves -> tree reuse
         self.tt_hits = 0            # number of merged (transposed) edges
@@ -206,11 +217,20 @@ class SearchThread(QThread):
         visited_pol = sum(e.prior for e in node.children.values()
                           if e.child.visits > 0 or e.child.vloss > 0)
         fpu = max(parent_q - FPU_REDUCTION * math.sqrt(max(visited_pol, 0.0)), -1.0)
+        cont = self.contempt
         best, best_s = None, -1e18
         for e in node.children.values():
             c = e.child
             started = c.visits + c.vloss
-            q_in_parent = -(c.value_sum / started) if started > 0 else fpu
+            if started > 0:
+                # Child Q is in child's POV — negate for parent. Subtract vloss
+                # from the numerator so parallel selects scatter across moves
+                # instead of all piling onto the current best (matches Rust).
+                # Contempt adds the (sign-invariant) draw mass scaled by `cont`.
+                q_child = (c.value_sum - c.vloss + cont * c.draw_sum) / started
+                q_in_parent = -q_child
+            else:
+                q_in_parent = fpu
             s = q_in_parent + self.c_puct * e.prior * sqrt_n / (1 + started)
             if s > best_s:
                 best_s, best = s, e
@@ -268,18 +288,39 @@ class SearchThread(QThread):
             n.vloss = max(0, n.vloss + delta)
 
     @staticmethod
-    def _backup(path, leaf_value):
+    def _backup(path, leaf_value, leaf_draw=0.0):
         # leaf_value is from the leaf's side-to-move; sign flips up the path.
+        # draw is sign-invariant (a draw is a draw for both sides).
         sign = 1.0
         for n in reversed(path):
             n.visits += 1
             n.value_sum += leaf_value * sign
+            n.draw_sum  += leaf_draw
             sign = -sign
 
     @staticmethod
     def _terminal_value(sim):
         r = sim.game_result()                      # white's perspective
         return r if sim.side_to_move() == 0 else -r
+
+    @staticmethod
+    def _pv(node, max_depth):
+        """Principal variation from `node`: the most-visited child at each
+        step. Returns the continuation as a list of move ints."""
+        line = []
+        seen = set()
+        for _ in range(max_depth):
+            if node.is_terminal or not node.is_expanded or not node.children:
+                break
+            best = max(node.children.values(), key=lambda e: e.child.visits)
+            if best.child.visits == 0:
+                break
+            line.append(best.move)
+            if best.child_hash in seen:            # repetition — stop
+                break
+            seen.add(best.child_hash)
+            node = best.child
+        return line
 
     # ---- main loop ----
     def run(self):
@@ -326,12 +367,13 @@ class SearchThread(QThread):
                     leaf = path_nodes[-1]
 
                     if kind == 'rep':                    # repetition -> draw
-                        self._backup(path_nodes, 0.0)
+                        self._backup(path_nodes, 0.0, 1.0)
                         total += 1
                         continue
                     if leaf.is_terminal:
                         sim = self._replay(path_moves)
-                        self._backup(path_nodes, self._terminal_value(sim))
+                        tv = self._terminal_value(sim)
+                        self._backup(path_nodes, tv, 1.0 if tv == 0.0 else 0.0)
                         total += 1
                         continue
 
@@ -339,7 +381,8 @@ class SearchThread(QThread):
                     if sim.is_game_over():
                         leaf.is_terminal = True
                         leaf.is_expanded = True
-                        self._backup(path_nodes, self._terminal_value(sim))
+                        tv = self._terminal_value(sim)
+                        self._backup(path_nodes, tv, 1.0 if tv == 0.0 else 0.0)
                         total += 1
                         continue
 
@@ -349,15 +392,17 @@ class SearchThread(QThread):
                     self._vloss(path_nodes, VIRTUAL_LOSS)
 
                 if pending:
-                    pols, vals, draws, _ = mcts._infer(tensors)
+                    pols, vals, draws, mlhs = mcts._infer(tensors)
                     for i, (leaf, path_nodes, path_moves, sim) in enumerate(pending):
                         if not leaf.is_expanded:
                             self._expand(leaf, sim, pols[i])
                         self._vloss(path_nodes, -VIRTUAL_LOSS)
                         v = float(vals[i])
+                        d = float(draws[i])
+                        m_ply = float(mlhs[i]) * 200.0    # MLH_PLY_NORM, see model.py
                         if len(path_moves) == 1:         # direct child of root
-                            child_nn[path_moves[0]] = (v, float(draws[i]))
-                        self._backup(path_nodes, v)
+                            child_nn[path_moves[0]] = (v, d, m_ply)
+                        self._backup(path_nodes, v, d)
                     total += len(pending)
 
                 now = time.time()
@@ -375,40 +420,67 @@ class SearchThread(QThread):
             traceback.print_exc()
 
     def _emit(self, root, stm, total, child_nn, finished):
-        tv = sum(e.child.visits for e in root.children.values())
-        moves = []
-        for m, e in root.children.items():
-            c = e.child
-            if c.visits == 0:
-                continue
-            mq = -(c.value_sum / c.visits)       # value from the mover's side
-            moves.append({
-                "move": m,
-                "visits": c.visits,
-                "prior": e.prior,
-                "q": mq,
-                "frac": (c.visits / tv) if tv > 0 else 0.0,
-                "nn": child_nn.get(m),
-            })
-        moves.sort(key=lambda d: d["visits"], reverse=True)
-        self.update.emit({"game_over": False, "moves": moves,
-                          "root_q": root.q(), "stm": stm, "sims": total,
-                          "merges": self.tt_hits, "reused": self.reused,
-                          "finished": finished})
+        payload = payload_from_node(root, stm, child_nn)
+        payload["sims"] = total
+        payload["merges"] = self.tt_hits
+        payload["reused"] = self.reused
+        payload["finished"] = finished
+        self.update.emit(payload)
+
+
+def payload_from_node(root, stm, child_nn=None):
+    """Build a GUI payload dict from a search-tree node.
+
+    Used both by the live search (``SearchThread._emit``) and by the GUI to
+    render a tree's already-accumulated state without running a search — e.g.
+    showing the residual sims a position carries via tree reuse while analysis
+    is stopped.
+    """
+    tv = sum(e.child.visits for e in root.children.values())
+    moves = []
+    for m, e in root.children.items():
+        c = e.child
+        if c.visits == 0:
+            continue
+        moves.append({
+            "move": m,
+            "visits": c.visits,
+            "prior": e.prior,
+            "q": -(c.value_sum / c.visits),       # value from the mover's side
+            "frac": (c.visits / tv) if tv > 0 else 0.0,
+            "nn": child_nn.get(m) if child_nn else None,
+            "pv": [m] + SearchThread._pv(c, PV_DEPTH),
+        })
+    moves.sort(key=lambda d: d["visits"], reverse=True)
+    return {"game_over": False, "moves": moves, "root_q": root.q(),
+            "stm": stm, "sims": root.visits, "merges": 0,
+            "reused": root.visits, "finished": True}
 
 
 # ───────────────────────────── Eval bar ───────────────────────────────────
 
 class EvalBar(QWidget):
-    """Vertical evaluation bar — white fill grows from the bottom."""
+    """Vertical evaluation bar — white fill grows from the bottom.
+
+    If a (heuristic) mate is detected, displays "M<n>" / "-M<n>" instead of
+    the percentage. Mate-in-n is a full-move count, not plies."""
 
     def __init__(self):
         super().__init__()
-        self.setFixedWidth(30)
+        self.setFixedWidth(36)
         self.white_wr = 0.5
+        self.mate_in = None      # signed full-move count or None
 
     def set_winrate(self, wr_white):
         self.white_wr = max(0.0, min(1.0, wr_white))
+        self.mate_in = None
+        self.update()
+
+    def set_eval(self, wr_white, mate_in=None):
+        """mate_in: signed int (+N = white mates in N, -N = black mates in N),
+        or None for no mate detected."""
+        self.white_wr = max(0.0, min(1.0, wr_white))
+        self.mate_in = mate_in
         self.update()
 
     def paintEvent(self, _):
@@ -420,14 +492,19 @@ class EvalBar(QWidget):
         p.fillRect(0, h - wh, w, wh, QColor("#ededed"))
         p.setPen(QPen(QColor(ACCENT), 1))
         p.drawLine(0, h // 2, w, h // 2)
-        pct = f"{self.white_wr * 100:.0f}"
-        p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+
+        if self.mate_in is not None:
+            label = f"M{abs(self.mate_in)}" if self.mate_in > 0 else f"-M{abs(self.mate_in)}"
+            p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        else:
+            label = f"{self.white_wr * 100:.0f}"
+            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
         if self.white_wr >= 0.5:
             p.setPen(QColor("#1c1c1c"))
-            p.drawText(QRect(0, h - 18, w, 16), Qt.AlignCenter, pct)
+            p.drawText(QRect(0, h - 20, w, 18), Qt.AlignCenter, label)
         else:
             p.setPen(QColor("#ededed"))
-            p.drawText(QRect(0, 2, w, 16), Qt.AlignCenter, pct)
+            p.drawText(QRect(0, 2, w, 18), Qt.AlignCenter, label)
 
 
 # ───────────────────────────── Winrate graph ──────────────────────────────
@@ -497,7 +574,7 @@ class InfoBox(QWidget):
     """Ranked move list with N / P / Q / WDL — the Nibbler-style infobox."""
     play_move = pyqtSignal(int)
 
-    ROW_H = 50
+    ROW_H = 64
 
     def __init__(self):
         super().__init__()
@@ -507,7 +584,7 @@ class InfoBox(QWidget):
         self.setMinimumWidth(330)
 
     def set_moves(self, moves):
-        self.rows = moves[:14]
+        self.rows = moves[:9]
         self.setMinimumHeight(max(1, len(self.rows)) * self.ROW_H + 4)
         self.update()
 
@@ -566,11 +643,23 @@ class InfoBox(QWidget):
             p.setFont(QFont("Segoe UI", 8))
             stats = (f"N {d['visits']}  ·  {d['frac'] * 100:.1f}%   "
                      f"P {d['prior'] * 100:.1f}%   Q {d['q']:+.3f}")
-            p.drawText(QRect(14, y + 24, w - 100, 16),
+            p.drawText(QRect(14, y + 23, w - 100, 15),
                        Qt.AlignVCenter | Qt.AlignLeft, stats)
 
+            # Principal variation — the engine's expected line ("queue of moves").
+            pv = d.get("pv")
+            if pv:
+                p.setPen(QColor("#8fa6bd"))
+                p.setFont(QFont("Consolas", 8))
+                pv_str = "▸ " + " ".join(move_to_uci(x) for x in pv)
+                pv_rect = QRect(14, y + 38, w - 22, 13)
+                pv_str = p.fontMetrics().elidedText(
+                    pv_str, Qt.ElideRight, pv_rect.width())
+                p.drawText(pv_rect, Qt.AlignVCenter | Qt.AlignLeft, pv_str)
+
             if d["nn"] is not None:
-                cq, cd = d["nn"]
+                # nn is (q, d) or (q, d, m_plies); ignore extras.
+                cq, cd = d["nn"][0], d["nn"][1]
                 win = max(0.0, (1.0 - cd - cq) / 2.0)
                 loss = max(0.0, (1.0 - cd + cq) / 2.0)
                 draw = max(0.0, 1.0 - win - loss)
@@ -693,14 +782,19 @@ class BoardWidget(QWidget):
         # Which analysis arrows to show: when a piece is focused (selected and
         # it has analysed moves) — only that piece's moves; otherwise the
         # global top moves. Clicking the piece again clears the focus.
-        piece_moves = []
+        # Crucially, every arrow keeps its *global* rank — the colour and
+        # weight of move #4 from the full list stay the same even when we
+        # filter down to one piece. (Otherwise "second-best piece move" would
+        # steal the colour of the global second-best, which is misleading.)
         if self.selected is not None:
-            piece_moves = [d for d in self.analysis
-                           if decode_move(d["move"])[0] == self.selected]
-        shown = piece_moves if piece_moves else self.analysis[:5]
+            shown_with_rank = [(g, d) for g, d in enumerate(self.analysis)
+                               if decode_move(d["move"])[0] == self.selected]
+        else:
+            shown_with_rank = list(enumerate(self.analysis[:5]))
 
         if self.selected is not None:
-            best_dest = decode_move(piece_moves[0]["move"])[1] if piece_moves else None
+            best_dest = (decode_move(shown_with_rank[0][1]["move"])[1]
+                         if shown_with_rank else None)
             for m in self.legal_moves:
                 fs, ts, _ = decode_move(m)
                 if fs != self.selected:
@@ -714,9 +808,23 @@ class BoardWidget(QWidget):
                     p.setBrush(QColor(0, 0, 0, 55))
                     p.drawEllipse(c, cell * 0.10, cell * 0.10)
 
-        for i, d in enumerate(shown):
-            color = RANK_COLORS[i] if i < len(RANK_COLORS) else GREY
-            self._draw_arrow(p, d, color, cell)
+        # Two passes (Nibbler-style): all arrows first, then all labels on top.
+        # Otherwise a later arrow can be drawn over an earlier arrow's label.
+        # Also: at most one label per destination square — if two moves end on
+        # the same square, only the higher-ranked one keeps its badge.
+        # Worst-first draw order so the best move's shaft and source disc end
+        # up on top instead of being covered by faded lower-rank arrows.
+        label_targets = set()
+        for g, d in reversed(shown_with_rank):
+            color = RANK_COLORS[g] if g < len(RANK_COLORS) else GREY
+            self._draw_arrow(p, d, color, cell, rank=g, n_shown=len(shown_with_rank))
+        for g, d in shown_with_rank:
+            color = RANK_COLORS[g] if g < len(RANK_COLORS) else GREY
+            _, t, _ = decode_move(d["move"])
+            if t in label_targets:
+                continue
+            label_targets.add(t)
+            self._draw_arrow_label(p, d, color, cell, rank=g)
 
     def _draw_piece(self, p, rect, color, ptype, cell):
         glyph = PIECE_GLYPHS.get(ptype, '?')
@@ -734,41 +842,63 @@ class BoardWidget(QWidget):
         p.setPen(fill)
         p.drawText(rect, Qt.AlignCenter, glyph)
 
-    def _draw_arrow(self, p, d, color, cell):
+    def _draw_arrow(self, p, d, color, cell, rank, n_shown):
+        """Arrow only — no label. Width and alpha scale by rank so the best
+        move dominates visually (Nibbler hierarchy)."""
         f, t, _ = decode_move(d["move"])
         s = self.sq_rect(f).center()
         e = self.sq_rect(t).center()
-        c = QColor(color)
-        c.setAlpha(220)
-        width = max(5.0, cell * 0.14)
         ang = np.arctan2(e.y() - s.y(), e.x() - s.x())
-        head = cell * 0.30
-        tip = QPointF(e.x() - np.cos(ang) * head * 0.2,
-                      e.y() - np.sin(ang) * head * 0.2)
+        # rank 0 — full strength, each subsequent rank fades by 25% alpha and
+        # 20% width. With 5 ranks the worst is still legible (~40% alpha).
+        alpha = max(0.35, 1.0 - rank * 0.15)
+        wf    = max(0.30, 1.0 - rank * 0.18)
+        c = QColor(color)
+        c.setAlpha(int(255 * alpha))
+        width = max(3.0, cell * 0.18 * wf)
+        head  = cell * 0.34 * wf
+        # Stop the arrow just short of the target square center so the corner
+        # badge stays readable instead of being half-eaten by the arrowhead.
+        tip  = QPointF(e.x() - np.cos(ang) * head * 0.20,
+                       e.y() - np.sin(ang) * head * 0.20)
         base = QPointF(tip.x() - np.cos(ang) * head,
                        tip.y() - np.sin(ang) * head)
+        # Small disc at the source — useful when multiple pieces can move to
+        # the same square; you see *which* piece this arrow belongs to.
+        p.setPen(Qt.NoPen)
+        p.setBrush(c)
+        src_r = max(3.0, cell * 0.07 * wf)
+        p.drawEllipse(s, src_r, src_r)
         p.setPen(QPen(c, width, Qt.SolidLine, Qt.RoundCap))
         p.drawLine(s, base)
         p.setBrush(c)
         p.setPen(Qt.NoPen)
-        p1 = base + QPointF(-np.sin(ang) * head * 0.6, np.cos(ang) * head * 0.6)
-        p2 = base - QPointF(-np.sin(ang) * head * 0.6, np.cos(ang) * head * 0.6)
+        p1 = base + QPointF(-np.sin(ang) * head * 0.65, np.cos(ang) * head * 0.65)
+        p2 = base - QPointF(-np.sin(ang) * head * 0.65, np.cos(ang) * head * 0.65)
         p.drawPolygon(QPolygonF([tip, p1, p2]))
 
+    def _draw_arrow_label(self, p, d, color, cell, rank):
+        """Winrate badge anchored to the target square's center — never overlaps
+        with arrow shafts because it lives on the destination, not the line."""
+        if rank > 2:
+            return  # only top three get a readable percentage
+        _, t, _ = decode_move(d["move"])
+        center = self.sq_rect(t).center()
         wr = (d["q"] + 1.0) / 2.0
-        mid = QPointF(s.x() + (e.x() - s.x()) * 0.55,
-                      s.y() + (e.y() - s.y()) * 0.55)
         label = f"{wr * 100:.0f}%"
-        p.setFont(QFont("Segoe UI", max(8, int(cell * 0.18)), QFont.Bold))
+        font_size = max(9, int(cell * (0.20 if rank == 0 else 0.17)))
+        p.setFont(QFont("Segoe UI", font_size, QFont.Bold))
         fm = p.fontMetrics()
         tw = fm.horizontalAdvance(label) + 10
         th = fm.height() + 2
-        box = QRectF(mid.x() - tw / 2, mid.y() - th / 2, tw, th)
+        box = QRectF(center.x() - tw / 2, center.y() - th / 2, tw, th)
         dark = QColor(color.darker(180))
-        dark.setAlpha(235)
+        dark.setAlpha(240)
         p.setBrush(dark)
-        p.setPen(QPen(c.lighter(140), 1))
+        p.setPen(QPen(color.lighter(140), 1))
         p.drawRoundedRect(box, 4, 4)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(box, Qt.AlignCenter, label)
         p.setPen(QColor("#ffffff"))
         p.drawText(box, Qt.AlignCenter, label)
 
@@ -813,9 +943,7 @@ class NibblerGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("Capablanca AI — анализатор")
         self.resize(1320, 920)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.net = None
         self.mcts = None
         self.search = None
         self.search_started = 0.0
@@ -826,10 +954,12 @@ class NibblerGUI(QMainWindow):
         self.snapshots = {}          # ply -> last analysis payload for that ply
         self.ttable = {}             # persistent search DAG — reused across moves
         self.mode = "analyze"
-        self.analysis_on = True
+        self.analysis_on = False     # off until ▶ / Space — no auto-search on open
+        self.contempt = 0.0          # LC0-style draw bias in PUCT selection
 
         self._build_ui()
         self._build_shortcuts()
+        self._autoload()
         self.refresh()
 
     # ---- UI construction ----
@@ -897,7 +1027,42 @@ class NibblerGUI(QMainWindow):
         lay.addWidget(self.spin_play)
         lay.addWidget(self._vline())
 
-        self.btn_go = QPushButton("⏸ Остановить анализ")
+        # c_puct: higher → wider search (alternatives get more visits), lower
+        # → deeper into the best line. LC0 training default 1.745; for analysis
+        # 2.5-3.0 is comfortable. Spinbox в ‰ для целочисленного шага.
+        lay.addWidget(QLabel("c_puct:"))
+        self.spin_cpuct = QSpinBox()
+        self.spin_cpuct.setRange(500, 5000)
+        self.spin_cpuct.setSingleStep(100)
+        self.spin_cpuct.setValue(1745)
+        self.spin_cpuct.setSuffix("‰")
+        self.spin_cpuct.setToolTip(
+            "Параметр исследования PUCT.\n"
+            "Меньше → MCTS уходит вглубь лучшей линии.\n"
+            "Больше → больше визитов на альтернативные ходы.\n"
+            "Обучение: 1745. Анализ: 2500-3000.")
+        self.spin_cpuct.valueChanged.connect(self._cpuct_changed)
+        lay.addWidget(self.spin_cpuct)
+        lay.addWidget(self._vline())
+
+        # Contempt: -100..+100 → -1.0..+1.0 (integer for QSpinBox).
+        # +N → MCTS избегает ничьих (агрессивная игра); -N → охотнее соглашается на ничью.
+        lay.addWidget(QLabel("Contempt:"))
+        self.spin_contempt = QSpinBox()
+        self.spin_contempt.setRange(-100, 100)
+        self.spin_contempt.setSingleStep(5)
+        self.spin_contempt.setValue(0)
+        self.spin_contempt.setSuffix("%")
+        self.spin_contempt.setToolTip(
+            "Сдвиг оценки ничьей в селекции PUCT.\n"
+            "+ значения → играть на выигрыш (избегать ничьих).\n"
+            "− значения → принимать ничейные линии.")
+        self.spin_contempt.valueChanged.connect(self._contempt_changed)
+        lay.addWidget(self.spin_contempt)
+        lay.addWidget(self._vline())
+
+        self.btn_go = QPushButton("⏸ Остановить анализ" if self.analysis_on
+                                  else "▶ Запустить анализ")
         self.btn_go.clicked.connect(self._toggle_analysis)
         lay.addWidget(self.btn_go)
 
@@ -971,33 +1136,31 @@ class NibblerGUI(QMainWindow):
 
     # ---- model loading ----
     def load_weights(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Загрузить веса", "", "*.pth")
-        if not path:
-            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Загрузить сеть", "", "ONNX-модель (*.onnx)")
+        if path:
+            self._load_onnx(path)
+
+    def _autoload(self):
+        """Load capablanca.onnx sitting next to the program, if present, so a
+        packaged build opens ready to analyse without touching a dialog."""
+        cand = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "capablanca.onnx")
+        if os.path.exists(cand):
+            self._load_onnx(cand)
+
+    def _load_onnx(self, path):
         try:
-            ckpt = torch.load(path, map_location=self.device, weights_only=False)
-            raw = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
-            sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
-                  for k, v in raw.items()}
-
-            stem = sd.get("input_conv.net.0.weight", sd.get("input_block.0.weight"))
-            ch = stem.shape[0]
-            bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
-
-            net = CapablancaNet(num_channels=ch, num_res_blocks=bl)
-            tgt = net.state_dict()
-            sd = {k: v for k, v in sd.items()
-                  if not (k in tgt and v.shape != tgt[k].shape)}
-            net.load_state_dict(sd, strict=False)
-            net.to(self.device).eval()
-
-            self.net = net
-            self.mcts = UltraFastMCTS(net, self.device, c_puct=1.745,
-                                      batch_size=96, add_dirichlet=False,
-                                      nn_cache=True)
-            self.ttable.clear()      # old stats came from the previous weights
+            # nn_cache_max=150_000 ≈ 4 GB RAM ceiling (each entry holds the
+            # 7000-prob policy + scalars). The old default 600 000 could grow
+            # to ~17 GB on long analysis sessions, which is what users see as
+            # "RAM full and not released".
+            self.mcts = OnnxEngine(path, c_puct=1.745, batch_size=96,
+                                   nn_cache=True, nn_cache_max=150_000)
+            self.ttable.clear()          # old stats came from the previous net
+            dev = "GPU · CUDA" if self.mcts.gpu else "CPU"
             self.statusBar().showMessage(
-                f"Модель загружена: {ch}ch × {bl}bl · {self.device}")
+                f"Сеть загружена: {os.path.basename(path)}  ·  {dev}")
             self.refresh()
         except Exception as e:
             self.statusBar().showMessage(f"Ошибка загрузки: {e}")
@@ -1013,6 +1176,56 @@ class NibblerGUI(QMainWindow):
         self.btn_go.setText("⏸ Остановить анализ" if self.analysis_on
                             else "▶ Запустить анализ")
         self.refresh()
+
+    def _contempt_changed(self, val):
+        # Spinbox carries percent; PUCT formula wants a scalar in roughly [-1, 1].
+        self.contempt = val / 100.0
+        # Stats accumulated under the previous contempt are still correct (Q/D
+        # are stored unscaled) — the change takes effect on the next selection.
+
+    def _cpuct_changed(self, val):
+        # Spinbox carries thousandths to allow integer steps. Updates the
+        # OnnxEngine attribute that SearchThread reads at construction time —
+        # the running search keeps its own snapshot, change applies to the next.
+        if self.mcts is not None:
+            self.mcts.c_puct = val / 1000.0
+
+    def _prune_ttable(self, move_history):
+        """Drop ttable entries unreachable from the current position.
+
+        Walks the search DAG from the position the next search starts at and
+        keeps only those nodes. Sub-trees behind other (no-longer-relevant)
+        move orders go away — frees memory without throwing away the work the
+        next search will actually reuse. Cheap: O(reachable nodes).
+        """
+        try:
+            engine = CapablancaEngine()
+            for m in move_history:
+                engine.make_move_int(m)
+            root_hash = position_key(engine)
+        except Exception:
+            self.ttable.clear()
+            return
+        root = self.ttable.get(root_hash)
+        if root is None:
+            self.ttable.clear()
+            return
+        keep = {root_hash: root}
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            if not n.children:
+                continue
+            for e in n.children.values():
+                if e.child_hash in keep:
+                    continue
+                keep[e.child_hash] = e.child
+                stack.append(e.child)
+        dropped = len(self.ttable) - len(keep)
+        self.ttable.clear()
+        self.ttable.update(keep)
+        self.statusBar().showMessage(
+            f"ttable prune: оставили {len(keep):,} узлов, выкинули {dropped:,}")
 
     def new_game(self):
         self.history = []
@@ -1123,8 +1336,23 @@ class NibblerGUI(QMainWindow):
         elif snap is not None:
             self.apply_payload(snap, live=False)        # instant placeholder
         else:
-            self.infobox.set_moves([])
-            self.eval_bar.set_winrate(self.evals.get(self.cursor, 0.5))
+            # No completed-search snapshot — but the persistent search tree may
+            # still hold residual sims for this position, carried over by tree
+            # reuse. Show those instead of a bare "analysis stopped" message.
+            node = (self.ttable.get(position_key(self.board.engine))
+                    if self.mcts is not None else None)
+            if node is not None and node.visits > 0:
+                self.apply_payload(
+                    payload_from_node(node, self.board.engine.side_to_move()),
+                    live=False)
+            else:
+                self.infobox.set_moves([])
+                self.eval_bar.set_winrate(self.evals.get(self.cursor, 0.5))
+                if (not over and self.mcts is not None
+                        and not self.should_search()):
+                    self.statusBar().showMessage(
+                        f"Позиция {self.cursor} · анализ остановлен — "
+                        f"▶ чтобы запустить")
 
         if not over and self.should_search():
             engine_turn = (self.cursor == len(self.history)
@@ -1132,14 +1360,12 @@ class NibblerGUI(QMainWindow):
             budget = (self.spin_play.value() if engine_turn
                       else self.spin_analyze.value())
             if len(self.ttable) > TT_MAX_NODES:
-                self.ttable.clear()          # soft memory cap
-            self.search = SearchThread(view, self.mcts, budget, self.ttable)
+                self._prune_ttable(view)     # keep current subtree, drop dead branches
+            self.search = SearchThread(view, self.mcts, budget, self.ttable,
+                                       contempt=self.contempt)
             self.search.update.connect(self.on_update)
             self.search_started = time.time()
             self.search.start()
-        elif not over and self.mcts is not None and snap is None:
-            self.statusBar().showMessage(
-                f"Позиция {self.cursor} · анализ остановлен — ▶ чтобы запустить")
 
         self.graph.set_data(self.evals, self.cursor, len(self.history))
         self._rebuild_table()
@@ -1154,7 +1380,33 @@ class NibblerGUI(QMainWindow):
 
         wr_stm = (payload["root_q"] + 1.0) / 2.0
         wr_white = wr_stm if stm == 0 else 1.0 - wr_stm
-        self.eval_bar.set_winrate(wr_white)
+        # Heuristic mate detection. The MLH head's `nn[1]` carries the network's
+        # draw belief for the top move and the per-move Q tells the winning side.
+        # Without proven mate bounds plumbed up to Python we infer it: if the top
+        # move's Q is near ±1 AND the moves-left estimate is short AND the draw
+        # belief is tiny, that's strongly a forced mate line.
+        mate_in = None
+        if moves:
+            top = moves[0]
+            top_q = top["q"]                # winning side POV
+            nn = top.get("nn")              # (q, d, m_plies) tuple or None
+            top_d = nn[1] if nn else 0.5
+            top_m_plies = nn[2] if (nn and len(nn) >= 3) else None
+            if abs(top_q) > 0.92 and top_d < 0.15:
+                # MLH carries plies left for the leaf side; convert to full moves.
+                # If absent, fall back to a coarse guess from |Q|. Cap at 30 to
+                # avoid nonsensical "M99" when the heuristic gets noisy.
+                if top_m_plies is not None and top_m_plies > 0:
+                    n = max(1, int(round(top_m_plies / 2)))
+                else:
+                    n = max(1, int(round((1.0 - abs(top_q)) * 40)))
+                n = min(n, 30)
+                # Sign: top_q > 0 → side-to-move mates. Convert to white POV.
+                if top_q > 0:
+                    mate_in = +n if stm == 0 else -n
+                else:
+                    mate_in = -n if stm == 0 else +n
+        self.eval_bar.set_eval(wr_white, mate_in)
         self.evals[self.cursor] = wr_white
 
         side = "белые" if stm == 0 else "чёрные"
@@ -1162,9 +1414,8 @@ class NibblerGUI(QMainWindow):
             elapsed = max(1e-3, time.time() - self.search_started)
             reused = payload.get("reused", 0)
             fresh = max(0, payload["sims"] - reused)
-            reuse_txt = f" (♻ {reused:,})" if reused else ""
             self.statusBar().showMessage(
-                f"Ход: {side}  ·  узлов: {payload['sims']:,}{reuse_txt}  ·  "
+                f"Ход: {side}  ·  узлов: {payload['sims']:,} (♻ {reused:,})  ·  "
                 f"{fresh / elapsed:.0f}/с  ·  слияний транспозиций: "
                 f"{payload['merges']:,}  ·  оценка (белые): {wr_white * 100:.1f}%")
         else:

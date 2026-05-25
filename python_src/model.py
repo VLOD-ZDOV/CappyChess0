@@ -110,12 +110,15 @@ class MultiHeadAttentionRPB(nn.Module):
         q = q.view(B, S, self.heads, self.head_dim).transpose(1, 2)
         k = k.view(B, S, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.heads, self.head_dim).transpose(1, 2)
-        # Attention: QK^T/√d + RPB bias
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, h, S, S)
-        scores = scores + self.rpb().unsqueeze(0)
-        attn = F.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)                                 # (B, h, S, hd)
-        out = out.transpose(1, 2).contiguous().view(B, S, D)
+        # SDPA picks the best backend (FlashAttention / mem-efficient / math)
+        # based on shapes and hardware. attn_mask is added to scores before softmax,
+        # so RPB rides in as an additive bias — broadcast across batch.
+        bias = self.rpb().unsqueeze(0)                              # (1, h, S, S)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+        # flatten(2) collapses the (h, hd) tail into a single D dim. The dynamo
+        # ONNX exporter lowers it to an explicit Flatten/Reshape op (unlike
+        # view/reshape which it tried to optimize through the transpose).
+        out = out.transpose(1, 2).flatten(2)                        # (B, S, D)
         return self.out_proj(out)
 
 
@@ -212,6 +215,8 @@ class CapablancaNet(nn.Module):
                  enable_future: bool = True):
         super().__init__()
         self.num_channels = num_channels
+        self.num_res_blocks = num_res_blocks
+        self.transformer_heads = transformer_heads
         self.enable_mlh = enable_mlh
         self.enable_future = enable_future
         self.num_transformer_blocks = num_transformer_blocks
@@ -395,3 +400,32 @@ class CapablancaNet(nn.Module):
         else:
             m = torch.zeros_like(q)
         return F.softmax(logits, dim=1), q, d, m
+
+
+def build_net_from_state_dict(raw_sd: dict):
+    """Inspect a checkpoint's state_dict and reconstruct CapablancaNet with the
+    exact architecture that produced those weights — channels, residual blocks,
+    transformer blocks, attention heads, plus mlh / future toggles.
+
+    Returns (net, sd) where sd has had any incompatible-shape entries dropped,
+    so caller can do `net.load_state_dict(sd, strict=False)` cleanly. Prevents
+    the silent-mismatch trap where eval/play scripts hardcoded ch×bl and quietly
+    skipped unfamiliar transformer/mlh/future weights through strict=False."""
+    sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
+          for k, v in raw_sd.items()}
+    stem_key = next((k for k in sd if ("input_conv" in k or "input_block" in k)
+                     and k.endswith(".weight") and "bn" not in k
+                     and "bias" not in k), None)
+    ch = sd[stem_key].shape[0] if stem_key else 128
+    bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
+    tb = len({k.split(".")[1] for k in sd if k.startswith("transformer_blocks.")})
+    rpb = sd.get("transformer_blocks.0.attn.rpb.bias_table")
+    heads = rpb.shape[0] if rpb is not None else 8
+    enable_mlh    = any(k.startswith("mlh_head.")    for k in sd)
+    enable_future = any(k.startswith("future_head.") for k in sd)
+    net = CapablancaNet(num_channels=ch, num_res_blocks=bl,
+                        num_transformer_blocks=tb, transformer_heads=heads,
+                        enable_mlh=enable_mlh, enable_future=enable_future)
+    target = net.state_dict()
+    sd = {k: v for k, v in sd.items() if k in target and v.shape == target[k].shape}
+    return net, sd

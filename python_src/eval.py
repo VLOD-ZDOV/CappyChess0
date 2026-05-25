@@ -81,13 +81,23 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
     raw_sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
     sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in raw_sd.items()}
 
-    # Architecture from weights
+    # Architecture from weights. Restore EVERY structural knob — otherwise
+    # checkpoints trained with non-default transformer/heads/mlh/future quietly
+    # load through strict=False with garbage layers, and the eval ends up
+    # comparing two different networks. Mirrors export_onnx.py logic.
     stem_key = next((k for k in sd if ("input_conv" in k or "input_block" in k)
                      and k.endswith(".weight") and "bn" not in k and "bias" not in k), None)
     ch = sd[stem_key].shape[0] if stem_key else 128
     bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
+    tb = len({k.split(".")[1] for k in sd if k.startswith("transformer_blocks.")})
+    rpb = sd.get("transformer_blocks.0.attn.rpb.bias_table")
+    heads = rpb.shape[0] if rpb is not None else 8
+    enable_mlh    = any(k.startswith("mlh_head.")    for k in sd)
+    enable_future = any(k.startswith("future_head.") for k in sd)
 
-    net = CapablancaNet(num_channels=ch, num_res_blocks=bl)
+    net = CapablancaNet(num_channels=ch, num_res_blocks=bl,
+                        num_transformer_blocks=tb, transformer_heads=heads,
+                        enable_mlh=enable_mlh, enable_future=enable_future)
 
     # Filter layers with incompatible shapes (scalar↔WDL transition)
     target = net.state_dict()

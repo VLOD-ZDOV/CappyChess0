@@ -223,8 +223,11 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
             print(f"  ❌ FSF: {e}")
             return [], 0, 0, 0
 
+    # Contempt is most useful here — vs an external opponent (FSF) the NN benefits
+    # from biasing away from draws to convert positional advantage into wins.
     mcts = UltraFastMCTS(net, device, c_puct=1.745, batch_size=1,
-                         add_dirichlet=False, parallel_sims=1)
+                         add_dirichlet=False, parallel_sims=1,
+                         contempt=cfg.contempt)
     all_samples = []
     wins = draws = losses = errors = 0
     nn_wins = nn_draws = nn_losses = 0
@@ -589,6 +592,12 @@ class Config:
     # On timeout (game reached max_game_length): True = draw, False = material evaluation
     timeout_as_draw: bool = False
 
+    # Contempt: PUCT Q-bias on the network's draw probability.
+    # 0.0 = standard play. +N → MCTS avoids draws (useful vs weaker opponents
+    # like FSF), -N → accepts draws. In pure self-play both sides apply it
+    # symmetrically — keep at 0.0 to avoid skewing value targets.
+    contempt: float = 0.0
+
 
 # Tuple: (board_f16, sparse_policy, value, mlh_norm)
 # mlh_norm = remaining_plies / MLH_PLY_NORM ∈ [0, 1], 0.0 for old samples without MLH
@@ -754,7 +763,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                          compile_mode=cfg.compile_inference,
                          kld_threshold=kld_thr,
                          kld_check_every=cfg.kld_check_every,
-                         kld_min_sims_frac=cfg.kld_min_sims_frac)
+                         kld_min_sims_frac=cfg.kld_min_sims_frac,
+                         contempt=cfg.contempt)
     all_samples: List[Sample] = []
 
     batch_sz = cfg.mcts_batch
@@ -784,6 +794,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         from capablanca_engine import RustMCTS as _RustMCTS
         _parallel = cfg.mcts_parallel_sims
         rust_mcts_reuse = _RustMCTS(engines, _parallel)
+        if mcts.contempt != 0.0:
+            rust_mcts_reuse.set_contempt(mcts.contempt)
+        if not mcts.add_dirichlet:
+            rust_mcts_reuse.set_add_dirichlet(False)
 
         while active and move_num < cfg.max_game_length:
             # Playout Cap Randomization: on fast_sim_fraction moves use fast_simulations
@@ -924,9 +938,14 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             move_num += 1
 
         batch_positions = 0
-        # Game categories. resigns — separate category, does NOT overlap with timeouts.
-        # Previously resign counted in BOTH timeouts AND white/black_wins → numbers didn't add up.
-        white_wins = black_wins = draws = resigns = adjudications = timeouts = 0
+        # Game categories. Win/loss counts split BY OUTCOME TYPE so a colour
+        # imbalance isn't hidden inside the resign/timeout buckets — that used
+        # to look like "black wins more" when in reality most black wins came
+        # from white resigning. resigns/timeouts are still also reported as
+        # totals for backward-compat sanity.
+        mate_w = mate_b = draws = adjudications = 0
+        resign_w = resign_b = 0     # split by who actually won
+        timeout_w = timeout_b = timeout_d = 0
 
         for i, eng in enumerate(engines):
             if resigned[i]:
@@ -934,21 +953,24 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 # Determine who resigned from side_to_move (opponent to move → previous side resigned)
                 last_side = histories[i][-1][2] if histories[i] else 0
                 result = -1.0 if last_side == 0 else 1.0
-                resigns += 1  # separate category, no double-counting
+                if result > 0: resign_w += 1
+                else:          resign_b += 1
             elif adjudicated[i] is not None:
                 # Adjudication — decisive material advantage
                 result = adjudicated[i]
                 adjudications += 1
-                if result > 0: white_wins += 1
-                else:          black_wins += 1
+                if result > 0: mate_w += 1
+                else:          mate_b += 1
             elif eng.is_game_over():
                 result = eng.game_result()
-                if result == 1.0:   white_wins += 1
-                elif result == -1.0: black_wins += 1
-                else:               draws += 1
+                if result == 1.0:   mate_w += 1
+                elif result == -1.0: mate_b += 1
+                else:                draws += 1
             else:
                 result = 0.0 if cfg.timeout_as_draw else eng.material_result()
-                timeouts += 1
+                if result > 0.5:    timeout_w += 1
+                elif result < -0.5: timeout_b += 1
+                else:                timeout_d += 1
 
             total_plies = len(histories[i])
             for k, entry in enumerate(histories[i]):
@@ -969,13 +991,18 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     pack_sample(board_np, pol, float(v), float(mlh_norm), int(future_idx)))
                 batch_positions += 1
 
-        # All categories are mutually exclusive → sum = n (sanity check).
-        total_counted = white_wins + black_wins + draws + resigns + adjudications + timeouts
+        # Aggregate totals per colour across all outcome types. Adjudications
+        # are already counted inside mate_w/mate_b above, so they aren't added.
+        total_w = mate_w + resign_w + timeout_w
+        total_b = mate_b + resign_b + timeout_b
+        total_d = draws + timeout_d
+        total_counted = total_w + total_b + total_d
         sanity = "" if total_counted == n else f" ⚠️ sanity {total_counted}/{n}"
         print(f"  Batch {b+1}/{num_batches}: {n} games, "
               f"{batch_positions} positions, {move_num} ходов | "
-              f"бел={white_wins} чёрн={black_wins} пат={draws} "
-              f"resign={resigns} adj={adjudications} timeout={timeouts}{sanity}")
+              f"W={total_w} (мат {mate_w}, resign {resign_w}, timeout {timeout_w}) · "
+              f"B={total_b} (мат {mate_b}, resign {resign_b}, timeout {timeout_b}) · "
+              f"D={total_d} (пат {draws}, timeout {timeout_d}){sanity}")
 
     # KLD-early-exit statistics
     if cfg.kld_enabled and cfg.kld_threshold > 0.0:
@@ -1011,34 +1038,35 @@ def value_to_wdl(v: float) -> np.ndarray:
 
 class SelfPlayDataset(torch.utils.data.Dataset):
     def __init__(self, samples: List[CompactSample]):
-        self.boards   = np.stack([s[0].astype(np.float32) for s in samples]).reshape(
+        boards_np = np.stack([s[0].astype(np.float32) for s in samples]).reshape(
             -1, CapablancaNet.INPUT_PLANES, CapablancaNet.BOARD_H, CapablancaNet.BOARD_W
         )
-        self.policies = np.stack([unpack_policy(s[1]) for s in samples])
-        # WDL: each scalar value → soft one-hot [Win, Draw, Loss]
-        self.wdl = np.stack([value_to_wdl(float(s[2])) for s in samples])
-        # MLH target: normalized ∈ [0, 1]. Old samples without MLH (len=3) → 0.0.
-        self.mlh = np.array(
+        policies_np = np.stack([unpack_policy(s[1]) for s in samples])
+        wdl_np = np.stack([value_to_wdl(float(s[2])) for s in samples])
+        mlh_np = np.array(
             [float(s[3]) if len(s) > 3 else 0.0 for s in samples],
             dtype=np.float32,
         )
-        # Future move target: policy index of move k+2. Old samples (len<5) → -1 (masked).
-        self.future = np.array(
+        future_np = np.array(
             [int(s[4]) if len(s) > 4 else -1 for s in samples],
             dtype=np.int64,
         )
+        # One-shot numpy→torch conversion. Avoids per-sample torch.from_numpy in
+        # __getitem__: with pin_memory=True the DataLoader then pages one contiguous
+        # batch instead of pinning each tiny tensor separately — major win on large
+        # buffers where the per-sample overhead used to starve the GPU.
+        self.boards   = torch.from_numpy(boards_np).contiguous()
+        self.policies = torch.from_numpy(policies_np).contiguous()
+        self.wdl      = torch.from_numpy(wdl_np).contiguous()
+        self.mlh      = torch.from_numpy(mlh_np).contiguous()
+        self.future   = torch.from_numpy(future_np).contiguous()
 
     def __len__(self):
-        return len(self.wdl)
+        return self.wdl.shape[0]
 
     def __getitem__(self, idx):
-        return (
-            torch.from_numpy(self.boards[idx]),
-            torch.from_numpy(self.policies[idx]),
-            torch.from_numpy(self.wdl[idx]),    # (3,) float32
-            torch.tensor(self.mlh[idx]),        # scalar float32 ∈ [0, 1]
-            torch.tensor(self.future[idx]),     # scalar int64 (policy idx or -1)
-        )
+        return (self.boards[idx], self.policies[idx], self.wdl[idx],
+                self.mlh[idx], self.future[idx])
 
 
 # ── Training step ─────────────────────────────────────────────────────────────
@@ -1771,6 +1799,11 @@ if __name__ == "__main__":
                         help="Минимальный ход для сдачи (default: 20)")
     parser.add_argument("--force-save",           action="store_true",
                         help="Сохранять чекпоинт даже если policy_loss < collapse_threshold")
+    parser.add_argument("--contempt",             type=float, default=0.0,
+                        help="Сдвиг Q в селекции PUCT на накопленный draw-prob. "
+                             "0.0 = обычный режим. +N → избегать ничьих (полезно vs FSF), "
+                             "-N → принимать ничьи. В чистом self-play оставлять 0.0 — "
+                             "обе стороны применят его симметрично и исказят value-таргеты.")
 
     # FSF integration (optional)
     parser.add_argument("--fsf-path",             type=str, default=None,
@@ -1869,6 +1902,7 @@ if __name__ == "__main__":
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,
         ema_start_iter=args.ema_start_iter,
+        contempt=args.contempt,
         fsf_value_alpha=args.fsf_value_alpha,
         resign_threshold=args.resign_threshold,
         resign_threshold_early=args.resign_threshold_early,
