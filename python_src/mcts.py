@@ -37,16 +37,29 @@ except (ImportError, AttributeError):
     pass
 
 
-def _bucket_size(n: int, step: int) -> int:
-    """Round n up to the next power-of-two multiple of `step`.
-    n=50, step=32 → 64. n=600, step=32 → 1024. Keeps the number of distinct
-    compiled shapes small (log2(max_n/step) ≈ 9), so CUDA graphs stick."""
+def _bucket_size(n: int, step: int, pow2: bool = True) -> int:
+    """Round n up to a stable batch shape.
+
+    pow2=True  (torch.compile path): next power-of-two multiple of `step`
+               (n=50,step=32→64; n=600→1024). Keeps distinct compiled shapes
+               to ~log2(max_n/step)≈9 so dynamo/CUDA-graphs don't thrash.
+    pow2=False (eager path): next multiple of `step` only. Measured GPU
+               throughput is *linear* in batch size (≈0.115 ms/leaf for the
+               384×15+4 net on a 5080), so power-of-two padding is pure wasted
+               compute — up to ~1.8x on an under-filled call (e.g. 2100→4096).
+               A fine grid keeps padding waste ≤ step/n while cudnn.benchmark
+               autotune of each new shape is a one-time ~1-forward cost that
+               amortizes to seconds over a full iteration."""
+    if pow2:
+        if n <= step:
+            return step
+        target = step
+        while target < n:
+            target *= 2
+        return target
     if n <= step:
         return step
-    target = step
-    while target < n:
-        target *= 2
-    return target
+    return ((n + step - 1) // step) * step
 
 try:
     from capablanca_engine import RustMCTS as _RustMCTS
@@ -198,20 +211,6 @@ class UltraFastMCTS:
         self._cache_hits = 0
         self._cache_misses = 0
 
-    @staticmethod
-    def _max_kl_divergence(prev: np.ndarray, curr: np.ndarray, eps: float = 1e-8) -> float:
-        """Max KL(prev || curr) across games. prev/curr: (N_games, POLICY_SIZE), stochastic.
-
-        KL(P||Q) = Σ P * log(P/Q). Used as L0-style smart-pruning gate.
-        Returns +inf if arrays are empty.
-        """
-        if prev.shape != curr.shape or prev.size == 0:
-            return float('inf')
-        p = prev + eps
-        q = curr + eps
-        kl = np.sum(p * (np.log(p) - np.log(q)), axis=1)  # (N_games,)
-        return float(np.max(kl))
-
     def kld_stats(self) -> dict:
         """KLD-early-exit statistics. Useful for logging."""
         if self._kld_total_calls == 0:
@@ -342,7 +341,12 @@ class UltraFastMCTS:
         # parallel_sims-aligned size (32, 64, 96, 128, ...) was a fresh shape,
         # dynamo hit cache_size_limit=8 and silently fell back to eager.
         ps = self._parallel_sims
-        target = _bucket_size(n, ps)
+        # Power-of-two buckets only matter when torch.compile/CUDA-graphs need
+        # shape stability. In eager mode (the only stable path on Blackwell) the
+        # GPU is compute-bound and throughput is linear in batch size, so we pad
+        # to the next multiple of `ps` instead — up to ~1.8x less wasted compute
+        # on under-filled calls.
+        target = _bucket_size(n, ps, pow2=self._compile_mode is not None)
         n_pad = target - n
 
         arr = tensors.reshape(n, INPUT_PLANES, BOARD_H, BOARD_W)
@@ -388,15 +392,12 @@ class UltraFastMCTS:
             logits, values = out
             mlh_raw = None
 
-        logits_f = logits.float()
-        values_f = values.float()
-
-        if torch.isnan(logits_f).any() or torch.isinf(logits_f).any():
-            print(f"⚠️  _infer: NaN/inf в logits! Возвращаем равномерное распределение.")
-            logits_f = torch.zeros_like(logits_f)
-        if torch.isnan(values_f).any() or torch.isinf(values_f).any():
-            print(f"⚠️  _infer: NaN/inf в values! Возвращаем нули.")
-            values_f = torch.zeros_like(values_f)
+        # nan_to_num scrubs NaN/inf on the GPU (pointwise kernel, no host sync).
+        # The old `.isnan().any()` guards each forced a device→host sync on every
+        # inference batch — pure latency in the self-play hot loop. zeros → uniform
+        # softmax for logits and a neutral value, the same fallback as before.
+        logits_f = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        values_f = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
         policies = torch.softmax(logits_f, dim=1).cpu().numpy()
 
@@ -410,9 +411,7 @@ class UltraFastMCTS:
 
         # MLH: sigmoid raw → ∈ [0, 1] (normalized "fraction of game remaining").
         if mlh_raw is not None:
-            mlh_f = mlh_raw.float()
-            if torch.isnan(mlh_f).any() or torch.isinf(mlh_f).any():
-                mlh_f = torch.zeros_like(mlh_f)
+            mlh_f = torch.nan_to_num(mlh_raw.float(), nan=0.0, posinf=0.0, neginf=0.0)
             m_values = torch.sigmoid(mlh_f).view(-1).cpu().numpy()
         else:
             m_values = np.zeros_like(q_values)

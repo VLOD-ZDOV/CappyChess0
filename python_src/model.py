@@ -89,15 +89,23 @@ class RelativePositionBias(nn.Module):
 
 
 class MultiHeadAttentionRPB(nn.Module):
-    """MHA with Relative Position Bias (no Smolgen). Pre-LN style."""
+    """MHA with Relative Position Bias (no Smolgen). Pre-LN style.
+
+    `qkv_bias=False` matches the BT5 finding: dropping QKV biases gives
+    ~10% faster training and ~5% faster inference with no quality loss.
+    Default True for backward compatibility with existing checkpoints —
+    new training runs should set it to False.
+    """
     def __init__(self, d_model: int, heads: int = 8,
-                 board_h: int = 8, board_w: int = 10):
+                 board_h: int = 8, board_w: int = 10,
+                 qkv_bias: bool = True):
         super().__init__()
         assert d_model % heads == 0, f"d_model={d_model} must be divisible by heads={heads}"
         self.heads = heads
         self.head_dim = d_model // heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv = nn.Linear(d_model, 3 * d_model)
+        # No explicit scale stored: F.scaled_dot_product_attention applies its own
+        # 1/sqrt(head_dim) internally, so a self.scale here would be dead/misleading.
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=qkv_bias)
         self.out_proj = nn.Linear(d_model, d_model)
         self.rpb = RelativePositionBias(heads, board_h, board_w)
 
@@ -122,16 +130,45 @@ class MultiHeadAttentionRPB(nn.Module):
         return self.out_proj(out)
 
 
+def _make_norm(d_model: int, use_rmsnorm: bool):
+    """LayerNorm or RMSNorm. RMSNorm drops the centering step (no mean
+    subtraction) and the bias term — matches BT5's "no centering, no
+    biases in normalization" change. Falls back to a hand-rolled impl
+    on PyTorch versions without nn.RMSNorm."""
+    if not use_rmsnorm:
+        return nn.LayerNorm(d_model)
+    if hasattr(nn, "RMSNorm"):
+        return nn.RMSNorm(d_model)
+    return _RMSNormFallback(d_model)
+
+
+class _RMSNormFallback(nn.Module):
+    """RMSNorm for PyTorch < 2.4 (no centering, only scale)."""
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
 class TransformerBlock(nn.Module):
-    """Pre-LN transformer encoder block: LN → MHA(RPB) → residual → LN → FFN → residual.
+    """Pre-LN transformer encoder block: norm → MHA(RPB) → residual → norm → FFN → residual.
     Pre-LN is more stable than post-LN when training without a transformer warmup schedule.
+
+    `use_rmsnorm=True` switches LayerNorm → RMSNorm (BT5: no centering, no
+    bias). `qkv_bias=False` drops the QKV bias. Both default to the legacy
+    layout so existing checkpoints load unchanged.
     """
     def __init__(self, d_model: int, heads: int = 8, ffn_mult: int = 2,
-                 board_h: int = 8, board_w: int = 10):
+                 board_h: int = 8, board_w: int = 10,
+                 qkv_bias: bool = True, use_rmsnorm: bool = False):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadAttentionRPB(d_model, heads, board_h, board_w)
-        self.ln2 = nn.LayerNorm(d_model)
+        self.ln1 = _make_norm(d_model, use_rmsnorm)
+        self.attn = MultiHeadAttentionRPB(d_model, heads, board_h, board_w,
+                                          qkv_bias=qkv_bias)
+        self.ln2 = _make_norm(d_model, use_rmsnorm)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model * ffn_mult),
             nn.Mish(inplace=True),
@@ -212,7 +249,10 @@ class CapablancaNet(nn.Module):
                  enable_mlh: bool = True,
                  num_transformer_blocks: int = 2,
                  transformer_heads: int = 8,
-                 enable_future: bool = True):
+                 enable_future: bool = True,
+                 qkv_bias: bool = True,
+                 use_rmsnorm: bool = False,
+                 piece_embed_dim: int = 0):
         super().__init__()
         self.num_channels = num_channels
         self.num_res_blocks = num_res_blocks
@@ -220,9 +260,29 @@ class CapablancaNet(nn.Module):
         self.enable_mlh = enable_mlh
         self.enable_future = enable_future
         self.num_transformer_blocks = num_transformer_blocks
+        self.qkv_bias = qkv_bias
+        self.use_rmsnorm = use_rmsnorm
+        self.piece_embed_dim = piece_embed_dim
+
+        # ── Piece embedding (BT3 trick) ─────────────────────────────────────────
+        # Per-square linear projection of the newest "what piece sits here" vector
+        # — 16 piece planes (8 our + 8 their). Concatenated to the raw input
+        # BEFORE the input conv so the trunk sees the board state both as the
+        # usual 139-plane stack AND as a learned dense per-square code. LC0 BT3
+        # reports "model plays as if 15% larger with a 5% latency increase".
+        # 0 = disabled (default, backward-compatible with existing checkpoints).
+        if piece_embed_dim > 0:
+            # 16 = current-position piece planes (planes 0..15 in our layout):
+            #   planes 0..7   = our pieces (P N B R Q A C K)
+            #   planes 8..15  = their pieces
+            # Linear is shared across all 80 squares.
+            self.piece_embed = nn.Linear(16, piece_embed_dim)
+            input_planes = self.INPUT_PLANES + piece_embed_dim
+        else:
+            input_planes = self.INPUT_PLANES
 
         # ── Input tower ─────────────────────────────────────────────────────────
-        self.input_conv = ConvBnRelu(self.INPUT_PLANES, num_channels, kernel=3, padding=1)
+        self.input_conv = ConvBnRelu(input_planes, num_channels, kernel=3, padding=1)
 
         # ── Residual tower ───────────────────────────────────────────────────────
         self.res_blocks = nn.ModuleList(
@@ -239,7 +299,8 @@ class CapablancaNet(nn.Module):
                 f"num_channels={num_channels} must be divisible by transformer_heads={transformer_heads}"
             self.transformer_blocks = nn.ModuleList([
                 TransformerBlock(num_channels, heads=transformer_heads,
-                                 board_h=self.BOARD_H, board_w=self.BOARD_W)
+                                 board_h=self.BOARD_H, board_w=self.BOARD_W,
+                                 qkv_bias=qkv_bias, use_rmsnorm=use_rmsnorm)
                 for _ in range(num_transformer_blocks)
             ])
         else:
@@ -363,6 +424,16 @@ class CapablancaNet(nn.Module):
             mlh_raw:       (batch, 1)     — raw, sigmoid applied in inference (None if enable_mlh=False)
             future_logits: (batch, 7000)  — raw logits for move at k+2 (None if enable_future=False)
         """
+        # Optional piece embedding: project the 16 current-position piece planes
+        # per-square to piece_embed_dim and concatenate with the raw input.
+        if self.piece_embed_dim > 0:
+            # x is (B, 139, 8, 10). Take planes 0..15 (current our + their),
+            # move to (B, 8, 10, 16), project to (B, 8, 10, E), put back.
+            pieces = x[:, :16].permute(0, 2, 3, 1).contiguous()       # (B, 8, 10, 16)
+            emb = self.piece_embed(pieces)                            # (B, 8, 10, E)
+            emb = emb.permute(0, 3, 1, 2).contiguous()                # (B, E, 8, 10)
+            x = torch.cat([x, emb], dim=1)                            # (B, 139+E, 8, 10)
+
         x = self.input_conv(x)
         for block in self.res_blocks:
             x = block(x)
@@ -423,9 +494,21 @@ def build_net_from_state_dict(raw_sd: dict):
     heads = rpb.shape[0] if rpb is not None else 8
     enable_mlh    = any(k.startswith("mlh_head.")    for k in sd)
     enable_future = any(k.startswith("future_head.") for k in sd)
+    # Detect BT5-style trim from the saved weights:
+    # - missing transformer_blocks.0.attn.qkv.bias → trained with qkv_bias=False
+    # - LN entries lack `.bias` (RMSNorm-only) → trained with use_rmsnorm=True
+    # - presence of `piece_embed.weight` → trained with piece embedding
+    qkv_bias = ("transformer_blocks.0.attn.qkv.bias" in sd) if tb > 0 else True
+    use_rmsnorm = (tb > 0
+                   and "transformer_blocks.0.ln1.weight" in sd
+                   and "transformer_blocks.0.ln1.bias" not in sd)
+    piece_embed_w = sd.get("piece_embed.weight")
+    piece_embed_dim = piece_embed_w.shape[0] if piece_embed_w is not None else 0
     net = CapablancaNet(num_channels=ch, num_res_blocks=bl,
                         num_transformer_blocks=tb, transformer_heads=heads,
-                        enable_mlh=enable_mlh, enable_future=enable_future)
+                        enable_mlh=enable_mlh, enable_future=enable_future,
+                        qkv_bias=qkv_bias, use_rmsnorm=use_rmsnorm,
+                        piece_embed_dim=piece_embed_dim)
     target = net.state_dict()
     sd = {k: v for k, v in sd.items() if k in target and v.shape == target[k].shape}
     return net, sd

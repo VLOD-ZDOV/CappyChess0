@@ -347,6 +347,9 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
         num_transformer_blocks=cfg.num_transformer_blocks,
         transformer_heads=cfg.transformer_heads,
         enable_future=cfg.enable_future,
+        qkv_bias=cfg.qkv_bias,
+        use_rmsnorm=cfg.use_rmsnorm,
+        piece_embed_dim=cfg.piece_embed_dim,
     ).to(device)
     lagged_net.load_state_dict(lagged_sd, strict=False)
     lagged_net.eval()
@@ -456,6 +459,13 @@ class Config:
     # Future move head (LC0 BT4-inspired): predicts our move 2 half-moves ahead.
     # Auxiliary task — improves planning representations in trunk. Not used at inference.
     enable_future: bool = True
+
+    # BT5-style trim. Defaults preserve the legacy architecture so existing
+    # checkpoints keep loading unchanged. Flip via CLI when starting a fresh
+    # run (or a distillation into a new architecture) to pick up the upgrade.
+    qkv_bias: bool = True            # False → drop QKV bias (~5% faster inference)
+    use_rmsnorm: bool = False        # True  → RMSNorm instead of LayerNorm
+    piece_embed_dim: int = 0         # >0    → per-square Linear(16 → N) added to input
 
     # Self-play
     simulations: int = 100
@@ -653,6 +663,78 @@ class ReplayBuffer:
         """Rebuild _val_arr from data after loading from pickle."""
         for i, s in enumerate(self.data):
             self._val_arr[i] = float(s[2])
+
+    def save_npz(self, path: str):
+        """Save the buffer as a numpy archive. ~5-10× faster than pickle on 1M
+        positions and produces a smaller file (float16 storage). The expensive
+        bit is the one-time np.stack across 1M boards; after that np.savez
+        writes contiguous blocks via a single OS write per array.
+
+        Layout: boards (N,planes,H,W) f16, sparse policy packed into a
+        rectangular (N, K) pair of (indices, values) with -1 / 0 padding,
+        plus three scalar arrays for value / mlh / future_idx and a tiny
+        meta vector with [ptr, full]. Saved atomically via a .tmp file
+        rename — a crash mid-write can't leave a half-written buffer."""
+        if not self.data:
+            return
+        n = len(self.data)
+        # Stack boards in one shot; numpy iterates through the list internally
+        # — still O(N) but in C, ~10× faster than pickle on the same data.
+        boards = np.stack([s[0] for s in self.data]).astype(np.float16, copy=False)
+        # Sparse policy is ragged (one entry per legal move). Pad to the max
+        # length seen in this buffer so the result is a single dense array.
+        pol_idxs = [s[1][0] for s in self.data]
+        pol_vals = [s[1][1] for s in self.data]
+        max_k = max((len(x) for x in pol_idxs), default=0)
+        pol_idx_arr = np.full((n, max_k), -1, dtype=np.int16)
+        pol_val_arr = np.zeros((n, max_k), dtype=np.float16)
+        for i, (idxs, vals) in enumerate(zip(pol_idxs, pol_vals)):
+            k = len(idxs)
+            if k:
+                pol_idx_arr[i, :k] = idxs
+                pol_val_arr[i, :k] = vals
+        values  = np.fromiter((float(s[2]) for s in self.data),
+                              dtype=np.float16, count=n)
+        mlhs    = np.fromiter((float(s[3]) if len(s) > 3 else 0.0 for s in self.data),
+                              dtype=np.float16, count=n)
+        futures = np.fromiter((int(s[4]) if len(s) > 4 else -1 for s in self.data),
+                              dtype=np.int32, count=n)
+        meta = np.array([self._ptr, int(self._full)], dtype=np.int64)
+
+        # np.savez auto-appends `.npz` to the path it gets. Pass a base name
+        # without extension and rename the real file to the target path.
+        tmp_base = path + ".tmp"
+        np.savez(tmp_base, boards=boards,
+                 pol_idx=pol_idx_arr, pol_val=pol_val_arr,
+                 values=values, mlhs=mlhs, futures=futures, meta=meta)
+        os.replace(tmp_base + ".npz", path)
+
+    def load_npz(self, path: str):
+        """Reverse of save_npz — rebuilds the list-of-tuples representation."""
+        z = np.load(path)
+        boards   = z["boards"]
+        pol_idx  = z["pol_idx"]
+        pol_val  = z["pol_val"]
+        values   = z["values"]
+        mlhs     = z["mlhs"]
+        futures  = z["futures"]
+        meta     = z["meta"]
+        self._ptr  = int(meta[0]) % self.max_size
+        self._full = bool(meta[1])
+        n = boards.shape[0]
+        self.data = []
+        for i in range(n):
+            mask = pol_idx[i] >= 0
+            sp_idx = pol_idx[i][mask].astype(np.int16, copy=False)
+            sp_val = pol_val[i][mask].astype(np.float16, copy=False)
+            self.data.append((
+                boards[i],
+                (sp_idx, sp_val),
+                float(values[i]),
+                float(mlhs[i]),
+                int(futures[i]),
+            ))
+        self.rebuild_val_arr()
 
     def sample(self, batch_size: int) -> List[Sample]:
         n = len(self.data)
@@ -1036,37 +1118,34 @@ def value_to_wdl(v: float) -> np.ndarray:
     return np.array([p_win, p_draw, p_loss], dtype=np.float32)
 
 
-class SelfPlayDataset(torch.utils.data.Dataset):
-    def __init__(self, samples: List[CompactSample]):
-        boards_np = np.stack([s[0].astype(np.float32) for s in samples]).reshape(
-            -1, CapablancaNet.INPUT_PLANES, CapablancaNet.BOARD_H, CapablancaNet.BOARD_W
-        )
-        policies_np = np.stack([unpack_policy(s[1]) for s in samples])
-        wdl_np = np.stack([value_to_wdl(float(s[2])) for s in samples])
-        mlh_np = np.array(
-            [float(s[3]) if len(s) > 3 else 0.0 for s in samples],
-            dtype=np.float32,
-        )
-        future_np = np.array(
-            [int(s[4]) if len(s) > 4 else -1 for s in samples],
-            dtype=np.int64,
-        )
-        # One-shot numpy→torch conversion. Avoids per-sample torch.from_numpy in
-        # __getitem__: with pin_memory=True the DataLoader then pages one contiguous
-        # batch instead of pinning each tiny tensor separately — major win on large
-        # buffers where the per-sample overhead used to starve the GPU.
-        self.boards   = torch.from_numpy(boards_np).contiguous()
-        self.policies = torch.from_numpy(policies_np).contiguous()
-        self.wdl      = torch.from_numpy(wdl_np).contiguous()
-        self.mlh      = torch.from_numpy(mlh_np).contiguous()
-        self.future   = torch.from_numpy(future_np).contiguous()
+def _collate_batch(samples: List[CompactSample]):
+    """Pack a small list of samples into batched tensors.
 
-    def __len__(self):
-        return self.wdl.shape[0]
-
-    def __getitem__(self, idx):
-        return (self.boards[idx], self.policies[idx], self.wdl[idx],
-                self.mlh[idx], self.future[idx])
+    Called once per training step on a freshly drawn 256-ish batch — no
+    pre-stacking of the entire training run. Used to be a SelfPlayDataset
+    that pre-stacked `train_steps * batch_size` samples up front; on the
+    1M buffer that pre-stack peaked at ~70 GB RAM and silently dropped
+    the process into swap. The lazy variant keeps RAM at a few MB."""
+    boards_np = np.stack([s[0].astype(np.float32) for s in samples]).reshape(
+        -1, CapablancaNet.INPUT_PLANES, CapablancaNet.BOARD_H, CapablancaNet.BOARD_W
+    )
+    policies_np = np.stack([unpack_policy(s[1]) for s in samples])
+    wdl_np = np.stack([value_to_wdl(float(s[2])) for s in samples])
+    mlh_np = np.array(
+        [float(s[3]) if len(s) > 3 else 0.0 for s in samples],
+        dtype=np.float32,
+    )
+    future_np = np.array(
+        [int(s[4]) if len(s) > 4 else -1 for s in samples],
+        dtype=np.int64,
+    )
+    return (
+        torch.from_numpy(boards_np),
+        torch.from_numpy(policies_np),
+        torch.from_numpy(wdl_np),
+        torch.from_numpy(mlh_np),
+        torch.from_numpy(future_np),
+    )
 
 
 # ── Training step ─────────────────────────────────────────────────────────────
@@ -1081,27 +1160,21 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
     """
     net.train()
 
-    max_steps_by_buffer = len(buffer) // cfg.batch_size
-    effective_steps = max(cfg.min_train_steps,
-                          min(cfg.train_steps, max_steps_by_buffer))
+    # With lazy sampling we can do as many steps as requested — each step draws
+    # an independent random batch from the buffer. The "1 epoch" cap that used
+    # to apply when we pre-stacked everything is no longer meaningful here.
+    effective_steps = max(cfg.min_train_steps, cfg.train_steps)
+    # Give a heads-up if requested steps × batch_size exceeds the buffer many
+    # times over — that's a sign of likely overfit on a small buffer.
+    coverage = (effective_steps * cfg.batch_size) / max(1, len(buffer))
+    if coverage > 1.0:
+        print(f"  ℹ️  Буфер {len(buffer):,} поз × ~{coverage:.1f} проходов "
+              f"({effective_steps} шагов × batch {cfg.batch_size})")
 
-    if max_steps_by_buffer < cfg.train_steps:
-        print(f"  ℹ️  Буфер {len(buffer):,} поз → {effective_steps} шагов "
-              f"(ограничено 1 эпохой, потолок {cfg.train_steps})")
-
-    samples = buffer.sample_balanced(effective_steps * cfg.batch_size)
-    dataset = SelfPlayDataset(samples)
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        # SelfPlayDataset — pure in-memory numpy. num_workers>0 = fork processes
-        # and IPC serialization for each batch → overhead with no benefit (no I/O).
-        num_workers=0,
-        pin_memory=True,
-        drop_last=True,
-    )
-
+    # Lazy per-step sampling: at each training step draw a fresh balanced batch
+    # of batch_size samples and collate to GPU tensors. With a 1M buffer and
+    # 4000 steps this keeps the RAM footprint at ~10 MB per step instead of
+    # the ~70 GB pre-stack that used to push the process into swap.
     total_loss = 0.0
     total_policy_loss = 0.0
     total_value_loss = 0.0
@@ -1109,9 +1182,9 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
     total_future_loss = 0.0
     steps = 0
 
-    for boards, policies, values, mlh_targets, future_targets in loader:
-        if steps >= effective_steps:
-            break
+    for step_idx in range(effective_steps):
+        samples = buffer.sample_balanced(cfg.batch_size)
+        boards, policies, values, mlh_targets, future_targets = _collate_batch(samples)
 
         boards = boards.to(device, non_blocking=True,
                            memory_format=torch.channels_last)
@@ -1164,17 +1237,16 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
         # bfloat16 has the same exponent range as fp32 — GradScaler is not needed
         # and dangerous (the continue below would break scaler.update() state machine).
         loss.backward()
-        # Check NaN/Inf in gradients — guard against gradient explosion
-        grad_ok = True
-        for p in net.parameters():
-            if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
-                grad_ok = False
-                break
-        if not grad_ok:
+        # Gradient-explosion guard. clip_grad_norm_ already walks every parameter
+        # in C++ and returns the global L2 grad norm; if any gradient is NaN/Inf
+        # that norm is non-finite. Checking the returned scalar is ONE device→host
+        # sync. The old per-parameter `.any()` loop forced one sync per tensor —
+        # hundreds of syncs per step on an 84M-param net, a real throughput tax.
+        total_norm = nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        if not torch.isfinite(total_norm):
             print("  ⚠️  NaN/Inf в градиентах — пропускаем шаг")
             optimizer.zero_grad(set_to_none=True)
             continue
-        nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         optimizer.step()
         # EMA per-step (LC0/AlphaZero-style). With decay=0.999 and ~900 steps/iter
         # by end of iteration 10 EMA will have 9000 updates → decay^9000 ≈ 1e-4 →
@@ -1182,30 +1254,34 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
         if ema is not None:
             ema.update(net)
 
-        total_loss += loss.item()
-        total_policy_loss += policy_loss.item()
-        total_value_loss += value_loss.item()
-        total_mlh_loss += float(mlh_loss.item())
-        total_future_loss += float(future_loss.item())
+        # Accumulate on-GPU (detached) — no per-step sync. The running averages
+        # are only materialised to the host every `log_every` steps (below) and
+        # once at the end, instead of 5 `.item()` syncs on every single step.
+        total_loss += loss.detach()
+        total_policy_loss += policy_loss.detach()
+        total_value_loss += value_loss.detach()
+        total_mlh_loss += mlh_loss.detach()
+        total_future_loss += future_loss.detach()
         steps += 1
 
         if steps % cfg.log_every == 0:
-            avg_p = total_policy_loss / steps
-            avg_v = total_value_loss / steps
-            avg_m = total_mlh_loss / steps
-            avg_f = total_future_loss / steps
-            avg_t = total_loss / steps
+            avg_p = float(total_policy_loss) / steps
+            avg_v = float(total_value_loss) / steps
+            avg_m = float(total_mlh_loss) / steps
+            avg_f = float(total_future_loss) / steps
+            avg_t = float(total_loss) / steps
             print(f"    step {steps:4d}/{effective_steps} | "
                   f"policy_loss={avg_p:.4f}  value_loss={avg_v:.4f}  "
                   f"mlh_loss={avg_m:.4f}  future_loss={avg_f:.4f}  total={avg_t:.4f}")
 
     n = max(steps, 1)
+    # float() materialises the on-GPU accumulators to the host exactly once here.
     return {
-        "loss": total_loss / n,
-        "policy_loss": total_policy_loss / n,
-        "value_loss": total_value_loss / n,
-        "mlh_loss": total_mlh_loss / n,
-        "future_loss": total_future_loss / n,
+        "loss": float(total_loss) / n,
+        "policy_loss": float(total_policy_loss) / n,
+        "value_loss": float(total_value_loss) / n,
+        "mlh_loss": float(total_mlh_loss) / n,
+        "future_loss": float(total_future_loss) / n,
         "steps": steps,
     }
 
@@ -1235,6 +1311,9 @@ def train(cfg: Config = None):
         num_transformer_blocks=cfg.num_transformer_blocks,
         transformer_heads=cfg.transformer_heads,
         enable_future=cfg.enable_future,
+        qkv_bias=cfg.qkv_bias,
+        use_rmsnorm=cfg.use_rmsnorm,
+        piece_embed_dim=cfg.piece_embed_dim,
     ).to(device)
     net = net.to(memory_format=torch.channels_last)
 
@@ -1306,13 +1385,23 @@ def train(cfg: Config = None):
     curriculum_winrate_history: List[float] = []
     lagged_pool = LaggedOpponentPool(max_snapshots=cfg.lag_opponent_pool_size)
 
-    buffer_path = os.path.join(cfg.checkpoint_dir, "buffer.pkl")
-    if os.path.exists(buffer_path):
+    # Prefer the new numpy archive (fast); fall back to legacy pickle only if
+    # no npz exists. Old .pkl files are migrated implicitly on the next save.
+    buffer_path     = os.path.join(cfg.checkpoint_dir, "buffer.npz")
+    buffer_path_pkl = os.path.join(cfg.checkpoint_dir, "buffer.pkl")
+    load_path = buffer_path if os.path.exists(buffer_path) else (
+        buffer_path_pkl if os.path.exists(buffer_path_pkl) else None)
+    if load_path:
         try:
-            with open(buffer_path, "rb") as f:
-                buffer.data, buffer._ptr, buffer._full = pickle.load(f)
-            # Sanitize after load: _ptr and _full may have been saved with a different max_size.
-            # If data > max_size — trim to max_size (keep the most recent).
+            t_load = time.time()
+            if load_path.endswith(".npz"):
+                buffer.load_npz(load_path)
+            else:
+                with open(load_path, "rb") as f:
+                    buffer.data, buffer._ptr, buffer._full = pickle.load(f)
+                buffer.rebuild_val_arr()
+            # Sanitize after load: _ptr / _full may have been saved with a
+            # different max_size. Trim oldest if buffer overshot.
             if len(buffer.data) > buffer.max_size:
                 buffer.data = list(buffer.data[-buffer.max_size:])
                 buffer._full = True
@@ -1323,8 +1412,10 @@ def train(cfg: Config = None):
             else:
                 buffer._full = False
                 buffer._ptr  = len(buffer.data) % buffer.max_size
-            buffer.rebuild_val_arr()
-            print(f"📦 Загружен буфер: {len(buffer):,} позиций\n")
+            elapsed = time.time() - t_load
+            kind = "npz" if load_path.endswith(".npz") else "pkl (legacy)"
+            print(f"📦 Загружен буфер: {len(buffer):,} позиций "
+                  f"({kind}, {elapsed:.1f}s)\n")
         except Exception as e:
             print(f"⚠️  Не удалось загрузить буфер: {e}\n")
 
@@ -1691,9 +1782,15 @@ def train(cfg: Config = None):
                 print(f"  💾 {os.path.basename(path)}")
 
             try:
-                with open(buffer_path, "wb") as f:
-                    pickle.dump((buffer.data, buffer._ptr, buffer._full), f)
-                print(f"  💾 Буфер сохранён ({len(buffer):,} позиций)\n")
+                t_save = time.time()
+                buffer.save_npz(buffer_path)
+                # Drop the legacy pickle file if it's still around — saves disk
+                # and removes ambiguity on the next load.
+                if os.path.exists(buffer_path_pkl):
+                    try: os.remove(buffer_path_pkl)
+                    except OSError: pass
+                print(f"  💾 Буфер сохранён ({len(buffer):,} позиций, "
+                      f"{time.time() - t_save:.1f}s)\n")
             except Exception as e:
                 print(f"  ⚠️  Не удалось сохранить буфер: {e}\n")
 
@@ -1715,6 +1812,19 @@ if __name__ == "__main__":
                         default=True, help="Отключить Moves-Left-Head.")
     parser.add_argument("--no-future",          dest="enable_future", action="store_false",
                         default=True, help="Отключить Future Move Head.")
+    parser.add_argument("--no-qkv-bias", dest="qkv_bias", action="store_false",
+                        default=True,
+                        help="BT5: убрать bias из QKV-проекций (~5%% быстрее inference, "
+                             "без потерь качества). НЕ совместимо со старыми чекпоинтами — "
+                             "включать только при дистилляции в новую архитектуру.")
+    parser.add_argument("--rmsnorm", dest="use_rmsnorm", action="store_true",
+                        default=False,
+                        help="BT5: использовать RMSNorm вместо LayerNorm (без centering и bias). "
+                             "Парная фича с --no-qkv-bias.")
+    parser.add_argument("--piece-embed-dim", type=int, default=0,
+                        help="BT3 trick: per-square Linear(16 → N) от plane piece-планов, "
+                             "конкатенируется к input. 0 = выключено. 32 — рекомендуемое значение. "
+                             "Только при тренировке новой архитектуры (ломает старые чекпоинты).")
     parser.add_argument("--simulations",         type=int,   default=100,
                         help="Полные симуляции (для PCR — больше fast_simulations, обучается на этих позициях)")
     parser.add_argument("--fast-simulations",     type=int,   default=80,
@@ -1855,12 +1965,13 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Reset buffer if requested
+    # Reset buffer if requested — drop both legacy pickle and new npz form.
     if args.reset_buffer:
-        buffer_path = os.path.join(args.checkpoint_dir, "buffer.pkl")
-        if os.path.exists(buffer_path):
-            os.remove(buffer_path)
-            print("🗑️  Буфер сброшен\n")
+        for fname in ("buffer.npz", "buffer.pkl"):
+            p = os.path.join(args.checkpoint_dir, fname)
+            if os.path.exists(p):
+                os.remove(p)
+        print("🗑️  Буфер сброшен\n")
 
     cfg = Config(
         num_channels=args.channels,
@@ -1895,6 +2006,9 @@ if __name__ == "__main__":
         mlh_loss_weight=args.mlh_loss_weight,
         future_loss_weight=args.future_loss_weight,
         enable_future=args.enable_future,
+        qkv_bias=args.qkv_bias,
+        use_rmsnorm=args.use_rmsnorm,
+        piece_embed_dim=args.piece_embed_dim,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_only=args.pretrain_only,
         reset_scheduler=args.reset_scheduler,

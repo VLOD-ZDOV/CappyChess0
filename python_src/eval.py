@@ -79,32 +79,21 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
     """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     raw_sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
-    sd = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in raw_sd.items()}
 
-    # Architecture from weights. Restore EVERY structural knob — otherwise
-    # checkpoints trained with non-default transformer/heads/mlh/future quietly
-    # load through strict=False with garbage layers, and the eval ends up
-    # comparing two different networks. Mirrors export_onnx.py logic.
-    stem_key = next((k for k in sd if ("input_conv" in k or "input_block" in k)
-                     and k.endswith(".weight") and "bn" not in k and "bias" not in k), None)
-    ch = sd[stem_key].shape[0] if stem_key else 128
-    bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
-    tb = len({k.split(".")[1] for k in sd if k.startswith("transformer_blocks.")})
-    rpb = sd.get("transformer_blocks.0.attn.rpb.bias_table")
-    heads = rpb.shape[0] if rpb is not None else 8
-    enable_mlh    = any(k.startswith("mlh_head.")    for k in sd)
-    enable_future = any(k.startswith("future_head.") for k in sd)
+    # Use the canonical helper from model.py — it knows about ALL architecture
+    # knobs (channels, res blocks, transformer, heads, mlh, future, AND the
+    # BT5 trim: qkv_bias / use_rmsnorm / piece_embed_dim). Inline logic here
+    # used to ignore the BT5 flags → checkpoints trained with them loaded into
+    # a default net with random qkv.bias / ln.bias / no piece_embed, ruining
+    # the transformer blocks and giving meaningless eval results.
+    from model import build_net_from_state_dict
+    net, sd = build_net_from_state_dict(raw_sd)
+    # Track shape-mismatch drops for the arch_tag warning below.
+    full_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
+               for k, v in raw_sd.items()}
+    skipped = [k for k in full_sd if k not in sd]
 
-    net = CapablancaNet(num_channels=ch, num_res_blocks=bl,
-                        num_transformer_blocks=tb, transformer_heads=heads,
-                        enable_mlh=enable_mlh, enable_future=enable_future)
-
-    # Filter layers with incompatible shapes (scalar↔WDL transition)
-    target = net.state_dict()
-    skipped = [k for k in sd if k in target and sd[k].shape != target[k].shape]
-    for k in skipped: del sd[k]
-
-    net.load_state_dict(sd, strict=False)
+    result = net.load_state_dict(sd, strict=False)
     net.to(device).eval()
     net = net.to(memory_format=torch.channels_last)
 
