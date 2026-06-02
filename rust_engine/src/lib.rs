@@ -321,6 +321,11 @@ impl Board {
             // K+N+N vs K — two knights cannot force mate without assistance
             (2, 0) if w_knights == 2 => true,
             (0, 2) if b_knights == 2 => true,
+            // K+B+B vs K with both bishops on the SAME square-colour — they cover
+            // only one colour complex, the bare king hides on the other → draw.
+            // (Opposite-colour bishops CAN mate, so they fall through to `false`.)
+            (2, 0) if w_bishops == 2 && bishops_same_color(self.pieces[0][BISHOP]) => true,
+            (0, 2) if b_bishops == 2 && bishops_same_color(self.pieces[1][BISHOP]) => true,
             // K+1 vs K+1 — bishops and knights can't mate each other
             (1, 1) => true,
             // Everything else — mate is theoretically possible
@@ -367,6 +372,18 @@ impl Board {
             }
         }
     }
+}
+
+/// True if every bishop in `bb` stands on the same square colour (all light or all
+/// dark). Square colour for the 10-wide board = (rank + file) parity, rank = sq/10,
+/// file = sq%10. Empty / single-bishop sets trivially count as "same colour".
+fn bishops_same_color(bb: BB) -> bool {
+    let mut light = 0u32;
+    let mut dark = 0u32;
+    for sq in bb_iter(bb) {
+        if ((sq / 10 + sq % 10) & 1) == 0 { dark += 1; } else { light += 1; }
+    }
+    light == 0 || dark == 0
 }
 
 fn add_pawn_move(from: u32, to: u32, us: usize, moves: &mut Vec<(u32, u32, Option<usize>)>) {
@@ -424,7 +441,20 @@ pub const TOTAL_INPUT_PLANES: usize = HISTORY_LEN * PLANES_PER_BOARD + META_PLAN
 /// `rep_flags[i]` = whether position i is a repetition.
 fn boards_to_tensor(history: &[Board], rep_flags: &[bool],
                     current_side: usize, halfmove: u32, castling: u8) -> Vec<f32> {
-    let mut t = vec![0.0f32; TOTAL_INPUT_PLANES * 80];
+    let mut out = Vec::new();
+    boards_to_tensor_into(&mut out, history, rep_flags, current_side, halfmove, castling);
+    out
+}
+
+/// Same encoding as `boards_to_tensor`, but appends one position's planes
+/// directly onto `out` (a reusable batch buffer) instead of allocating a fresh
+/// Vec + memcpy per leaf. Hot path: `collect_leaves_into_buf`.
+fn boards_to_tensor_into(out: &mut Vec<f32>, history: &[Board], rep_flags: &[bool],
+                         current_side: usize, halfmove: u32, castling: u8) {
+    // Sparse writes below rely on the region being zero-initialised first.
+    let base0 = out.len();
+    out.resize(base0 + TOTAL_INPUT_PLANES * 80, 0.0);
+    let t = &mut out[base0..];
     let do_flip = current_side == 1;
 
     for h in 0..HISTORY_LEN {
@@ -460,7 +490,6 @@ fn boards_to_tensor(history: &[Board], rep_flags: &[bool],
     for i in 0..80 { t[hm_base + i] = hm; }
     let ones_base = (HISTORY_LEN * PLANES_PER_BOARD + 2) * 80;
     for i in 0..80 { t[ones_base + i] = 1.0; }
-    t
 }
 
 // FIX: cache legal moves — for one position they are computed only once.
@@ -835,7 +864,109 @@ mod tests {
         b.pieces[0][PAWN] = 1u128 << 10;
         assert!(!b.is_insufficient_material(), "K+P vs K must NOT be draw");
 
+        // K+B+B (same colour, sq 2 & 4 both dark) vs K — draw
+        let mut b = kings_only();
+        b.pieces[0][BISHOP] = (1u128 << 2) | (1u128 << 4);
+        assert!(b.is_insufficient_material(), "K+B+B same-colour vs K must be draw");
+
+        // K+B+B (opposite colours, sq 2 dark & 3 light) vs K — NOT a draw
+        let mut b = kings_only();
+        b.pieces[0][BISHOP] = (1u128 << 2) | (1u128 << 3);
+        assert!(!b.is_insufficient_material(), "K+B+B opposite-colour vs K must NOT be draw");
+
         println!("✅ insufficient material: all cases correct");
+    }
+
+    // ── Virtual loss semantics ───────────────────────────────────────────────
+    // Convention check: node.wl is stored in the node's OWN side-to-move POV
+    // (backup gives the leaf +value, the parent -value). select() scores a child
+    // as `-child.q()` (negamax). Therefore a virtual loss — which must make an
+    // in-flight node LESS attractive to the parent doing the selecting — has to
+    // push `-child.q()` DOWN, i.e. push child.q() UP. If q() pushes the value the
+    // other way, parallel selects pile onto the SAME in-flight node instead of
+    // diverging, and the duplicate guard in collect_leaves drops them → the GPU
+    // batch is under-filled (fewer unique leaves than parallel_sims).
+    #[test]
+    fn test_virtual_loss_makes_node_worse_for_parent() {
+        let mut n = MctsNode::new(0, 0.5, 0, None);
+        n.visits = 10;
+        n.wl = 0.0; // neutral position
+        let parent_view_no_vloss = -n.q();
+        n.virtual_loss = VIRTUAL_LOSS_V;
+        let parent_view_with_vloss = -n.q();
+        println!(
+            "parent view  no_vloss={parent_view_no_vloss}  with_vloss={parent_view_with_vloss}"
+        );
+        assert!(
+            parent_view_with_vloss < parent_view_no_vloss,
+            "virtual loss must make a node LESS attractive to its parent \
+             (negamax: parent sees -q). no_vloss={parent_view_no_vloss}, \
+             with_vloss={parent_view_with_vloss}"
+        );
+    }
+
+    #[test]
+    fn test_virtual_loss_repels_selection() {
+        // Build root with two otherwise-identical, heavily-visited, neutral,
+        // UNEXPANDED leaf children A and B. With no virtual loss select() ties
+        // and takes children[0] (=A). After a virtual loss on A, a correct
+        // engine must steer the next select to B.
+        let mut mcts = SingleMcts::new(Board::start());
+        let root = mcts.root;
+        // dummy distinct moves; values don't matter, only that A==B statistically
+        let a = mcts.arena.add(MctsNode::new(1 << 10, 0.5, 1, Some(root)));
+        let b = mcts.arena.add(MctsNode::new(2 << 10, 0.5, 1, Some(root)));
+        for &ci in &[a, b] {
+            let c = mcts.arena.get_mut(ci);
+            c.visits = 1000;
+            c.wl = 0.0;
+        }
+        {
+            let r = mcts.arena.get_mut(root);
+            r.children = vec![a, b];
+            r.is_expanded = true;
+            r.visits = 2000;
+        }
+        let picked_no_vloss = mcts.select().expect("select should return a leaf");
+        assert_eq!(picked_no_vloss, a, "symmetric tie should take children[0]=A");
+
+        // Simulate A's subtree being in-flight.
+        mcts.apply_vloss(a, VIRTUAL_LOSS_V);
+        let picked_with_vloss = mcts.select().expect("select should return a leaf");
+        assert_eq!(
+            picked_with_vloss, b,
+            "after virtual loss on A, select must diverge to B (got A → vloss is not repelling)"
+        );
+    }
+
+    #[test]
+    fn test_select_considers_low_prior_proven_child() {
+        // A proven-winning child (c.upper == -1 → child is losing → parent wins,
+        // gets the +100 StickyEndgames boost) with a LOW prior sits AFTER higher-prior
+        // unvisited children in the prior-sorted list. select() must still pick it.
+        // The old early-exit (break after the first unvisited) skipped it entirely.
+        let mut mcts = SingleMcts::new(Board::start());
+        let root = mcts.root;
+        let high = mcts.arena.add(MctsNode::new(1 << 10, 0.6, 1, Some(root))); // unvisited, top prior
+        let mid  = mcts.arena.add(MctsNode::new(2 << 10, 0.3, 1, Some(root))); // unvisited
+        let proven = mcts.arena.add(MctsNode::new(3 << 10, 0.1, 1, Some(root))); // visited, proven win
+        {
+            let p = mcts.arena.get_mut(proven);
+            p.visits = 5;
+            p.wl = 0.0;
+            p.upper = -1; // proven losing for the child ⇒ winning for the parent
+        }
+        {
+            let r = mcts.arena.get_mut(root);
+            r.children = vec![high, mid, proven]; // already prior-desc sorted
+            r.is_expanded = true;
+            r.visits = 10;
+        }
+        let picked = mcts.select().expect("select should return a leaf");
+        assert_eq!(
+            picked, proven,
+            "select must pick the proven-winning low-prior child, not a higher-prior unvisited one"
+        );
     }
 }
 
@@ -912,10 +1043,17 @@ impl MctsNode {
             position_hash: 0,
         }
     }
+    // wl is stored in this node's OWN side-to-move POV, and select() scores a
+    // child as `-child.q()` (negamax). A virtual loss must make the in-flight
+    // node LESS attractive to the parent — i.e. push `-q` DOWN, i.e. push q UP.
+    // So each virtual visit counts as a WIN (+1) in the node's own POV: a win
+    // for this side is a loss for the parent doing the selecting. Subtracting
+    // here (the old code) did the opposite and made parallel selects collapse
+    // onto the same in-flight leaf, under-filling the GPU batch.
     fn q(&self) -> f32 {
         if self.virtual_loss > 0 {
             let total = self.visits + self.virtual_loss;
-            if total > 0 { (self.wl * self.visits as f32 - self.virtual_loss as f32) / total as f32 }
+            if total > 0 { (self.wl * self.visits as f32 + self.virtual_loss as f32) / total as f32 }
             else { 0.0 }
         } else {
             self.wl
@@ -924,13 +1062,14 @@ impl MctsNode {
 
     // Q biased by a contempt factor on the running draw probability.
     // Q_eff = wl + c * d (per-visit averages). vloss correction matches q():
-    // visits scale up the biased Q, then we subtract vloss and divide by (visits + vloss).
+    // visits scale up the biased Q, then we add vloss (virtual win in own POV)
+    // and divide by (visits + vloss).
     fn q_with_contempt(&self, contempt: f32) -> f32 {
         if contempt == 0.0 { return self.q(); }
         let biased = self.wl + contempt * self.d;
         if self.virtual_loss > 0 {
             let total = self.visits + self.virtual_loss;
-            if total > 0 { (biased * self.visits as f32 - self.virtual_loss as f32) / total as f32 }
+            if total > 0 { (biased * self.visits as f32 + self.virtual_loss as f32) / total as f32 }
             else { 0.0 }
         } else {
             biased
@@ -1246,14 +1385,25 @@ impl SingleMcts {
             let parent_m = self.arena.get(idx).m;
             let m_active = parent_q.abs() > M_THRESHOLD;
 
-            // Early-exit after seeing first unvisited child: children are sorted by prior
-            // descending (SortEdges in expand), so the first unvisited is always the
-            // best unvisited. After it, one more step finds second-best; then we stop.
-            let mut can_exit = false;
+            // Children are sorted by prior descending (SortEdges in expand). Among
+            // UNVISITED children fpu is constant, so score = fpu + cpuct*prior*sqrt_n
+            // is monotone in prior → the first unvisited we meet already dominates all
+            // later unvisited ones, and we can skip the unvisited tail. But VISITED
+            // children can sit anywhere in the sorted order (visits accrue over time,
+            // tree reuse, etc.) and may carry a decisive bounds bias (±100) or M-utility
+            // despite a low prior — so they must ALL be scored. The old code broke after
+            // the first unvisited child and could miss a proven-winning low-prior child
+            // (c.upper==-1, +100), defeating the StickyEndgames redirect.
+            let mut seen_unvisited = false;
             for ci_pos in 0..n_ch {
                 let ci = self.arena.get(idx).children[ci_pos];
                 let c = self.arena.get(ci);
                 let started = c.visits + c.virtual_loss;
+                if started == 0 {
+                    // later unvisited children have ≤ prior → can't beat this one
+                    if seen_unvisited { continue; }
+                    seen_unvisited = true;
+                }
                 // Negamax: child.q() in child's POV. Negate to get parent's POV.
                 // Contempt biases Q toward/away from draws — 0.0 means standard MCTS.
                 let q_val = if started > 0 { -c.q_with_contempt(self.contempt) } else { fpu };
@@ -1274,8 +1424,6 @@ impl SingleMcts {
                     score += m_util;
                 }
                 if !score.is_nan() && score > best { best = score; best_ci = ci; }
-                if can_exit { break; }
-                if started == 0 { can_exit = true; }
             }
             idx = best_ci;
         }
@@ -1538,11 +1686,10 @@ impl SingleMcts {
                 if !history.is_empty() && self.rep_count_at_leaf(leaf, &leaf_board) >= 2 {
                     rep_flags[0] = true;
                 }
-                let tensor = boards_to_tensor(
-                    &history, &rep_flags,
+                boards_to_tensor_into(
+                    &mut self.leaf_tensor_buf, &history, &rep_flags,
                     leaf_board.side, leaf_board.halfmove_clock, leaf_board.castling,
                 );
-                self.leaf_tensor_buf.extend_from_slice(&tensor);
                 self.pending_boards.push(leaf_board);
                 self.pending.push(leaf);
                 count += 1;
@@ -1551,61 +1698,9 @@ impl SingleMcts {
         count
     }
 
-    // Old version — kept for compatibility
-    fn collect_leaves(&mut self, parallel: usize, _rng: &mut u64) -> Vec<Vec<f32>> {
-        self.pending.clear();
-        self.pending_boards.clear();
-        let mut tensors = Vec::new();
-        for _ in 0..parallel {
-            if let Some(leaf) = self.select() {
-                if self.arena.get(leaf).is_terminal { continue; }
-                self.apply_vloss(leaf, VIRTUAL_LOSS_V);
-                let (leaf_board, history) = self.board_with_history_at(leaf);
-                let mut rep_flags = vec![false; history.len()];
-                if !history.is_empty() && self.rep_count_at_leaf(leaf, &leaf_board) >= 2 {
-                    rep_flags[0] = true;
-                }
-                tensors.push(boards_to_tensor(
-                    &history, &rep_flags,
-                    leaf_board.side, leaf_board.halfmove_clock, leaf_board.castling,
-                ));
-                self.pending_boards.push(leaf_board);
-                self.pending.push(leaf);
-            }
-        }
-        tensors
-    }
-
-    fn apply_inference(&mut self, policies: &[Vec<f32>], values: &[f32], draws: &[f32], mlhs: &[f32], rng: &mut u64) {
-        let pending = std::mem::take(&mut self.pending);
-        let boards  = std::mem::take(&mut self.pending_boards);
-        for (i, leaf) in pending.into_iter().enumerate() {
-            if i >= policies.len() { break; }
-            self.apply_vloss(leaf, -VIRTUAL_LOSS_V);
-            let is_root = leaf == self.root && self.add_dirichlet;
-            let was_unexpanded = !self.arena.get(leaf).is_expanded;
-            if was_unexpanded {
-                if let Some(board) = boards.get(i) {
-                    self.expand(leaf, board, &policies[i], is_root, rng);
-                }
-            }
-            // Terminal: expand already set wl/d/bounds. m_terminal = 0 (game already over).
-            // Non-terminal: use NN value/draw/mlh. mlh from net ∈ [0,1] → multiply by NORM=200 → PLY.
-            let leaf_terminal = self.arena.get(leaf).is_terminal;
-            let (v, d, m_ply) = if leaf_terminal {
-                let n = self.arena.get(leaf);
-                (n.wl, n.d, 0.0_f32)  // terminal = 0 plies remaining
-            } else {
-                let dv = if i < draws.len() { draws[i].clamp(0.0, 1.0) } else { 0.0 };
-                let mv = if i < mlhs.len() { mlhs[i].clamp(0.0, 1.0) * MLH_PLY_NORM } else { 0.0 };
-                (values[i], dv, mv)
-            };
-            self.backup(leaf, v, d, m_ply);
-            if was_unexpanded && leaf_terminal {
-                self.propagate_bounds_from(leaf);
-            }
-        }
-    }
+    // Inference results are applied via the flat-slice path below; the old
+    // Vec<Vec<f32>>-based collect_leaves / apply_inference pair was unused
+    // (Python drives the buffered flat path) and has been removed.
 
     // Version without Vec<Vec<f32>> — accepts flat policy slice
     fn apply_inference_flat(&mut self, pol_flat: &[f32], policy_size: usize,
@@ -1822,13 +1917,6 @@ impl SingleMcts {
                             }
 }
 
-/// BatchState stores leaf_counts together with batch data.
-/// This allows double-buffering to apply policies to the correct batch —
-/// self.leaf_counts is overwritten by the next collect_leaves, but BatchState is not.
-struct BatchState {
-    leaf_counts: Vec<usize>,
-}
-
 /// RustMCTS — batched MCTS for N games simultaneously.
 #[pyclass]
 pub struct RustMCTS {
@@ -1837,7 +1925,6 @@ pub struct RustMCTS {
     rng: u64,
     leaf_game_map: Vec<usize>,
     leaf_counts: Vec<usize>,
-    prev_batch: Option<BatchState>,  // for correct double-buffering
 }
 
 #[pymethods]
@@ -1856,7 +1943,7 @@ impl RustMCTS {
             .wrapping_mul(0x9e3779b97f4a7c15)
             .wrapping_add(0xbf58476d1ce4e5b9);
         RustMCTS { games, parallel_sims, rng: seed,
-            leaf_game_map: Vec::new(), leaf_counts: Vec::new(), prev_batch: None }
+            leaf_game_map: Vec::new(), leaf_counts: Vec::new() }
     }
 
     /// Set the contempt factor on every per-game MCTS. 0.0 = standard play.
@@ -1905,10 +1992,9 @@ impl RustMCTS {
             flat.extend_from_slice(&game.leaf_tensor_buf);
         }
 
-        // Save leaf_counts of THIS batch to prev_batch BEFORE overwriting self.leaf_counts.
-        // apply_inference_buffered takes counts from Python (passed after collect_leaves),
-        // so policies always go to the correct games in double-buffering.
-        self.prev_batch = Some(BatchState { leaf_counts: new_counts.clone() });
+        // Python reads these counts via get_current_batch_counts() right after
+        // collect_leaves and passes them back into apply_inference_buffered, so
+        // policies always land on the correct games even with double-buffering.
         self.leaf_counts = new_counts;
 
         // Single tensor size = TOTAL_INPUT_PLANES * 80 (139 * 80 = 11120 with history planes).
