@@ -22,8 +22,11 @@ fn not_file_j() -> BB { !file_mask(9) & BOARD_MASK }
 // Speeds up gen_pseudo_legal by 2-3x: no mask recomputation on each call.
 use std::sync::OnceLock;
 
-static KNIGHT_ATTACKS: OnceLock<[BB; 80]> = OnceLock::new();
-static KING_ATTACKS:   OnceLock<[BB; 80]> = OnceLock::new();
+// Single OnceLock for the pair: init_attack_tables() computes BOTH knight and
+// king tables in one pass, so storing them together avoids running the whole
+// init twice (separate locks made knight_attacks/king_attacks each trigger a
+// full recompute of both). One-time startup cost, but cleaner and free.
+static ATTACK_TABLES: OnceLock<([BB; 80], [BB; 80])> = OnceLock::new();
 
 fn init_attack_tables() -> ([BB; 80], [BB; 80]) {
     let mut knights = [0u128; 80];
@@ -53,8 +56,7 @@ fn init_attack_tables() -> ([BB; 80], [BB; 80]) {
 }
 
 fn knight_attacks(sq: u32) -> BB {
-    let tables = KNIGHT_ATTACKS.get_or_init(|| init_attack_tables().0);
-    tables[sq as usize]
+    ATTACK_TABLES.get_or_init(init_attack_tables).0[sq as usize]
 }
 
 fn ray_attacks(sq: u32, occupancy: BB, delta: i32) -> BB {
@@ -84,8 +86,7 @@ fn archbishop_attacks(sq: u32, occ: BB) -> BB { bishop_attacks(sq, occ) | knight
 fn chancellor_attacks(sq: u32, occ: BB) -> BB { rook_attacks(sq, occ) | knight_attacks(sq) }
 
 fn king_attacks(sq: u32) -> BB {
-    let tables = KING_ATTACKS.get_or_init(|| init_attack_tables().1);
-    tables[sq as usize]
+    ATTACK_TABLES.get_or_init(init_attack_tables).1[sq as usize]
 }
 
 fn white_pawn_attacks(pawns: BB) -> BB { ((pawns & not_file_j()) << 11) | ((pawns & not_file_a()) << 9) } // FIX: pre-shift masks
@@ -789,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_startpos_legal_moves() {
-        let mut board = Board::start();
+        let board = Board::start();
         let legal = board.gen_legal();
         // In Capablanca starting position: 10 pawn moves + 4 knight moves + 4 archbishop/chancellor moves
         // Exact count depends on rules, but should be > 20
@@ -1133,8 +1134,6 @@ struct SingleMcts {
     // root_history[0] = root_board, [1..] = moves BACKWARD from root (up to HISTORY_LEN-1 entries).
     // During leaf-walk we collect history by prepending new positions.
     root_history: Vec<Board>,
-    // Reusable buffer for collect_leaves — no allocations per step
-    leaf_tensor_buf: Vec<f32>,
     // KLD-early-exit: snapshot of previous root visits distribution.
     // Vec<(move_int, visits)>. None if no snapshot yet (or after root reset).
     // Computed in Rust to avoid marshalling 7000-vector to Python every 2 MCTS steps.
@@ -1174,6 +1173,7 @@ fn compute_board_hash(b: &Board) -> u64 {
 impl SingleMcts {
     fn board_hash(b: &Board) -> u64 { compute_board_hash(b) }
 
+    #[cfg(test)]
     fn new(board: Board) -> Self {
         Self::new_with_history(board.clone(), vec![board])
     }
@@ -1184,13 +1184,11 @@ impl SingleMcts {
         let mut arena = Arena::new(8192);
         let root = arena.add(MctsNode::new(0, 1.0, side, None));
         arena.get_mut(root).position_hash = initial_hash;  // root always has valid hash
-        let buf_cap = 8192 * TOTAL_INPUT_PLANES * 80;
         SingleMcts {
             arena, root, root_board: board,
             pending: Vec::new(), pending_boards: Vec::new(),
             position_history: vec![initial_hash],
             root_history,
-            leaf_tensor_buf: Vec::with_capacity(buf_cap),
             kld_prev_snapshot: None,
             move_start_visits: 0,
             contempt: 0.0,
@@ -1665,29 +1663,25 @@ impl SingleMcts {
         second + sims_remaining < best
     }
 
-    // Version with reusable buffer — no Vec<Vec<f32>> allocations
-    fn collect_leaves_into_buf(&mut self, parallel: usize, _rng: &mut u64) -> usize {
+    // Collect leaves and append encoded tensors directly into the caller's
+    // flat batch buffer. This avoids one extra full-buffer copy per MCTS step.
+    fn collect_leaves_append(&mut self, parallel: usize, _rng: &mut u64,
+                             out: &mut Vec<f32>) -> usize {
         self.pending.clear();
         self.pending_boards.clear();
-        self.leaf_tensor_buf.clear();
         let mut count = 0usize;
         for _ in 0..parallel {
             if let Some(leaf) = self.select() {
                 if self.arena.get(leaf).is_terminal { continue; }
-                // Duplicate protection: select() may return the same unexpanded node
-                // repeatedly (vloss doesn't help for unexpanded — we never reach the PUCT loop).
-                // Without this check, visits inflate and GPU evaluates identical positions.
                 if self.pending.contains(&leaf) { continue; }
                 self.apply_vloss(leaf, VIRTUAL_LOSS_V);
                 let (leaf_board, history) = self.board_with_history_at(leaf);
-                // Rep flag only for the current (leaf) position — most important information.
-                // Leave old slots at 0 for simplicity (LC0 V2 also often skips them).
                 let mut rep_flags = vec![false; history.len()];
                 if !history.is_empty() && self.rep_count_at_leaf(leaf, &leaf_board) >= 2 {
                     rep_flags[0] = true;
                 }
                 boards_to_tensor_into(
-                    &mut self.leaf_tensor_buf, &history, &rep_flags,
+                    out, &history, &rep_flags,
                     leaf_board.side, leaf_board.halfmove_clock, leaf_board.castling,
                 );
                 self.pending_boards.push(leaf_board);
@@ -1735,6 +1729,32 @@ impl SingleMcts {
                 self.propagate_bounds_from(leaf);
             }
         }
+                            }
+
+                            fn get_policy_sparse(&self) -> (Vec<i32>, Vec<f32>) {
+                                let root = self.arena.get(self.root);
+                                let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
+                                let mut idxs = Vec::with_capacity(root.children.len());
+                                let mut vals = Vec::with_capacity(root.children.len());
+                                if total > 0 {
+                                    let side = self.root_board.side;
+                                    for &ci in &root.children {
+                                        let c = self.arena.get(ci);
+                                        if c.visits <= 0 { continue; }
+                                        let m = c.move_from_parent;
+                                        let f = (m >> 10) & 0x7F;
+                                        let t = (m >> 3) & 0x7F;
+                                        let pv = m & 0b111;
+                                        let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                                        // Canonical index (see Board::move_to_idx).
+                                        let idx = Board::move_to_idx(f, t, p, side);
+                                        if idx < POLICY_SIZE_MCTS {
+                                            idxs.push(idx as i32);
+                                            vals.push(c.visits as f32 / total as f32);
+                                        }
+                                    }
+                                }
+                                (idxs, vals)
                             }
 
                             fn get_policy(&self) -> Vec<f32> {
@@ -1969,7 +1989,10 @@ impl RustMCTS {
     pub fn collect_leaves<'py>(&mut self, py: Python<'py>, target_sims_per_game: i32) -> Bound<'py, PyArray2<f32>> {
         self.leaf_game_map.clear();
         let mut new_counts = vec![0usize; self.games.len()];
-        let mut flat: Vec<f32> = Vec::new();
+        let cols = TOTAL_INPUT_PLANES * 80;
+        let mut flat: Vec<f32> = Vec::with_capacity(
+            self.games.len().saturating_mul(self.parallel_sims).saturating_mul(cols)
+        );
         let mut total = 0usize;
 
         for (g, game) in self.games.iter_mut().enumerate() {
@@ -1984,12 +2007,14 @@ impl RustMCTS {
                 let sims_remaining = (target_sims_per_game - sims_done_this_move).max(0);
                 if game.best_move_is_decided(sims_remaining) { continue; }
             }
-            // Use buffered collection without extra Vec<Vec<f32>> allocations
-            let count = game.collect_leaves_into_buf(self.parallel_sims, &mut self.rng);
+            // Append directly into the shared flat tensor buffer. This avoids
+            // one full copy of all input planes per MCTS step.
+            let count = game.collect_leaves_append(
+                self.parallel_sims, &mut self.rng, &mut flat
+            );
             new_counts[g] = count;
             for _ in 0..count { self.leaf_game_map.push(g); }
             total += count;
-            flat.extend_from_slice(&game.leaf_tensor_buf);
         }
 
         // Python reads these counts via get_current_batch_counts() right after
@@ -1998,7 +2023,6 @@ impl RustMCTS {
         self.leaf_counts = new_counts;
 
         // Single tensor size = TOTAL_INPUT_PLANES * 80 (139 * 80 = 11120 with history planes).
-        let cols = TOTAL_INPUT_PLANES * 80;
         if total == 0 {
             Array2::<f32>::zeros((0, cols)).into_pyarray(py).into()
         } else {
@@ -2168,6 +2192,16 @@ impl RustMCTS {
     /// Final policy vectors from visit counts.
     pub fn get_policies(&self) -> Vec<Vec<f32>> {
         self.games.iter().map(|g| g.get_policy()).collect()
+    }
+
+    /// Sparse final policy vectors from visit counts.
+    ///
+    /// Each entry is (policy_indices, visit_probs) for the root legal moves with
+    /// non-zero visits. This is the self-play hot path: transferring 30-80
+    /// floats per game is much cheaper than transferring a dense 7000-vector
+    /// for every active game on every move.
+    pub fn get_policies_sparse(&self) -> Vec<(Vec<i32>, Vec<f32>)> {
+        self.games.iter().map(|g| g.get_policy_sparse()).collect()
     }
 
     /// Root value estimates (Q = P(W) - P(L)).
