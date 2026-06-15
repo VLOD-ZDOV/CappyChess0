@@ -27,12 +27,12 @@ if torch.cuda.is_available():
     except AttributeError:
         pass
 
-# torch.compile cache: with bucket-padding the inference net sees ~10 unique
-# batch sizes (32, 64, 128, ..., 8192). Default cache_size_limit=8 triggers
-# fallback to eager — raise it so every bucket keeps its compiled CUDA graph.
+# torch.compile cache: bucket-padding intentionally keeps the number of unique
+# batch sizes bounded. Default cache_size_limit=8 triggers fallback to eager —
+# raise it so every bucket keeps its compiled CUDA graph.
 try:
     import torch._dynamo
-    torch._dynamo.config.cache_size_limit = 32
+    torch._dynamo.config.cache_size_limit = 64
 except (ImportError, AttributeError):
     pass
 
@@ -40,9 +40,11 @@ except (ImportError, AttributeError):
 def _bucket_size(n: int, step: int, pow2: bool = True) -> int:
     """Round n up to a stable batch shape.
 
-    pow2=True  (torch.compile path): next power-of-two multiple of `step`
-               (n=50,step=32→64; n=600→1024). Keeps distinct compiled shapes
-               to ~log2(max_n/step)≈9 so dynamo/CUDA-graphs don't thrash.
+    pow2=True  (torch.compile path): coarse buckets instead of strict powers
+               of two. Power-of-two padding kept Dynamo happy, but on large
+               partially-finished self-play batches it could nearly double the
+               GPU work (e.g. 2100 leaves → 4096). Coarse 512-ish buckets keep
+               compile shapes bounded while wasting much less compute.
     pow2=False (eager path): next multiple of `step` only. Measured GPU
                throughput is *linear* in batch size (≈0.115 ms/leaf for the
                384×15+4 net on a 5080), so power-of-two padding is pure wasted
@@ -53,10 +55,10 @@ def _bucket_size(n: int, step: int, pow2: bool = True) -> int:
     if pow2:
         if n <= step:
             return step
-        target = step
-        while target < n:
-            target *= 2
-        return target
+        small_grid = step
+        coarse_grid = max(step * 16, 512)
+        grid = small_grid if n <= coarse_grid else coarse_grid
+        return ((n + grid - 1) // grid) * grid
     if n <= step:
         return step
     return ((n + step - 1) // step) * step
@@ -156,9 +158,8 @@ class UltraFastMCTS:
         self._compile_mode = compile_mode
         if compile_mode is not None and hasattr(torch, 'compile'):
             try:
-                # dynamic=False: shapes are fixed (padded to multiple of parallel_sims),
-                # allows aggressive optimizations. If shape changes anyway,
-                # torch.compile will do a recapture on its own.
+                # dynamic=False: shapes are bucketed, so compile sees a bounded
+                # set of static shapes and can optimize them aggressively.
                 self.net = torch.compile(self.net, mode=compile_mode, dynamic=False)
                 print(f"🔥 torch.compile(mode={compile_mode!r}) — первый inference будет медленнее (warmup).")
             except Exception as e:
@@ -173,11 +174,12 @@ class UltraFastMCTS:
         MAX_LEAVES = max(8192, batch_size * self._parallel_sims * 2)
         if self._has_cuda:
             self.pinned_buf = torch.empty(
-                MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W,
-                pin_memory=True, dtype=torch.bfloat16)
+                (MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W),
+                pin_memory=True, dtype=torch.bfloat16,
+                memory_format=torch.channels_last)
         else:
             self.pinned_buf = torch.empty(
-                MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W,
+                (MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W),
                 pin_memory=False, dtype=torch.float32)
             print("⚠️  CUDA не найдена — inference на CPU. Очень медленно, "
                   "training/eval скорее иллюстративные. Установите GPU + драйвер.")
@@ -335,11 +337,9 @@ class UltraFastMCTS:
             empty_v = np.empty((0,), dtype=np.float32)
             return empty_p, empty_v, empty_v.copy(), empty_v.copy()
 
-        # Pad to a power-of-two bucket (32, 64, 128, 256, ..., 8192) so
-        # torch.compile sees only a handful of unique input shapes — each one
-        # keeps its CUDA graph, no recompile thrash. Without bucketing every
-        # parallel_sims-aligned size (32, 64, 96, 128, ...) was a fresh shape,
-        # dynamo hit cache_size_limit=8 and silently fell back to eager.
+        # Pad to a stable bucket so torch.compile sees a bounded set of input
+        # shapes. Strict power-of-two buckets waste too much compute on
+        # partially-finished game batches, so _bucket_size uses a coarse grid.
         ps = self._parallel_sims
         # Power-of-two buckets only matter when torch.compile/CUDA-graphs need
         # shape stability. In eager mode (the only stable path on Blackwell) the
@@ -349,25 +349,38 @@ class UltraFastMCTS:
         target = _bucket_size(n, ps, pow2=self._compile_mode is not None)
         n_pad = target - n
 
-        arr = tensors.reshape(n, INPUT_PLANES, BOARD_H, BOARD_W)
-        if n_pad > 0:
-            pad_idx = np.random.randint(0, n, n_pad)
-            arr = np.concatenate([arr, arr[pad_idx]], axis=0)
-        n_total = arr.shape[0]
+        arr = np.ascontiguousarray(
+            tensors.reshape(n, INPUT_PLANES, BOARD_H, BOARD_W)
+        )
+        n_total = target
 
         if n_total <= self.pinned_size:
             buf = self.pinned_buf[:n_total]
             # copy_(fp32) casts to buf's dtype (BF16 on CUDA, FP32 on CPU).
-            buf.copy_(torch.from_numpy(np.ascontiguousarray(arr)))
+            buf[:n].copy_(torch.from_numpy(arr))
+            if n_pad > 0:
+                # Padding rows are discarded after inference. Duplicate existing
+                # rows in-place instead of building a new numpy array with
+                # np.concatenate on every MCTS step.
+                filled = n
+                while filled < n_total:
+                    take = min(filled, n_total - filled)
+                    buf[filled:filled + take].copy_(buf[:take])
+                    filled += take
             x = buf.to(self.device, non_blocking=True)
         else:
             # Fallback when pinned buffer is exceeded. Match the buffer dtype
             # so we never feed BF16 into FP32 weights on CPU.
+            if n_pad > 0:
+                pad_idx = np.arange(n_pad) % n
+                arr = np.concatenate([arr, arr[pad_idx]], axis=0)
             target_dtype = torch.bfloat16 if self._has_cuda else torch.float32
-            cpu_t = torch.from_numpy(np.ascontiguousarray(arr)).to(target_dtype)
-            x = cpu_t.to(self.device, non_blocking=True)
+            cpu_t = torch.from_numpy(arr).to(target_dtype)
+            x = cpu_t.to(self.device, non_blocking=True,
+                         memory_format=torch.channels_last)
 
-        x = x.to(memory_format=torch.channels_last)
+        if not x.is_contiguous(memory_format=torch.channels_last):
+            x = x.to(memory_format=torch.channels_last)
         if self._bf16_weights:
             # Both weights and input in BF16 — no autocast needed.
             out = self.net(x)

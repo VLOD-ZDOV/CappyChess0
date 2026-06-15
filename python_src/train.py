@@ -225,8 +225,11 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
 
     # Contempt is most useful here — vs an external opponent (FSF) the NN benefits
     # from biasing away from draws to convert positional advantage into wins.
+    # parallel_sims>1 batches the leaves of a single game's tree per GPU call
+    # (was 1 → batch=1 inference per simulation, GPU idle). Even with one game
+    # in flight this collects mcts_parallel_sims leaves per step.
     mcts = UltraFastMCTS(net, device, c_puct=1.745, batch_size=1,
-                         add_dirichlet=False, parallel_sims=1,
+                         add_dirichlet=False, parallel_sims=cfg.mcts_parallel_sims,
                          contempt=cfg.contempt)
     all_samples = []
     wins = draws = losses = errors = 0
@@ -354,10 +357,11 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
     lagged_net.load_state_dict(lagged_sd, strict=False)
     lagged_net.eval()
 
+    # parallel_sims>1: batch the single game's leaves per GPU call (was 1 → idle GPU).
     mcts_cur = UltraFastMCTS(net, device, c_puct=1.745, batch_size=1,
-                              add_dirichlet=True, parallel_sims=1)
+                              add_dirichlet=True, parallel_sims=cfg.mcts_parallel_sims)
     mcts_lag = UltraFastMCTS(lagged_net, device, c_puct=1.745, batch_size=1,
-                              add_dirichlet=False, parallel_sims=1)
+                              add_dirichlet=False, parallel_sims=cfg.mcts_parallel_sims)
 
     all_samples = []
     cur_wins = cur_draws = cur_losses = 0
@@ -625,6 +629,22 @@ def pack_sample(board: np.ndarray, policy: np.ndarray, value: float,
     pol_val = policy[nz].astype(np.float16)
     return (board_f16, (pol_idx, pol_val), np.float32(value),
             np.float32(mlh_norm), np.int32(future_idx))
+
+
+def pack_sample_sparse(board: np.ndarray, pol_sparse: Tuple[np.ndarray, np.ndarray],
+                       value: float, mlh_norm: float = 0.0,
+                       future_idx: int = -1) -> CompactSample:
+    """Pack a sample when MCTS already returned sparse visit probabilities."""
+    board_f16 = board.astype(np.float16)
+    pol_idx, pol_val = pol_sparse
+    return (
+        board_f16,
+        (pol_idx.astype(np.int16, copy=False),
+         pol_val.astype(np.float16, copy=False)),
+        np.float32(value),
+        np.float32(mlh_norm),
+        np.int32(future_idx),
+    )
 
 
 def unpack_policy(pol_sparse: Tuple[np.ndarray, np.ndarray],
@@ -922,14 +942,13 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                             mcts._kld_early_exits += 1
                             mcts._kld_sims_saved += (steps - _step - 1) * _parallel
                             break
-            raw_pols  = rust_mcts_reuse.get_policies()
+            sparse_pols = rust_mcts_reuse.get_policies_sparse()
             raw_vals  = rust_mcts_reuse.get_values()
             raw_draws = rust_mcts_reuse.get_draws()
-            # get_policies()/get_values() return one entry per EACH game
+            # get_policies_sparse()/get_values() return one entry per EACH game
             # in rust_mcts_reuse.games (length = n, not len(active)).
             # Index by game_idx; otherwise after the first game in the batch finishes
             # all remaining games get wrong policy/value.
-            policies  = [np.array(p, dtype=np.float32) for p in raw_pols]
             values_np = np.array(raw_vals,  dtype=np.float32)
             draws_np  = np.array(raw_draws, dtype=np.float32)
 
@@ -940,14 +959,31 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 if not legal:
                     continue
 
-                board_np = np.array(eng.get_board_tensor(), dtype=np.float32)
                 side = eng.side_to_move()
-                pol = policies[game_idx]
+                pol_idx_raw, pol_val_raw = sparse_pols[game_idx]
+                pol_lookup = {
+                    int(idx): float(val)
+                    for idx, val in zip(pol_idx_raw, pol_val_raw)
+                }
                 root_v_raw = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
+                keep_position = (
+                    (not cfg.playout_cap_train_only_full) or use_full_search
+                )
+                if keep_position:
+                    # Board encoding is expensive. For PCR fast-search moves the
+                    # sample is discarded later, so do not compute/store it.
+                    board_np = np.array(eng.get_board_tensor(), dtype=np.float32)
+                    pol_sparse = (
+                        np.asarray(pol_idx_raw, dtype=np.int16),
+                        np.asarray(pol_val_raw, dtype=np.float16),
+                    )
+                else:
+                    board_np = None
+                    pol_sparse = None
                 # 6th element (move_idx) — policy index of selected move, patched
                 # below after sampling. List (not tuple) so it can be mutated.
                 histories[game_idx].append(
-                    [board_np, pol.copy(), side, root_v_raw, use_full_search, -1])
+                    [board_np, pol_sparse, side, root_v_raw, use_full_search, -1])
 
                 # Temperature decay (argmax branch below catches tau ≈ 0)
                 if move_num < cfg.temperature_moves:
@@ -959,16 +995,23 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     tau = cfg.temperature_late
 
                 raw = np.array([
-                    pol[eng.move_int_to_policy_idx(m) or 0] for m in legal
+                    pol_lookup.get(eng.move_int_to_policy_idx(m), 0.0)
+                    for m in legal
                 ], dtype=np.float64)
 
                 if tau < 0.01:
                     # tau≈0 = hard argmax (avoid 1/0 = inf → NaN)
-                    move = int(legal[int(np.argmax(raw))])
+                    if np.isfinite(raw).all() and raw.max(initial=0.0) > 0.0:
+                        move = int(legal[int(np.argmax(raw))])
+                    else:
+                        move = int(np.random.choice(legal))
                 else:
-                    raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
-                    s = raw.sum()
-                    probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
+                    if np.isfinite(raw).all() and raw.max(initial=0.0) > 0.0:
+                        raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
+                        s = raw.sum()
+                        probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
+                    else:
+                        probs = np.ones(len(legal)) / len(legal)
                     move = int(np.random.choice(legal, p=probs))
 
                 # Record canonical policy index of the selected move in history —
@@ -1056,9 +1099,11 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
 
             total_plies = len(histories[i])
             for k, entry in enumerate(histories[i]):
-                board_np, pol, side = entry[0], entry[1], entry[2]
+                board_np, pol_sparse, side = entry[0], entry[1], entry[2]
                 # Playout cap: skip fast-search positions during training
                 if cfg.playout_cap_train_only_full and len(entry) > 4 and not entry[4]:
+                    continue
+                if board_np is None or pol_sparse is None:
                     continue
                 v = result if side == 0 else -result
                 # MLH target: how many half-moves REMAIN from this position to game end.
@@ -1070,7 +1115,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 # same canonical policy-index orientation). -1 if game ended.
                 future_idx = histories[i][k + 2][5] if k + 2 < total_plies else -1
                 all_samples.append(
-                    pack_sample(board_np, pol, float(v), float(mlh_norm), int(future_idx)))
+                    pack_sample_sparse(board_np, pol_sparse, float(v),
+                                       float(mlh_norm), int(future_idx)))
                 batch_positions += 1
 
         # Aggregate totals per colour across all outcome types. Adjudications

@@ -149,6 +149,8 @@ def play_batch(
     timeout_as_draw: bool = False,
     white_name: str = "White",
     black_name: str = "Black",
+    compile_mode: str = None,
+    kld_threshold: float = 0.0,
 ) -> List[float]:
     """
     Plays num_games games: net_white as white, net_black as black.
@@ -156,9 +158,11 @@ def play_batch(
         +1.0 = white wins, -1.0 = black wins, 0.0 = draw, 0.5/-0.5 = by material
     """
     mcts_w = UltraFastMCTS(net_white, device, c_puct=1.25,
-                            batch_size=mcts_batch, add_dirichlet=False)
+                            batch_size=mcts_batch, add_dirichlet=False,
+                            compile_mode=compile_mode, kld_threshold=kld_threshold)
     mcts_b = UltraFastMCTS(net_black, device, c_puct=1.25,
-                            batch_size=mcts_batch, add_dirichlet=False)
+                            batch_size=mcts_batch, add_dirichlet=False,
+                            compile_mode=compile_mode, kld_threshold=kld_threshold)
 
     engines = [CapablancaEngine() for _ in range(num_games)]
     active  = list(range(num_games))
@@ -258,6 +262,8 @@ def run_match(
     verbose: bool = False,
     pgn_dir: str = None,
     timeout_as_draw: bool = False,
+    compile_mode: str = None,
+    kld_threshold: float = 0.0,
 ) -> Dict:
     """
     Plays `games` games between A and B (half with A as white, half with B as white).
@@ -282,7 +288,8 @@ def run_match(
                       max_moves, temperature_moves, mcts_batch,
                       verbose=verbose, pgn_path=pgn1,
                       white_name=name_a, black_name=name_b,
-                      timeout_as_draw=timeout_as_draw)
+                      timeout_as_draw=timeout_as_draw,
+                      compile_mode=compile_mode, kld_threshold=kld_threshold)
     for r in res1:
         if r > 0:   wins_a += 1
         elif r < 0: wins_b += 1
@@ -300,7 +307,8 @@ def run_match(
                       max_moves, temperature_moves, mcts_batch,
                       verbose=verbose, pgn_path=pgn2,
                       white_name=name_b, black_name=name_a,
-                      timeout_as_draw=timeout_as_draw)
+                      timeout_as_draw=timeout_as_draw,
+                      compile_mode=compile_mode, kld_threshold=kld_threshold)
     for r in res2:
         # r — result for white (= B), convert to result for A
         r_a = -r
@@ -445,7 +453,17 @@ def main():
                         help="Папка для сохранения PGN партий (напр. games/)")
     parser.add_argument("--timeout-as-draw", action="store_true", default=False,
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
+    parser.add_argument("--compile-inference", type=str, default="default",
+                        choices=["none", "default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile режим инференса (~1.5x на форварде). "
+                             "default — безопасно; none — отключить (default: default)")
+    parser.add_argument("--kld", type=float, default=0.0,
+                        help="Порог KLD early-exit: MCTS останавливается раньше, когда "
+                             "распределение визитов стабилизировалось. 0 = выкл. "
+                             "Типично 1e-4..3e-4 для заметного ускорения (default: 0)")
     args = parser.parse_args()
+
+    compile_mode = None if args.compile_inference == "none" else args.compile_inference
 
     # Device
     if args.device == "auto":
@@ -484,6 +502,8 @@ def main():
     print(f"   Симуляций/ход: {args.simulations} | "
           f"Макс ходов: {args.max_moves} | "
           f"Температура: первые {args.temperature_moves} ходов")
+    print(f"   compile={compile_mode or 'none'} | "
+          f"KLD early-exit={'off' if args.kld <= 0 else args.kld}")
 
     # Round-robin tournament
     match_results = []
@@ -501,6 +521,8 @@ def main():
             verbose=args.verbose,
             pgn_dir=args.pgn_dir,
             timeout_as_draw=args.timeout_as_draw,
+            compile_mode=compile_mode,
+            kld_threshold=args.kld,
         )
         match_results.append(result)
 
