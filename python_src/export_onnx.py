@@ -42,17 +42,6 @@ class _InferWrap(nn.Module):
         return F.softmax(policy, dim=1), q, d, m
 
 
-def _infer_arch(sd):
-    """Recover (channels, res_blocks, transformer_blocks, heads) from weights."""
-    ch = sd["input_conv.net.0.weight"].shape[0]
-    rb = sum(1 for k in sd
-             if k.startswith("res_blocks.") and k.endswith("conv1.weight"))
-    tb = len({k.split(".")[1] for k in sd if k.startswith("transformer_blocks.")})
-    rpb = sd.get("transformer_blocks.0.attn.rpb.bias_table")
-    heads = rpb.shape[0] if rpb is not None else 8
-    return ch, rb, tb, heads
-
-
 def main():
     if len(sys.argv) < 2:
         print("Usage: python export_onnx.py <checkpoint.pth> [output.onnx]")
@@ -62,20 +51,15 @@ def main():
 
     ckpt = torch.load(src, map_location="cpu", weights_only=False)
     raw = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-    sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
-          for k, v in raw.items()}
 
-    ch, rb, tb, heads = _infer_arch(sd)
-    enable_mlh = any(k.startswith("mlh_head.") for k in sd)
-    enable_future = any(k.startswith("future_head.") for k in sd)
-    print(f"Архитектура: {ch}ch × {rb} res-блоков + {tb} transformer-блоков "
-          f"({heads} голов) · mlh={enable_mlh} future={enable_future}")
-
-    net = CapablancaNet(num_channels=ch, num_res_blocks=rb,
-                        num_transformer_blocks=tb, transformer_heads=heads,
-                        enable_mlh=enable_mlh, enable_future=enable_future)
-    tgt = net.state_dict()
-    sd = {k: v for k, v in sd.items() if k in tgt and v.shape == tgt[k].shape}
+    # Use the canonical helper — it recovers ALL architecture knobs including
+    # the BT5 trim (qkv_bias / use_rmsnorm / piece_embed_dim). The inline
+    # detection this replaced ignored those flags, so a BT5-trained checkpoint
+    # silently exported with LayerNorm instead of RMSNorm and no piece_embed —
+    # a wrong-architecture ONNX with no error.
+    from model import build_net_from_state_dict, describe_arch
+    net, sd = build_net_from_state_dict(raw)
+    print(f"Архитектура: {describe_arch(net)}")
     result = net.load_state_dict(sd, strict=False)
     if result.missing_keys:
         print(f"⚠️  не заполнено ключей: {len(result.missing_keys)} "

@@ -95,39 +95,78 @@ class MultiHeadAttentionRPB(nn.Module):
     ~10% faster training and ~5% faster inference with no quality loss.
     Default True for backward compatibility with existing checkpoints —
     new training runs should set it to False.
+
+    `qk_norm=True` normalises Q and K over the head dimension before the dot
+    product (Gemma 2 / Chameleon / ViT-22B). Attention logits grow like
+    |q|·|k|, so at a high learning rate they can saturate the softmax into a
+    near one-hot the gradient cannot recover from. Costs two head_dim-sized
+    vectors and is what lets the stack tolerate the larger LR.
     """
     def __init__(self, d_model: int, heads: int = 8,
                  board_h: int = 8, board_w: int = 10,
-                 qkv_bias: bool = True):
+                 qkv_bias: bool = True, qk_norm: bool = False,
+                 value_residual: bool = False):
         super().__init__()
         assert d_model % heads == 0, f"d_model={d_model} must be divisible by heads={heads}"
         self.heads = heads
         self.head_dim = d_model // heads
+        self.qk_norm = qk_norm
         # No explicit scale stored: F.scaled_dot_product_attention applies its own
         # 1/sqrt(head_dim) internally, so a self.scale here would be dead/misleading.
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=qkv_bias)
         self.out_proj = nn.Linear(d_model, d_model)
         self.rpb = RelativePositionBias(heads, board_h, board_w)
+        if qk_norm:
+            self.q_norm = _make_norm(self.head_dim, use_rmsnorm=True)
+            self.k_norm = _make_norm(self.head_dim, use_rmsnorm=True)
+        self.value_residual = value_residual
+        if value_residual:
+            # One scalar per block, through a sigmoid → mixing weight in (0, 1).
+            self.value_res_lambda = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, v_first: torch.Tensor = None):
+        """Returns (out, v) — `v` is this block's value tensor so the stack can
+        feed the FIRST block's values back into the later ones (ResFormer)."""
         # x: (B, S, D)
         B, S, D = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
+        v_out = v
+        if self.value_residual and v_first is not None:
+            # Value residual learning (ResFormer, arXiv:2410.17897): mix in the
+            # first layer's values. Deep layers otherwise suffer "value-state
+            # drain" — attention concentrates and the value stream degenerates.
+            # The paper's key negative result: doing the same for Q or K does
+            # NOT help, only V. lam starts at 0 so the block begins identical to
+            # a plain one and learns how much of layer 0 it wants.
+            lam = torch.sigmoid(self.value_res_lambda)
+            v = (1.0 - lam) * v + lam * v_first
+        # Keep the (B, S, D) form to hand upward: every block mixes against the
+        # first block's values in this layout, before the head split.
+        v_out = v
         # (B, S, h, hd) → (B, h, S, hd)
         q = q.view(B, S, self.heads, self.head_dim).transpose(1, 2)
         k = k.view(B, S, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.heads, self.head_dim).transpose(1, 2)
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         # SDPA picks the best backend (FlashAttention / mem-efficient / math)
         # based on shapes and hardware. attn_mask is added to scores before softmax,
         # so RPB rides in as an additive bias — broadcast across batch.
-        bias = self.rpb().unsqueeze(0)                              # (1, h, S, S)
+        bias = self.rpb().unsqueeze(0)                              # (1, h, 80, 80)
+        if bias.shape[-1] != S:
+            # Register tokens are prepended and have no board geometry, so they
+            # get a zero relative-position bias; the 80×80 board block stays in
+            # the bottom-right corner.
+            pad = S - bias.shape[-1]
+            bias = F.pad(bias, (pad, 0, pad, 0))
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         # flatten(2) collapses the (h, hd) tail into a single D dim. The dynamo
         # ONNX exporter lowers it to an explicit Flatten/Reshape op (unlike
         # view/reshape which it tried to optimize through the transpose).
         out = out.transpose(1, 2).flatten(2)                        # (B, S, D)
-        return self.out_proj(out)
+        return self.out_proj(out), v_out
 
 
 def _make_norm(d_model: int, use_rmsnorm: bool):
@@ -153,32 +192,252 @@ class _RMSNormFallback(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 
+class SwiGLU(nn.Module):
+    """Gated feed-forward: (SiLU(W1 x) * W3 x) W2 — the LLM-standard FFN
+    (PaLM / LLaMA / Mistral).
+
+    The gate multiplies two projections instead of applying a pointwise
+    non-linearity to one, which buys a multiplicative interaction for free.
+    `hidden` is scaled by 2/3 so the block keeps the same parameter count as the
+    plain `Linear → Mish → Linear` it replaces (three matrices instead of two).
+    """
+    def __init__(self, d_model: int, ffn_mult: int = 2):
+        super().__init__()
+        hidden = int(d_model * ffn_mult * 2 / 3)
+        hidden = max(8, (hidden + 7) // 8 * 8)   # keep it tensor-core friendly
+        self.w_in = nn.Linear(d_model, 2 * hidden)   # gate and value in one GEMM
+        self.w_out = nn.Linear(hidden, d_model)
+
+    def forward(self, x):
+        gate, value = self.w_in(x).chunk(2, dim=-1)
+        return self.w_out(F.silu(gate) * value)
+
+
+class HyperConnection(nn.Module):
+    """Manifold-constrained hyper-connections (DeepSeek, arXiv:2512.24880),
+    replacing one sub-layer's residual `x = x + f(x)`.
+
+    Hyper-Connections widen the residual into `n` parallel streams and let the
+    network learn how to route between them: a pre-mapping aggregates the
+    streams into the sub-layer's input, a post-mapping scatters its output back,
+    and a residual mapping mixes the streams with each other. Plain HC diverges
+    at depth — the mixing matrix has no norm control, so signal energy grows
+    layer over layer (the paper measures Amax gains up to ~3000).
+
+    mHC is the fix: the mixing matrix is projected onto the Birkhoff polytope
+    (doubly stochastic matrices) with Sinkhorn-Knopp. Doubly stochastic matrices
+    have spectral norm 1 and are closed under multiplication, so stream mixing
+    becomes a convex combination and cannot amplify — the paper reports the Amax
+    gain dropping to ~1.6.
+
+    Parameter cost is `2n + n²` scalars per sub-layer (24 at n=4); the real cost
+    is activation memory, which is n× the residual stream.
+
+    Initialised to be *exactly* a plain residual: streams start identical, the
+    pre-mapping averages them, the mixing matrix starts at the identity and each
+    stream receives the full sub-layer output.
+    """
+
+    def __init__(self, n_streams: int = 4, sinkhorn_iters: int = 8,
+                 identity_init: float = 4.0):
+        super().__init__()
+        self.n = n_streams
+        self.sinkhorn_iters = sinkhorn_iters
+        self.pre = nn.Parameter(torch.zeros(n_streams))           # → softmax
+        self.post = nn.Parameter(torch.ones(n_streams))
+        # Logits of the stream-mixing matrix. A strong diagonal makes the
+        # Sinkhorn projection start ≈ identity, so layer 0 behaves like a
+        # standard residual and the network *learns* to differentiate streams.
+        self.res_logits = nn.Parameter(identity_init * torch.eye(n_streams))
+
+    def mixing_matrix(self) -> torch.Tensor:
+        """Sinkhorn-Knopp projection onto the Birkhoff polytope."""
+        m = torch.exp(self.res_logits - self.res_logits.max())
+        for _ in range(self.sinkhorn_iters):
+            m = m / (m.sum(dim=1, keepdim=True) + 1e-8)
+            m = m / (m.sum(dim=0, keepdim=True) + 1e-8)
+        return m
+
+    def aggregate(self, streams: torch.Tensor) -> torch.Tensor:
+        """(B, S, n, D) → (B, S, D): convex combination of the streams."""
+        w = torch.softmax(self.pre, dim=0).view(1, 1, -1, 1)
+        return (streams * w).sum(dim=2)
+
+    def scatter(self, streams: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Mix the streams, then add the sub-layer output back into each."""
+        mixed = torch.einsum('ij,bsjd->bsid', self.mixing_matrix(), streams)
+        return mixed + self.post.view(1, 1, -1, 1) * out.unsqueeze(2)
+
+
 class TransformerBlock(nn.Module):
     """Pre-LN transformer encoder block: norm → MHA(RPB) → residual → norm → FFN → residual.
     Pre-LN is more stable than post-LN when training without a transformer warmup schedule.
 
     `use_rmsnorm=True` switches LayerNorm → RMSNorm (BT5: no centering, no
-    bias). `qkv_bias=False` drops the QKV bias. Both default to the legacy
+    bias). `qkv_bias=False` drops the QKV bias. `swiglu=True` swaps the FFN for
+    a gated one, `qk_norm=True` normalises Q/K. All default to the legacy
     layout so existing checkpoints load unchanged.
     """
     def __init__(self, d_model: int, heads: int = 8, ffn_mult: int = 2,
                  board_h: int = 8, board_w: int = 10,
-                 qkv_bias: bool = True, use_rmsnorm: bool = False):
+                 qkv_bias: bool = True, use_rmsnorm: bool = False,
+                 qk_norm: bool = False, swiglu: bool = False,
+                 value_residual: bool = False, hyper_streams: int = 0):
         super().__init__()
+        # 0 = a plain residual; >0 = mHC with that many parallel streams.
+        self.hyper_streams = hyper_streams
+        if hyper_streams > 0:
+            self.hc_attn = HyperConnection(hyper_streams)
+            self.hc_ffn = HyperConnection(hyper_streams)
         self.ln1 = _make_norm(d_model, use_rmsnorm)
         self.attn = MultiHeadAttentionRPB(d_model, heads, board_h, board_w,
-                                          qkv_bias=qkv_bias)
+                                          qkv_bias=qkv_bias, qk_norm=qk_norm,
+                                          value_residual=value_residual)
         self.ln2 = _make_norm(d_model, use_rmsnorm)
-        self.ffn = nn.Sequential(
+        self.ffn = SwiGLU(d_model, ffn_mult) if swiglu else nn.Sequential(
             nn.Linear(d_model, d_model * ffn_mult),
             nn.Mish(inplace=True),
             nn.Linear(d_model * ffn_mult, d_model),
         )
 
+    def forward(self, x: torch.Tensor, v_first: torch.Tensor = None):
+        if self.hyper_streams == 0:
+            attn_out, v = self.attn(self.ln1(x), v_first)
+            x = x + attn_out
+            x = x + self.ffn(self.ln2(x))
+            return x, v
+        # x is the widened residual: (B, S, n, D)
+        h = self.hc_attn.aggregate(x)
+        attn_out, v = self.attn(self.ln1(h), v_first)
+        x = self.hc_attn.scatter(x, attn_out)
+        h = self.hc_ffn.aggregate(x)
+        x = self.hc_ffn.scatter(x, self.ffn(self.ln2(h)))
+        return x, v
+
+
+class AttentionPolicyHead(nn.Module):
+    """Bilinear from→to policy head (lc0 BT3+ "attention policy").
+
+    The policy index layout is already an 80×80 matrix: a normal move encodes as
+    `from_sq * 80 + to_sq` (indices 0..6399, see Board::move_to_idx in lib.rs).
+    So the logits can be a scaled dot product between a per-square "from"
+    projection and a per-square "to" projection of the trunk's own 80 tokens,
+    instead of a `Linear(C*80 → 7000)`.
+
+    Why it matters here: on a 256ch × 15 + 4tb net the policy and future heads
+    are 17.9M parameters *each* — 63% of the whole 56.6M network — while the
+    trunk is only 20.8M. This head is ~0.25M. It also generalises: one learned
+    rule for "this kind of from-square attacks that kind of to-square", shared
+    across all 6400 square pairs, rather than 7000 independent output rows.
+
+    Promotions occupy 6400 + (from_file*10 + to_file)*6 + promo_idx, i.e. exactly
+    600 slots (6400..6999). In canonical coordinates our pawns always promote
+    from rank 6 to rank 7, so those logits come from the rank-6 and rank-7
+    tokens through a second, smaller bilinear form.
+    """
+
+    N_PROMO = 6          # Q R B N A C — order fixed by Board::move_to_idx
+
+    def __init__(self, channels: int, d_head: int = 128, d_promo: int = 64,
+                 board_h: int = 8, board_w: int = 10):
+        super().__init__()
+        self.board_h, self.board_w = board_h, board_w
+        self.d_head, self.d_promo = d_head, d_promo
+        self.q_proj = nn.Linear(channels, d_head)
+        self.k_proj = nn.Linear(channels, d_head)
+        # Promotions: from-file token → one query per promotion piece.
+        self.promo_q = nn.Linear(channels, self.N_PROMO * d_promo)
+        self.promo_k = nn.Linear(channels, d_promo)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """tokens: (B, 80, C) in row-major square order → (B, 7000) logits."""
+        B = tokens.shape[0]
+        W = self.board_w
+        q = self.q_proj(tokens)                                   # (B, 80, d)
+        k = self.k_proj(tokens)                                   # (B, 80, d)
+        # (B, 80, 80) with [i, j] = from square i to square j, then row-major
+        # flatten → index i*80 + j, exactly the normal-move encoding.
+        normal = torch.matmul(q, k.transpose(1, 2)) * (self.d_head ** -0.5)
+        normal = normal.flatten(1)                                # (B, 6400)
+
+        # Canonical promotions: rank 6 → rank 7 (our pawns, after the flip).
+        from_tok = tokens[:, (self.board_h - 2) * W: (self.board_h - 1) * W]   # (B, 10, C)
+        to_tok   = tokens[:, (self.board_h - 1) * W: self.board_h * W]         # (B, 10, C)
+        pq = self.promo_q(from_tok).view(B, W, self.N_PROMO, self.d_promo)
+        pk = self.promo_k(to_tok)                                              # (B, 10, d)
+        # → (B, from_file, to_file, promo); flattening gives
+        #   f*60 + t*6 + p = (f*10 + t)*6 + p, matching the 6400+ layout.
+        promo = torch.einsum('bfpd,btd->bftp', pq, pk) * (self.d_promo ** -0.5)
+        promo = promo.flatten(1)                                  # (B, 600)
+        return torch.cat([normal, promo], dim=1)                  # (B, 7000)
+
+
+def reachable_policy_indices(board_h: int = 8, board_w: int = 10):
+    """Indices of POLICY_SIZE that a legal move can ever occupy.
+
+    Normal moves are encoded `from*80 + to`, which spans all 6400 square pairs —
+    but on a 10x8 board only queen lines and knight jumps are reachable by any
+    piece in this variant (archbishop = B+N, chancellor = R+N add no new
+    geometry). Promotions live at `6400 + (from_file*10 + to_file)*6 + piece`
+    and a pawn changes file by at most one.
+
+    2672 of 7000 indices survive. The other 4328 rows of a dense
+    `Linear(*, 7000)` can only ever learn to output -inf: 11.1M parameters in
+    the policy head, and as many again in the future head, doing nothing but
+    suppression. Measured leak onto illegal moves was 0.9-10.5% depending on the
+    head, i.e. they never fully learn it either.
+    """
+    n_sq = board_h * board_w
+    out = []
+    for f in range(n_sq):
+        fr, fc = divmod(f, board_w)
+        for t in range(n_sq):
+            if f == t:
+                continue
+            dr, dc = divmod(t, board_w)[0] - fr, divmod(t, board_w)[1] - fc
+            straight = dr == 0 or dc == 0 or abs(dr) == abs(dc)
+            knight = (abs(dr), abs(dc)) in ((1, 2), (2, 1))
+            if straight or knight:
+                out.append(f * n_sq + t)
+    for ff in range(board_w):
+        for tf in range(board_w):
+            if abs(ff - tf) <= 1:
+                for pc in range(AttentionPolicyHead.N_PROMO):
+                    out.append(n_sq * n_sq + (ff * board_w + tf)
+                               * AttentionPolicyHead.N_PROMO + pc)
+    return out
+
+
+class RestrictedPolicyHead(nn.Module):
+    """Dense policy head that only carries the reachable rows.
+
+    Same shape of computation as the plain dense head — conv, norm, flatten,
+    one Linear — but the Linear emits 2672 logits instead of 7000, and they are
+    scattered back into a 7000-wide vector whose remaining entries are a large
+    negative constant. Downstream code (loss, MCTS, ONNX) sees an unchanged
+    (B, 7000) output.
+    """
+
+    NEG = -1e4
+
+    def __init__(self, channels: int, board_h: int = 8, board_w: int = 10):
+        super().__init__()
+        idx = reachable_policy_indices(board_h, board_w)
+        self.register_buffer("index", torch.tensor(idx, dtype=torch.long),
+                             persistent=False)
+        self.n_out = len(idx)
+        self.body = nn.Sequential(
+            nn.Conv2d(channels, POLICY_HEAD_CHANNELS, kernel_size=1, bias=False),
+            nn.GroupNorm(_gn_groups(POLICY_HEAD_CHANNELS), POLICY_HEAD_CHANNELS),
+            nn.Mish(inplace=True),
+            nn.Flatten(),
+        )
+        self.fc = nn.Linear(POLICY_HEAD_CHANNELS * board_h * board_w, self.n_out)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
-        x = x + self.ffn(self.ln2(x))
-        return x
+        h = self.fc(self.body(x))
+        full = h.new_full((h.shape[0], POLICY_SIZE), self.NEG)
+        return full.index_copy(1, self.index, h)
 
 
 class ResBlock(nn.Module):
@@ -252,7 +511,17 @@ class CapablancaNet(nn.Module):
                  enable_future: bool = True,
                  qkv_bias: bool = True,
                  use_rmsnorm: bool = False,
-                 piece_embed_dim: int = 0):
+                 piece_embed_dim: int = 0,
+                 qk_norm: bool = False,
+                 swiglu: bool = False,
+                 attn_policy: bool = False,
+                 num_registers: int = 0,
+                 value_residual: bool = False,
+                 hyper_streams: int = 0,
+                 restricted_policy: bool = False,
+                 abs_pos_embed: bool = False,
+                 wide_value: bool = False,
+                 ffn_mult: int = 2):
         super().__init__()
         self.num_channels = num_channels
         self.num_res_blocks = num_res_blocks
@@ -263,6 +532,16 @@ class CapablancaNet(nn.Module):
         self.qkv_bias = qkv_bias
         self.use_rmsnorm = use_rmsnorm
         self.piece_embed_dim = piece_embed_dim
+        self.qk_norm = qk_norm
+        self.swiglu = swiglu
+        self.attn_policy = attn_policy
+        self.num_registers = num_registers
+        self.value_residual = value_residual
+        self.hyper_streams = hyper_streams
+        self.restricted_policy = restricted_policy
+        self.abs_pos_embed = abs_pos_embed
+        self.wide_value = wide_value
+        self.ffn_mult = ffn_mult
 
         # ── Piece embedding (BT3 trick) ─────────────────────────────────────────
         # Per-square linear projection of the newest "what piece sits here" vector
@@ -298,11 +577,25 @@ class CapablancaNet(nn.Module):
             assert num_channels % transformer_heads == 0, \
                 f"num_channels={num_channels} must be divisible by transformer_heads={transformer_heads}"
             self.transformer_blocks = nn.ModuleList([
-                TransformerBlock(num_channels, heads=transformer_heads,
+                TransformerBlock(num_channels, heads=transformer_heads, ffn_mult=ffn_mult,
                                  board_h=self.BOARD_H, board_w=self.BOARD_W,
-                                 qkv_bias=qkv_bias, use_rmsnorm=use_rmsnorm)
+                                 qkv_bias=qkv_bias, use_rmsnorm=use_rmsnorm,
+                                 qk_norm=qk_norm, swiglu=swiglu,
+                                 value_residual=value_residual,
+                                 hyper_streams=hyper_streams)
                 for _ in range(num_transformer_blocks)
             ])
+            if hyper_streams > 0:
+                # Final aggregation of the widened residual back to one stream.
+                self.hc_out = nn.Parameter(torch.zeros(hyper_streams))
+            # Register tokens ("Vision Transformers Need Registers", Darcet 2023):
+            # a few learnable non-square tokens the attention can use as scratch
+            # space for global state, instead of hijacking a real board square to
+            # store it. Dropped again before the tokens go back to (B, C, H, W).
+            if num_registers > 0:
+                self.registers = nn.Parameter(
+                    torch.zeros(1, num_registers, num_channels))
+                nn.init.normal_(self.registers, std=0.02)
         else:
             self.transformer_blocks = nn.ModuleList([])
 
@@ -315,13 +608,20 @@ class CapablancaNet(nn.Module):
         # 32 channels → 2560 features: tactical sharpness noticeably improves.
         # Cost: Linear(2560,7000)=17.9M vs (640,7000)=4.5M parameters.
         # LC0 uses 32-128 channels in the policy bottleneck.
-        self.policy_head = nn.Sequential(
-            nn.Conv2d(num_channels, POLICY_HEAD_CHANNELS, kernel_size=1, bias=False),
-            nn.GroupNorm(_gn_groups(POLICY_HEAD_CHANNELS), POLICY_HEAD_CHANNELS),
-            nn.Mish(inplace=True),
-            nn.Flatten(),
-            nn.Linear(POLICY_HEAD_CHANNELS * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
-        )
+        if attn_policy:
+            self.policy_head = AttentionPolicyHead(
+                num_channels, board_h=self.BOARD_H, board_w=self.BOARD_W)
+        else:
+            self.policy_head = (
+                RestrictedPolicyHead(num_channels, self.BOARD_H, self.BOARD_W)
+                if restricted_policy else
+                nn.Sequential(
+                    nn.Conv2d(num_channels, POLICY_HEAD_CHANNELS, kernel_size=1, bias=False),
+                    nn.GroupNorm(_gn_groups(POLICY_HEAD_CHANNELS), POLICY_HEAD_CHANNELS),
+                    nn.Mish(inplace=True),
+                    nn.Flatten(),
+                    nn.Linear(POLICY_HEAD_CHANNELS * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
+                ))
 
         # ── Value head (WDL) ─────────────────────────────────────────────────────
         # Outputs 3 logits: [Win, Draw, Loss].
@@ -329,14 +629,15 @@ class CapablancaNet(nn.Module):
         # WDL gives better gradients than scalar Tanh:
         #   - the network explicitly learns to distinguish "sharp position" vs "dead draw"
         #   - cross-entropy loss instead of MSE — more stable training
+        v_ch, v_hid = (32, 512) if wide_value else (8, 256)
         self.value_head = nn.Sequential(
-            nn.Conv2d(num_channels, 8, kernel_size=1, bias=False),
-            nn.GroupNorm(_gn_groups(8), 8),
+            nn.Conv2d(num_channels, v_ch, kernel_size=1, bias=False),
+            nn.GroupNorm(_gn_groups(v_ch), v_ch),
             nn.Mish(inplace=True),
             nn.Flatten(),
-            nn.Linear(8 * self.BOARD_H * self.BOARD_W, 256),
+            nn.Linear(v_ch * self.BOARD_H * self.BOARD_W, v_hid),
             nn.Mish(inplace=True),
-            nn.Linear(256, 3),   # [Win, Draw, Loss] logits
+            nn.Linear(v_hid, 3),   # [Win, Draw, Loss] logits
         )
 
         # ── Moves-Left Head (LC0 MLH) ─────────────────────────────────────────────
@@ -362,13 +663,27 @@ class CapablancaNet(nn.Module):
         # Used ONLY during training (trunk shape), not needed at inference.
         # Architecture like policy head: 32-channel bottleneck → 7000 logits.
         if enable_future:
-            self.future_head = nn.Sequential(
-                nn.Conv2d(num_channels, POLICY_HEAD_CHANNELS, kernel_size=1, bias=False),
-                nn.GroupNorm(_gn_groups(POLICY_HEAD_CHANNELS), POLICY_HEAD_CHANNELS),
-                nn.Mish(inplace=True),
-                nn.Flatten(),
-                nn.Linear(POLICY_HEAD_CHANNELS * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
-            )
+            # Same shape of problem as the policy head, so the same head type.
+            if attn_policy:
+                self.future_head = AttentionPolicyHead(
+                    num_channels, board_h=self.BOARD_H, board_w=self.BOARD_W)
+            else:
+                self.future_head = nn.Sequential(
+                    nn.Conv2d(num_channels, POLICY_HEAD_CHANNELS, kernel_size=1, bias=False),
+                    nn.GroupNorm(_gn_groups(POLICY_HEAD_CHANNELS), POLICY_HEAD_CHANNELS),
+                    nn.Mish(inplace=True),
+                    nn.Flatten(),
+                    nn.Linear(POLICY_HEAD_CHANNELS * self.BOARD_H * self.BOARD_W, POLICY_SIZE),
+                )
+
+        # Absolute position on the token stream. The conv trunk only knows
+        # where a square is through padding at the edges, and the attention
+        # stack sees a bag of 80 tokens plus a RELATIVE bias — nothing says
+        # "this token is e4". 80*C parameters, 1 MAC each.
+        if abs_pos_embed:
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, self.BOARD_H * self.BOARD_W, num_channels))
+            nn.init.normal_(self.pos_embed, std=0.02)
 
         self._init_weights()
 
@@ -384,12 +699,11 @@ class CapablancaNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # Policy head final Linear: gain=0.01 → nearly uniform softmax at init.
-        # Only affects freshly initialised networks, not pre-trained weights.
-        policy_linear = list(self.policy_head.children())[-1]
-        if isinstance(policy_linear, nn.Linear):
-            nn.init.xavier_uniform_(policy_linear.weight, gain=0.01)
-            nn.init.zeros_(policy_linear.bias)
+        # Policy head: start near-uniform so the first searches are not biased by
+        # random noise. For the Linear head that is a small gain on the last
+        # layer; for the bilinear head it is a small gain on the q/k projections
+        # (the logits are their dot product, so the scale enters twice).
+        self._init_policy_like(self.policy_head)
 
         # Value head final Linear (WDL, 3 outputs): gain=0.01 →
         # logits ≈ 0 at init → softmax gives [0.33, 0.33, 0.33].
@@ -407,12 +721,21 @@ class CapablancaNet(nn.Module):
                 nn.init.xavier_uniform_(mlh_linear.weight, gain=0.01)
                 nn.init.zeros_(mlh_linear.bias)
 
-        # Future head final Linear: gain=0.01 → nearly uniform softmax at init.
+        # Future head: same treatment as the policy head.
         if self.enable_future:
-            future_linear = list(self.future_head.children())[-1]
-            if isinstance(future_linear, nn.Linear):
-                nn.init.xavier_uniform_(future_linear.weight, gain=0.01)
-                nn.init.zeros_(future_linear.bias)
+            self._init_policy_like(self.future_head)
+
+    @staticmethod
+    def _init_policy_like(head):
+        if isinstance(head, AttentionPolicyHead):
+            for lin in (head.q_proj, head.k_proj, head.promo_q, head.promo_k):
+                nn.init.xavier_uniform_(lin.weight, gain=0.1)
+                nn.init.zeros_(lin.bias)
+            return
+        last = list(head.children())[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.xavier_uniform_(last.weight, gain=0.01)
+            nn.init.zeros_(last.bias)
 
     def forward(self, x: torch.Tensor):
         """
@@ -439,17 +762,50 @@ class CapablancaNet(nn.Module):
             x = block(x)
 
         # Transformer "head": (B, C, 8, 10) → (B, 80, C) → blocks → back.
+        B, C, H, W = x.shape
+        tokens = None
         if len(self.transformer_blocks) > 0:
-            B, C, H, W = x.shape
             tokens = x.flatten(2).transpose(1, 2).contiguous()  # (B, 80, C)
+            if self.abs_pos_embed:
+                tokens = tokens + self.pos_embed
+            n_reg = self.num_registers
+            if n_reg > 0:
+                # Registers ride along through the blocks, then are dropped —
+                # they exist only to give attention somewhere to park global
+                # state that is not tied to a board square.
+                tokens = torch.cat([self.registers.expand(B, -1, -1), tokens], dim=1)
+            if self.hyper_streams > 0:
+                # Widen: every stream starts as a copy, so the stack begins
+                # exactly equivalent to a single-stream residual.
+                tokens = tokens.unsqueeze(2).expand(
+                    -1, -1, self.hyper_streams, -1).contiguous()
+            v_first = None
             for tb in self.transformer_blocks:
-                tokens = tb(tokens)
+                # v_first stays the FIRST block's values for the whole stack —
+                # that is the point of ResFormer, not a running previous-layer V.
+                tokens, v = tb(tokens, v_first)
+                if v_first is None:
+                    v_first = v
+            if self.hyper_streams > 0:
+                w = torch.softmax(self.hc_out, dim=0).view(1, 1, -1, 1)
+                tokens = (tokens * w).sum(dim=2)
+            if n_reg > 0:
+                tokens = tokens[:, n_reg:]
+            tokens = tokens.contiguous()
             x = tokens.transpose(1, 2).contiguous().view(B, C, H, W)
 
-        policy     = self.policy_head(x)
+        if self.attn_policy and tokens is None:
+            # Pure-ResNet trunk (no transformer blocks): the bilinear head still
+            # wants per-square tokens, so read them straight off the feature map.
+            tokens = x.flatten(2).transpose(1, 2).contiguous()
+
+        policy     = self.policy_head(tokens if self.attn_policy else x)
         wdl_logits = self.value_head(x)
         mlh_raw    = self.mlh_head(x) if self.enable_mlh else None
-        future     = self.future_head(x) if self.enable_future else None
+        if self.enable_future:
+            future = self.future_head(tokens if self.attn_policy else x)
+        else:
+            future = None
         return policy, wdl_logits, mlh_raw, future
 
     def inference(self, x: torch.Tensor):
@@ -471,6 +827,47 @@ class CapablancaNet(nn.Module):
         else:
             m = torch.zeros_like(q)
         return F.softmax(logits, dim=1), q, d, m
+
+
+def describe_arch(net) -> str:
+    """One-line architecture summary, used by every tool that loads a checkpoint.
+
+    Lists the trunk shape and parameter count always, and then only the knobs
+    that differ from the defaults — so a legacy net prints nothing extra and an
+    unusual one is impossible to miss. It lives here because export_onnx.py,
+    eval.py and game_stats.py each used to build their own string and each
+    listed a different subset; adding a flag then silently failed to show up.
+    """
+    opts = []
+    for name, attr, default in (
+        ("attn-policy", "attn_policy", False),
+        ("qk-norm", "qk_norm", False),
+        ("swiglu", "swiglu", False),
+        ("value-residual", "value_residual", False),
+        ("rmsnorm", "use_rmsnorm", False),
+        ("no-qkv-bias", "qkv_bias", True),
+        ("no-mlh", "enable_mlh", True),
+        ("no-future", "enable_future", True),
+        ("restricted-policy", "restricted_policy", False),
+        ("abs-pos", "abs_pos_embed", False),
+        ("wide-value", "wide_value", False),
+    ):
+        if getattr(net, attr, default) != default:
+            opts.append(name)
+    if getattr(net, "ffn_mult", 2) != 2:
+        opts.append(f"ffn×{net.ffn_mult}")
+    for name, attr in (("registers", "num_registers"),
+                       ("hyper-streams", "hyper_streams"),
+                       ("piece-embed", "piece_embed_dim")):
+        v = getattr(net, attr, 0)
+        if v:
+            opts.append(f"{name}={v}")
+    n = sum(p.numel() for p in net.parameters())
+    tb = (f" + {net.num_transformer_blocks}tb({net.transformer_heads}h)"
+          if net.num_transformer_blocks else " (без трансформера)")
+    return (f"{net.num_channels}ch × {net.num_res_blocks}bl{tb} · "
+            f"{n / 1e6:.1f}M параметров · "
+            + (", ".join(opts) if opts else "все флаги по умолчанию"))
 
 
 def build_net_from_state_dict(raw_sd: dict):
@@ -504,11 +901,50 @@ def build_net_from_state_dict(raw_sd: dict):
                    and "transformer_blocks.0.ln1.bias" not in sd)
     piece_embed_w = sd.get("piece_embed.weight")
     piece_embed_dim = piece_embed_w.shape[0] if piece_embed_w is not None else 0
+    # Modern-stack toggles, all detectable from the saved tensors:
+    #   attention policy head → policy_head.q_proj instead of policy_head.4
+    #   QK-norm               → transformer_blocks.0.attn.q_norm.weight
+    #   SwiGLU FFN            → ffn.w_in / ffn.w_out instead of ffn.0 / ffn.2
+    #   register tokens       → a `registers` parameter, shape (1, N, C)
+    attn_policy = "policy_head.q_proj.weight" in sd
+    qk_norm = "transformer_blocks.0.attn.q_norm.weight" in sd
+    swiglu = "transformer_blocks.0.ffn.w_in.weight" in sd
+    reg = sd.get("registers")
+    num_registers = reg.shape[1] if reg is not None else 0
+    value_residual = "transformer_blocks.0.attn.value_res_lambda" in sd
+    hc = sd.get("transformer_blocks.0.hc_attn.pre")
+    hyper_streams = hc.shape[0] if hc is not None else 0
+    restricted_policy = "policy_head.fc.weight" in sd
+    abs_pos_embed = "pos_embed" in sd
+    vw = sd.get("value_head.4.weight")
+    wide_value = vw is not None and vw.shape[0] == 512
+    fw = sd.get("transformer_blocks.0.ffn.w_in.weight")
+    # SwiGLU: w_in = (2*hidden, d), hidden = d*mult*2/3
+    ffn_mult = max(1, round(fw.shape[0] / 2 * 3 / (2 * ch))) if fw is not None else 2
     net = CapablancaNet(num_channels=ch, num_res_blocks=bl,
                         num_transformer_blocks=tb, transformer_heads=heads,
                         enable_mlh=enable_mlh, enable_future=enable_future,
                         qkv_bias=qkv_bias, use_rmsnorm=use_rmsnorm,
-                        piece_embed_dim=piece_embed_dim)
+                        piece_embed_dim=piece_embed_dim,
+                        qk_norm=qk_norm, swiglu=swiglu,
+                        attn_policy=attn_policy, num_registers=num_registers,
+                        value_residual=value_residual,
+                        hyper_streams=hyper_streams,
+                        restricted_policy=restricted_policy,
+                        abs_pos_embed=abs_pos_embed,
+                        wide_value=wide_value, ffn_mult=ffn_mult)
     target = net.state_dict()
-    sd = {k: v for k, v in sd.items() if k in target and v.shape == target[k].shape}
-    return net, sd
+    # Drop entries whose shape doesn't match the reconstructed arch. Since the
+    # arch is inferred FROM this state_dict, drops should be ~empty; a non-trivial
+    # drop means a genuine mismatch worth surfacing rather than loading silently
+    # with default-initialised weights (e.g. a head that won't actually load).
+    kept = {k: v for k, v in sd.items() if k in target and v.shape == target[k].shape}
+    dropped = [k for k in sd if k not in kept]
+    weighty = [k for k in dropped if k.endswith(".weight") or k.endswith(".bias")]
+    if weighty:
+        import warnings
+        warnings.warn(
+            f"build_net_from_state_dict: dropped {len(weighty)} weight tensor(s) "
+            f"on shape/key mismatch — these stay default-initialised. "
+            f"First few: {weighty[:5]}", stacklevel=2)
+    return net, kept

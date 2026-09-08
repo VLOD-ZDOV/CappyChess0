@@ -1,8 +1,8 @@
 # ♛ Capablanca Chess Zero
 
 **An AlphaZero-style engine trained entirely from self-play** — no human games,
-no opening books, no handcrafted evaluation. The network discovers everything on
-its own board.
+no opening books, no handcrafted evaluation. The network discovers everything
+on its own board.
 
 The project has three parts:
 
@@ -10,21 +10,155 @@ The project has three parts:
 |------|-------|------|
 | **Engine** | Rust + PyO3 | move generation, rules, MCTS primitives |
 | **Training** | Python + PyTorch | self-play, replay buffer, network training |
-| **Analysis** | PyQt5 | a Nibbler-style GUI for reviewing games |
+| **Analysis** | PyQt5 + onnxruntime | a Nibbler-style GUI for reviewing games |
+
+---
+
+## ⚡ Quick start
+
+Copy-paste, in order. Everything runs from the repository root unless stated.
+
+### 1. Dependencies
+
+```bash
+python -m venv venv && source venv/bin/activate     # fish: source venv/bin/activate.fish
+pip install maturin numpy torch
+```
+
+### 2. Build the Rust engine
+
+It compiles into a Python module named `capablanca_engine`. Without this step
+nothing else imports.
+
+```bash
+cd rust_engine
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release
+cd ..
+```
+
+Check it worked:
+
+```bash
+python -c "import capablanca_engine; print('ok')"
+```
+
+### 3. Get a network
+
+Either download one from [Releases](../../releases) into `python_src/`, or
+train your own (next step). Everything below assumes a `.pth` file exists.
+
+### 4. Play against it in the terminal
+
+```bash
+cd python_src
+python play_cli.py <weights.pth> --sims 800 --side white
+```
+
+Moves are UCI: `e2e4`, promotions get a suffix (`q r b n a c` — `a` archbishop,
+`c` chancellor). `moves` lists legal moves, `quit` exits.
+
+Over SSH, one move per invocation, state kept in a file:
+
+```bash
+python play_cli.py <weights.pth> --new              # start a game
+python play_cli.py <weights.pth> --move e2e4        # your move, engine replies
+```
+
+### 5. Train
+
+```bash
+cd python_src
+python -u train.py \
+    --channels 256 --res-blocks 10 \
+    --transformer-blocks 10 --transformer-heads 8 --ffn-mult 4 \
+    --restricted-policy --abs-pos-embed --wide-value --no-future \
+    --games 128 --mcts-batch 128 --mcts-parallel-sims 8 \
+    --simulations 600 --fast-simulations 150 \
+    --batch-size 512 --train-steps 200 \
+    --buffer-max 150000 --lr 2e-4 \
+    --save-every 10 --checkpoint-dir checkpoints
+```
+
+Two settings deserve attention, because getting them wrong quietly wrecks
+training rather than crashing:
+
+- **`--mcts-parallel-sims`** is how many leaves go to the GPU per call.
+  `ceil(--simulations / --mcts-parallel-sims)` is the number of *sequential*
+  PUCT rounds the search gets. Below about 12 rounds virtual loss spreads the
+  visits flat across the root and the stored policy target degenerates towards
+  uniform. Keep the ratio at 12 or more.
+- **`--simulations`** decides how accurate that target is, and the network
+  cannot end up sharper than what it is trained on.
+
+**Run long training outside your terminal multiplexer**, not inside a pane —
+if the multiplexer server dies it takes the run with it:
+
+```bash
+setsid nohup python -u train.py ... >> train.log 2>&1 < /dev/null &
+tail -f train.log
+```
+
+### 6. Check that it is actually learning
+
+Loss alone will not tell you. Two commands:
+
+```bash
+python policy_health.py checkpoints/model_iter*.pth
+```
+
+Reports `max(p)*n_legal` — how much sharper than uniform the best move is.
+`1.0` is uniform, `1.04` is a randomly initialised head, `3.5+` is healthy. A
+value drifting downwards means the policy head is being flattened; the loss
+curve looks like a plateau while this happens.
+
+```bash
+python eval.py <old.pth> <new.pth> --games 200 --simulations 200 \
+       --mcts-parallel-sims 8
+```
+
+Head-to-head is the only trustworthy strength measure here. Score against a
+random mover ranks networks in the *wrong order* — a stronger network draws
+more against a random opponent because it fails to convert, not because it
+plays worse.
+
+For an absolute reading, use the Fairy-Stockfish ladder — and use
+`Skill Level`, not `--fsf-nodes`; node limits barely weaken the engine, so
+every network in this project scored 0% against it regardless of strength.
+
+### 7. GUI
+
+```bash
+pip install -r python_src/requirements.txt   # PyQt5 + onnxruntime-gpu
+pip install onnx onnxscript
+python python_src/export_onnx.py <weights.pth> capablanca.onnx
+python python_src/gui.py
+```
+
+Export from a *snapshot*, never from a `latest.pth` that a training run is
+still overwriting.
 
 ---
 
 ## ✨ Highlights
 
-- **A pure AlphaZero loop**: self-play → replay buffer → training → a stronger network.
+- **A pure AlphaZero loop**: self-play → replay buffer → training → a stronger
+  network.
 - **Hybrid network**: a convolutional ResNet trunk with Squeeze-Excitation,
-  topped by Transformer blocks with a Relative Position Bias.
+  topped by Transformer blocks with a Relative Position Bias. Attention runs
+  through PyTorch's fused `scaled_dot_product_attention` — picks FlashAttention
+  or memory-efficient backend automatically.
 - **Four output heads**: policy, value (WDL), moves-left, and a training-only
   "future move" head.
-- **Transposition-aware MCTS**: positions reached by different move orders are
-  merged into a single search node — something Lc0 deliberately avoids.
+- **Transposition-aware MCTS** (in the GUI): positions reached by different
+  move orders are merged into a single search node — something Lc0
+  deliberately avoids.
+- **Tree reuse across moves**: after a played move the relevant sub-tree
+  becomes the new root; statistics carry over.
 - **Curriculum vs. Fairy-Stockfish**: an adaptive teacher that tracks the
   network's current strength.
+- **Self-contained GUI**: a single `.onnx` file + Rust engine binary. No
+  PyTorch needed at inference time. Optional CUDA acceleration via
+  `onnxruntime-gpu` (CUDA runtime ships inside the wheel).
 
 ---
 
@@ -45,14 +179,15 @@ One training iteration is a closed loop:
 
 1. **Self-play.** The current network plays a large batch of games against
    itself. Every move is chosen by an MCTS search guided by the network's
-   policy and value outputs. The search visit counts become the *policy target*;
-   the game result (mixed with bootstrap values) becomes the *value target*.
-2. **Replay buffer.** Positions from recent iterations are kept in a FIFO buffer
-   and sampled with win/draw/loss balancing.
+   policy and value outputs. The search visit counts become the *policy
+   target*; the game result (mixed with bootstrap values) becomes the
+   *value target*.
+2. **Replay buffer.** Positions from recent iterations are kept in a FIFO
+   buffer and sampled with win/draw/loss balancing.
 3. **Training.** The network is trained to predict the search policy, the game
    outcome, the moves-left estimate, and the future move — a multi-task loss.
-4. **Repeat.** The improved network feeds the next round of self-play. Strength
-   compounds iteration over iteration.
+4. **Repeat.** The improved network feeds the next round of self-play.
+   Strength compounds iteration over iteration.
 
 Optionally, a fraction of games are played against **Fairy-Stockfish** as an
 external teacher (see *Curriculum* below).
@@ -80,7 +215,8 @@ meta:
   1  all-ones plane (a CNN edge-detection helper)
 ```
 
-History planes give the network a sense of motion and let it detect repetitions.
+History planes give the network a sense of motion and let it detect
+repetitions.
 
 ### Trunk
 
@@ -97,13 +233,13 @@ input  (139, 8, 10)
    ▼  reshape to 80 tokens (one per square)
    │
    ▼  K × TransformerBlock                     ── attention tower
-   │     Pre-LN → MHA(+RPB) → +residual
+   │     Pre-LN → MHA(+RPB via SDPA) → +residual
    │     Pre-LN → FFN(Mish) → +residual
    │
    ▼  reshape back to (C, 8, 10) → heads
 ```
 
-A few deliberate choices:
+Deliberate choices:
 
 - **GroupNorm, not BatchNorm.** GroupNorm has no running statistics, so it
   behaves identically at batch size 1 (MCTS leaf inference) and does not drift
@@ -114,11 +250,14 @@ A few deliberate choices:
   per-channel **scale and a bias**, letting the network re-weight feature maps
   based on global board context.
 - **Transformer with a Relative Position Bias (RPB).** The 80 squares become
-  tokens, and self-attention connects any two squares in a single step. The bias
-  is keyed purely on the *offset* `(Δrank, Δfile)` between two squares: a knight
-  jump is the same offset everywhere, so the network learns board geometry from
-  the start. RPB costs ~2.3K parameters per block — three orders of magnitude
-  cheaper than Smolgen-style alternatives.
+  tokens, and self-attention connects any two squares in a single step. The
+  bias is keyed purely on the *offset* `(Δrank, Δfile)` between two squares:
+  a knight jump is the same offset everywhere, so the network learns board
+  geometry from the start. RPB costs ~2.3K parameters per block — three orders
+  of magnitude cheaper than Smolgen-style alternatives.
+- **`scaled_dot_product_attention`** instead of hand-rolled `matmul + softmax`.
+  PyTorch picks the best backend (FlashAttention, memory-efficient, or math)
+  based on shapes and hardware. RPB rides in as an additive `attn_mask`.
 
 ### Output heads
 
@@ -133,9 +272,9 @@ The policy and future heads use a 32-channel `1×1` bottleneck before the final
 linear layer. That width is deliberate: a narrower bottleneck makes the
 7000-way output physically low-rank and blunts tactical sharpness.
 
-A WDL value head (rather than a single `tanh` scalar) gives cleaner gradients —
-the network explicitly separates "sharp, double-edged" from "dead drawn", and
-trains under cross-entropy instead of MSE.
+A WDL value head (rather than a single `tanh` scalar) gives cleaner gradients
+— the network explicitly separates "sharp, double-edged" from "dead drawn",
+and trains under cross-entropy instead of MSE.
 
 At init the head output layers are scaled down (`gain = 0.01`), so a fresh
 network starts from near-uniform move priors and a flat `[⅓, ⅓, ⅓]` WDL — no
@@ -150,17 +289,59 @@ blocks** (8 attention heads).
 
 - **PUCT selection** with parameters carried over from Lc0 (`c_puct = 1.745`,
   logarithmic `c_puct` growth, `FPU = 0.330`, virtual loss).
+- **Virtual loss as a real divergence force.** Each in-flight leaf marks its
+  ancestors with a `-1` penalty in the numerator of Q. Parallel selects
+  therefore scatter across distinct moves instead of all collapsing onto the
+  current best line. The vloss is removed exactly once, when the leaf's NN
+  evaluation comes back — never inside `backup`.
 - **Board-less nodes** — a node is ~60 bytes; the position is reconstructed by
   replaying moves, which keeps the tree cache-friendly.
-- **Batched search** — every self-play game in an iteration is searched together
-  so the GPU sees one large inference batch.
-- **Double buffering** — leaf collection for the next batch overlaps with the
-  inference of the current one.
-- **Tree reuse** — after a move is played the relevant subtree becomes the new
-  root; visits are not thrown away.
-- **Transposition merging** (in the analysis GUI) — search statistics live on a
-  *position* node, priors live on the *edges*, so different move orders that
-  reach the same position share one node and pool their visits.
+- **Batched search** — every self-play game in an iteration is searched
+  together so the GPU sees one large inference batch.
+- **Bucket-padded inference** for `torch.compile(mode='reduce-overhead')`.
+  Input batch is padded up to the next power-of-two so only ~10 distinct
+  shapes ever reach the compiled graph — CUDA Graphs stick instead of
+  recompiling on every step.
+- **Tree reuse** — after a move is played the relevant subtree becomes the
+  new root; visits are not thrown away.
+- **Transposition merging** (in the analysis GUI) — search statistics live on
+  a *position* node, priors live on the *edges*, so different move orders
+  that reach the same position share one node and pool their visits.
+- **KLD early-exit** — search stops once the visit distribution settles
+  (Lc0-style).
+- **Contempt** (optional) — Q is biased by `contempt * draw_prob`. Positive
+  contempt makes the engine avoid draws (good vs weaker external opponents);
+  negative makes it accept them.
+- **Add-dirichlet toggle.** Self-play turns it on (exploration); eval / FSF /
+  lagged play turn it off for a deterministic measurement of the network's
+  actual choice.
+
+---
+
+## 🎛 GUI features
+
+The analysis GUI (`python_src/gui.py`) loads a single `.onnx` graph and runs
+through `onnxruntime`. No PyTorch dependency at inference time.
+
+- **Two-pass arrow rendering** — Nibbler-style. All arrows drawn first,
+  labels on top in a second pass. Width and alpha scale with rank, so the
+  best move visually dominates. Labels are anchored to the destination
+  square (not over the shaft) and never overlap on crossing arrows.
+- **Mate display** in the side eval bar. When the top move's Q is near ±1
+  and the network's draw probability is low, the bar shows `M<n>` /
+  `-M<n>` in white POV instead of a percentage.
+- **Tree reuse across moves.** The transposition table persists between
+  searches; when a new search starts at a position already in the table, it
+  picks up the accumulated statistics.
+- **Smart prune**, not `clear`. When the ttable exceeds 500 000 nodes, only
+  the sub-tree reachable from the current position is kept. The rest is
+  dropped — no work the next search would have reused is lost.
+- **Bounded NN cache** (~150 000 entries by default, ~4 GB RAM ceiling).
+  Long sessions no longer balloon memory usage.
+- **c_puct and contempt sliders** in the toolbar. For analysis, raise
+  c_puct to 2.5-3.0 to widen the search; flip contempt positive to bias
+  away from draws.
+- **Live PV** per move (10 plies deep) inside the info box.
 
 ---
 
@@ -169,26 +350,31 @@ blocks** (8 attention heads).
 [Leela Chess Zero](https://lczero.org/) is the open AlphaZero-style chess
 project. Several of its community-tuned ideas are reused here:
 
-- **PUCT parameters** straight from Lc0's `params.cc` — tuned over millions of
-  games, not guessed.
-- **WDL value head** — predicting a Win/Draw/Loss triple instead of one scalar.
+- **PUCT parameters** straight from Lc0's `params.cc` — tuned over millions
+  of games, not guessed.
+- **WDL value head** — predicting a Win/Draw/Loss triple instead of one
+  scalar.
 - **Moves-Left Head** — for converting won positions instead of shuffling.
-- **Future-move heads** — an auxiliary planning signal, from Lc0's BT4 networks.
+- **Future-move heads** — an auxiliary planning signal, from Lc0's BT4
+  networks.
 - **Transformer trunk with relative position encoding** — in the spirit of
   Lc0's BT3+ attention nets (RPB used in place of Smolgen).
 - **Mish activation** — adopted in Lc0 BT3+.
-- **Playout-cap randomization** — most moves use a cheap shallow search; only
-  full-search positions are written to the training buffer.
+- **Playout-cap randomization** — most moves use a cheap shallow search;
+  only full-search positions are written to the training buffer.
 - **KLD early exit** — a search stops once the visit distribution settles.
 - **EMA weights** — self-play runs on exponentially-averaged weights for a
   steadier feedback loop.
+- **Bounds propagation** (StickyEndgames) — proven terminal nodes bias
+  selection through ±100 score shifts so the search commits to known
+  outcomes.
 
 ## 🎛 Ideas borrowed from Nibbler
 
-[Nibbler](https://github.com/rooklift/nibbler) is a well-loved analysis GUI for
-Lc0. It is hardwired to an 8×8 board and the UCI protocol, so this network
-cannot be plugged into it — but its ideas shaped the project's own GUI
-(`python_src/gui.py`):
+[Nibbler](https://github.com/rooklift/nibbler) is a well-loved analysis GUI
+for Lc0. It is hardwired to an 8×8 board and the UCI protocol, so this
+network cannot be plugged into it — but its ideas shaped the project's own
+GUI:
 
 - a **ranked move infobox** showing `N` (visits), `P` (network prior), `Q`
   (evaluation) and a WDL bar per move;
@@ -198,8 +384,9 @@ cannot be plugged into it — but its ideas shaped the project's own GUI
 - **analysis snapshots** — scrubbing through history shows cached results
   instead of re-searching.
 
-On top of the Nibbler ideas the GUI adds its own: transposition merging in the
-search tree, and tree reuse across moves (visit accumulation).
+On top of the Nibbler ideas the GUI adds its own: transposition merging in
+the search tree, tree reuse across moves (visit accumulation), and PV lines
+for every ranked move.
 
 ---
 
@@ -207,26 +394,36 @@ search tree, and tree reuse across moves (visit accumulation).
 
 ```
 rust_engine/
-  src/lib.rs         — engine: board, move generation, rules, MCTS primitives
-  Cargo.toml         — PyO3 module build
+  src/lib.rs              — engine: board, move generation, rules, MCTS primitives
+  Cargo.toml              — PyO3 module build
 python_src/
-  train.py           — training loop + Fairy-Stockfish integration
-  mcts.py            — Python wrapper over the Rust MCTS (batching, double buffering)
-  model.py           — CapablancaNet (ResNet + Transformer + 4 heads)
-  eval.py            — round-robin tournament between checkpoints
-  export_onnx.py     — convert a .pth checkpoint into a self-contained .onnx
-  onnx_engine.py     — onnxruntime inference backend used by the GUI
-  gui.py             — Nibbler-style analysis GUI (PyQt5, GPU via onnxruntime)
-  fsf_integration.py — Fairy-Stockfish wrapper
-  requirements.txt   — GUI / inference dependencies
+  train.py                — training loop; FSF curriculum, lagged opponent and
+                            distillation are flags on this one entry point
+  mcts.py                 — Python driver for the Rust MCTS (batching, KLD)
+  model.py                — CapablancaNet (ResNet + Transformer + 4 heads)
+                            plus build_net_from_state_dict() helper
+  eval.py                 — round-robin tournament between checkpoints
+  game_stats.py           — diagnostics on a single checkpoint
+  export_onnx.py          — convert a .pth checkpoint into a self-contained .onnx
+  onnx_engine.py          — onnxruntime inference backend used by the GUI
+  gui.py                  — Nibbler-style analysis GUI
+  play_cli.py             — play against a checkpoint from a terminal (no GUI)
+  policy_health.py        — is the policy head still ranking moves, or flat?
+  distill.py              — move a trained net into a different architecture
+  bootstrap_policy.py     — re-teach the policy head from a deep search
+  check_buffer.py         — value-target distribution of a replay buffer
+  slim_checkpoints.py     — shrink checkpoints/buffers into sibling *_slim/ dirs
+  requirements.txt        — GUI / inference dependencies
+experiments/              — scripts behind the measurements quoted here
 ```
 
 ---
 
 ## 🚀 Running from source
 
-This is the raw, run-it-yourself path — install the dependencies and launch the
-scripts directly. (For shipping a one-click binary instead, see *Packaging* below.)
+This is the raw, run-it-yourself path — install the dependencies and launch
+the scripts directly. (For shipping a one-click binary instead, see
+*Packaging* below.)
 
 There are two dependency sets: the **GUI** needs only a lightweight inference
 stack, **training** additionally needs PyTorch.
@@ -235,13 +432,13 @@ stack, **training** additionally needs PyTorch.
 
 - Python 3.10+
 - A Rust toolchain (`rustup`) — to build the engine
-- For GPU inference: an up-to-date NVIDIA driver (the CUDA runtime itself ships
-  inside the `onnxruntime-gpu` wheel — no CUDA Toolkit install needed)
+- For GPU inference: an up-to-date NVIDIA driver (the CUDA runtime itself
+  ships inside the `onnxruntime-gpu` wheel — no CUDA Toolkit install needed)
 
 ### 1. Build the Rust engine
 
-The engine compiles into a Python module called `capablanca_engine`. Run inside
-`rust_engine/`:
+The engine compiles into a Python module called `capablanca_engine`. Run
+inside `rust_engine/`:
 
 ```bash
 pip install maturin
@@ -256,8 +453,8 @@ GUI / inference only:
 pip install -r python_src/requirements.txt
 ```
 
-That is `numpy`, `PyQt5` and `onnxruntime-gpu` — for a machine without an NVIDIA
-GPU, replace `onnxruntime-gpu` with `onnxruntime`.
+That is `numpy`, `PyQt5` and `onnxruntime-gpu` — for a machine without an
+NVIDIA GPU, replace `onnxruntime-gpu` with `onnxruntime`.
 
 Training additionally needs PyTorch — install the build matching your CUDA:
 
@@ -270,31 +467,46 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 From scratch (self-play):
 
 ```bash
-python train.py --channels 256 --res-blocks 15 \
-                --transformer-blocks 4 --transformer-heads 8 \
-                --simulations 1000 --games 2048
+python train.py --channels 256 --res-blocks 10 \
+                --transformer-blocks 10 --transformer-heads 8 --ffn-mult 4 \
+                --restricted-policy --abs-pos-embed --wide-value --no-future \
+                --simulations 600 --games 128 \
+                --mcts-batch 128 --mcts-parallel-sims 8 \
+                --kld-threshold 8e-3 \
+                --compile-inference default
 ```
 
-With a Fairy-Stockfish teacher (curriculum) — the opponent's strength rises when
-the win-rate is high and drops when it falls, so the network always plays at the
-edge of its ability:
+With a Fairy-Stockfish teacher (curriculum) — the opponent's strength rises
+when the win-rate is high and drops when it falls, so the network always
+plays at the edge of its ability:
 
 ```bash
 python train.py --channels 256 --res-blocks 15 \
                 --fsf-path ./fairy-stockfish-largeboard_x86-64-bmi2 \
-                --curriculum --fsf-nodes-start 1 --curriculum-sp-ratio 0.5
+                --curriculum --fsf-nodes-start 1 --curriculum-sp-ratio 0.5 \
+                --contempt 0.2
 ```
+
+`--contempt 0.2` is useful **only when playing against an external opponent**
+(FSF). In pure self-play both sides apply contempt symmetrically and the
+training signal gets a structural shift — keep contempt at 0 for pure
+self-play.
 
 ### 4. Export the network to ONNX *(needs PyTorch)*
 
-The GUI runs an `.onnx` graph, not a `.pth` checkpoint. Convert once:
+The GUI runs an `.onnx` graph, not a `.pth` checkpoint. The exporter uses
+PyTorch's ONNX path, which also needs `onnx` and `onnxscript`:
 
 ```bash
+pip install onnx onnxscript
 python export_onnx.py checkpoints_big/latest.pth capablanca.onnx
 ```
 
-This bakes architecture **and** weights into one binary file and pre-applies the
-softmax / WDL reduction — so the GUI itself carries no PyTorch dependency.
+This bakes architecture **and** weights into one binary file and pre-applies
+the softmax / WDL reduction — so the GUI itself carries no PyTorch
+dependency. The exporter first tries the modern dynamo path and silently
+falls back to the legacy TorchScript exporter if needed (see
+`KNOWN_QUIRKS.md`).
 
 ### 5. Run the analysis GUI
 
@@ -303,14 +515,20 @@ python gui.py
 ```
 
 If `capablanca.onnx` sits next to `gui.py` it loads automatically; otherwise
-pick one through «Загрузить сеть». GPU acceleration is automatic when an NVIDIA
-GPU is present (the status bar shows `GPU · CUDA`), with a silent CPU fallback.
+pick one through «Загрузить сеть». GPU acceleration is automatic when an
+NVIDIA GPU is present (the status bar shows `GPU · CUDA`), with a silent
+CPU fallback.
 
 ### Tournament between two checkpoints *(needs PyTorch)*
 
 ```bash
-python eval.py <weights_A.pth> <weights_B.pth> --max 100
+python eval.py <weights_A.pth> <weights_B.pth> --games 200 \
+       --simulations 200 --mcts-parallel-sims 8
 ```
+
+`eval.py` recovers the **full** architecture from the checkpoint (channels,
+res blocks, transformer blocks, heads, mlh/future toggles), so comparing two
+checkpoints with different shapes works correctly.
 
 ---
 
@@ -319,18 +537,21 @@ python eval.py <weights_A.pth> <weights_B.pth> --max 100
 To distribute the GUI without making users install Python and dependencies:
 
 1. Export the final network with `export_onnx.py` (single `capablanca.onnx`).
-2. Build the Rust engine for the target OS (`.so` on Linux, `.pyd` on Windows).
+2. Build the Rust engine for the target OS (`.so` on Linux, `.pyd` on
+   Windows).
 3. Bundle with **PyInstaller**:
 
    ```bash
    pyinstaller --onedir --windowed --name capablanca-gui gui.py
    ```
 
-4. Place `capablanca.onnx` next to the produced executable — the GUI auto-loads it.
+4. Place `capablanca.onnx` next to the produced executable — the GUI
+   auto-loads it.
 
-`onnxruntime-gpu` carries the CUDA runtime, so the bundle runs GPU-accelerated on
-any machine with an NVIDIA driver — no PyTorch, no CUDA Toolkit. Builds are
-per-OS (no cross-compilation): build on Linux for Linux, on Windows for Windows.
+`onnxruntime-gpu` carries the CUDA runtime, so the bundle runs
+GPU-accelerated on any machine with an NVIDIA driver — no PyTorch, no
+CUDA Toolkit. Builds are per-OS (no cross-compilation): build on Linux for
+Linux, on Windows for Windows.
 
 ---
 
@@ -338,38 +559,56 @@ per-OS (no cross-compilation): build on Linux for Linux, on Windows for Windows.
 
 A learning / research project. Ideas and thanks:
 
-- **[AlphaZero](https://www.science.org/doi/10.1126/science.aar6404)** (DeepMind) — the overall method.
-- **[Leela Chess Zero](https://lczero.org/)** — MCTS parameters, the WDL / MLH / future heads, the Transformer trunk.
-- **[Nibbler](https://github.com/rooklift/nibbler)** — the analysis-GUI concept.
-- **[Fairy-Stockfish](https://github.com/fairy-stockfish/Fairy-Stockfish)** — teacher and sparring partner.
+- **[AlphaZero](https://www.science.org/doi/10.1126/science.aar6404)**
+  (DeepMind) — the overall method.
+- **[Leela Chess Zero](https://lczero.org/)** — MCTS parameters, the WDL /
+  MLH / future heads, the Transformer trunk.
+- **[Nibbler](https://github.com/rooklift/nibbler)** — the analysis-GUI
+  concept.
+- **[Fairy-Stockfish](https://github.com/fairy-stockfish/Fairy-Stockfish)** —
+  teacher and sparring partner.
+
+See `ROADMAP.md` for planned improvements and `KNOWN_QUIRKS.md` for
+intentional design choices and PyTorch/ONNX ecosystem quirks.
 
 ---
 
-## Кратко по-русски
+## 🇷🇺 Кратко по-русски
 
-AlphaZero-движок, обучаемый **только** на self-play — без человеческих партий и
-дебютных книг.
+AlphaZero-движок, обучаемый **только** на self-play — без человеческих
+партий и дебютных книг.
 
 **Цикл обучения:** сеть играет батч партий сама с собой, поиск MCTS даёт
 policy-таргеты (визиты) и value-таргеты (результат); позиции копятся в
-FIFO-буфере; сеть обучается на мульти-таргет лоссе (policy + value + moves-left
-+ future) → новые веса → следующий раунд self-play.
+FIFO-буфере; сеть обучается на мульти-таргет лоссе (policy + value +
+moves-left + future) → новые веса → следующий раунд self-play.
 
-**Сеть `CapablancaNet`:** вход 139 плоскостей (8 досок истории × 17 + 3 мета,
-канонический флип под сторону хода) → input-conv → башня ResNet-блоков со
-Squeeze-Excitation → блоки Transformer с относительным позиционным смещением
-(RPB) → четыре головы:
+**Сеть `CapablancaNet`:** вход 139 плоскостей (8 досок истории × 17 + 3
+мета, канонический флип под сторону хода) → input-conv → башня
+ResNet-блоков со Squeeze-Excitation → блоки Transformer с относительным
+позиционным смещением (RPB, через `scaled_dot_product_attention`) →
+четыре головы:
 
 - **policy** — 7000 логитов, prior для MCTS;
 - **value (WDL)** — Win/Draw/Loss, оценка `Q = P(Win) − P(Loss)`;
 - **moves-left** — сколько полуходов до конца (доводить выигрыш до мата);
-- **future** — ход на 2 полухода вперёд, вспомогательная голова только для
-  обучения (тянет ствол к «планирующим» признакам).
+- **future** — ход на 2 полухода вперёд, вспомогательная голова только
+  для обучения.
 
 Особенности: GroupNorm вместо BatchNorm (корректен при batch=1 и сдвиге
-распределения), активация Mish, RPB вместо Smolgen (≈2.3К параметров на блок).
+распределения), активация Mish, RPB вместо Smolgen (≈2.3К параметров на
+блок).
 
 **MCTS:** PUCT с параметрами из Lc0, безбордовые узлы (~60 байт), батчевый
-поиск, двойная буферизация, переиспользование дерева, слияние транспозиций (в
-GUI). Опционально — curriculum-обучение против Fairy-Stockfish с адаптивной
-силой учителя.
+поиск, переиспользование дерева, слияние транспозиций (в GUI), virtual
+loss с правильной формулой `(W − vloss)/N` для разброса параллельных
+селектов. Опционально — curriculum-обучение против Fairy-Stockfish с
+адаптивной силой учителя и contempt-сдвигом.
+
+**GUI:** один self-contained `.onnx` файл, инференс через onnxruntime, без
+PyTorch. Tree reuse между ходами, smart prune вместо очистки таблицы,
+ограниченный NN-кэш. Стрелки в стиле Nibbler с двумя проходами, mate
+display в боковой шкале, c_puct/contempt слайдеры в тулбаре.
+
+Подробности про будущие улучшения — в `ROADMAP.md`. Известные особенности
+и баги-фичи — в `KNOWN_QUIRKS.md`.

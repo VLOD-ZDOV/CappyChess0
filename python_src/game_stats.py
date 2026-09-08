@@ -23,20 +23,8 @@ from model import CapablancaNet
 from mcts import UltraFastMCTS
 
 
-def detect_arch(sd: dict) -> tuple[int, int]:
-    """Detects (num_channels, num_res_blocks) from a state_dict without loading the model."""
-    stem = sd.get("input_conv.net.0.weight")
-    if stem is None:
-        stem = sd.get("input_block.0.weight")
-    if stem is None:
-        raise ValueError("Не удалось найти input_conv в state_dict — неизвестный формат чекпоинта")
-    ch = stem.shape[0]
-    bl = sum(1 for k in sd if "res_blocks" in k and k.endswith("conv1.weight"))
-    return ch, bl
-
 try:
     from capablanca_engine import CapablancaEngine
-    from capablanca_engine import RustMCTS as _RustMCTS
 except ImportError:
     raise ImportError("capablanca_engine not found. Build: maturin develop --release")
 
@@ -71,23 +59,11 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
         active   = list(range(n))
         move_num = 0
 
-        rust_mcts = _RustMCTS(engines, args.parallel_sims)
+        rust_mcts = mcts.new_tree(engines)
 
         while active and move_num < args.max_game_length:
-            steps = max(1, (args.simulations + args.parallel_sims - 1) // args.parallel_sims)
-            for _ in range(steps):
-                lm = rust_mcts.collect_leaves(args.simulations)
-                if lm.shape[0] == 0:
-                    break
-                lh = rust_mcts.get_leaf_hashes() if mcts.nn_cache_enabled else None
-                rp, rv, rd, rm = mcts._infer(lm, hashes=lh)
-                rust_mcts.apply_inference_buffered(
-                    np.ascontiguousarray(rp, dtype=np.float32),
-                    np.ascontiguousarray(rv, dtype=np.float32),
-                    np.ascontiguousarray(rd, dtype=np.float32),
-                    np.ascontiguousarray(rm, dtype=np.float32),
-                    rust_mcts.get_current_batch_counts(),
-                )
+            # Same collect → infer → apply loop the training self-play uses.
+            mcts.run_search(rust_mcts, args.simulations)
 
             raw_pols  = rust_mcts.get_policies()
             raw_vals  = rust_mcts.get_values()
@@ -135,7 +111,7 @@ def run_games(net: nn.Module, device: torch.device, args: argparse.Namespace):
                         resigned[game_idx] = True
                         continue
 
-                adj = eng.adjudication_result()
+                adj = eng.adjudication_result() if args.adjudicate else None
                 if adj is not None:
                     adjudicated[game_idx] = adj
                 else:
@@ -259,11 +235,7 @@ def main():
                         help="Путь к .pth чекпоинту модели (или 'latest' — "
                              "ищет latest.pth в --checkpoint-dir)")
 
-    # Model (auto-detected from checkpoint by default)
-    parser.add_argument("--channels",       type=int,   default=None,
-                        help="Каналы модели (авто если не указано)")
-    parser.add_argument("--res-blocks",     type=int,   default=None,
-                        help="Residual блоков (авто если не указано)")
+    # Architecture is always recovered from the checkpoint itself.
     parser.add_argument("--checkpoint-dir", type=str,   default="checkpoints",
                         help="Директория чекпоинтов (для 'latest')")
     parser.add_argument("--use-ema",        action="store_true", default=True,
@@ -289,6 +261,10 @@ def main():
     parser.add_argument("--resign-consec",     type=int,   default=3)
     parser.add_argument("--resign-min-move",   type=int,   default=20)
 
+    parser.add_argument("--adjudicate", action="store_true",
+                        help="Досрочно присуждать явно решённые партии (как train.py "
+                             "--adjudicate). По умолчанию выключено — иначе статистика "
+                             "не соответствует режиму, в котором идёт обучение.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--timeout-as-draw", action="store_true", default=False,
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
@@ -314,13 +290,12 @@ def main():
     # Recover the FULL architecture from the checkpoint: channels, res blocks,
     # transformer blocks, heads, mlh/future toggles. Without this, statistics
     # would silently be computed against a partially-loaded network.
-    from model import build_net_from_state_dict
+    from model import build_net_from_state_dict, describe_arch
     net, raw_sd = build_net_from_state_dict(raw_sd)
-    net = net.to(device).to(memory_format=torch.channels_last)
-    print(f"   Архитектура из чекпоинта: {net.num_channels}ch × "
-          f"{net.num_res_blocks}bl + "
-          f"{net.num_transformer_blocks}tb({net.transformer_heads}h) · "
-          f"mlh={net.enable_mlh} future={net.enable_future}")
+    # NCHW on purpose: channels_last measured ~10-15% slower on this
+    # GroupNorm-heavy net (see experiments/perf/ and notes in mcts.py).
+    net = net.to(device)
+    print(f"   Архитектура из чекпоинта: {describe_arch(net)}")
 
     if hasattr(torch, "compile"):
         try:
@@ -337,7 +312,7 @@ def main():
         net_target.load_state_dict(ema_sd, strict=False)
         ema_loaded = True
 
-    print(f"✅ Модель: {ch}ch × {bl}bl"
+    print(f"✅ Модель: {net_target.num_channels}ch × {net_target.num_res_blocks}bl"
           f"  iter={iteration}"
           f"{'  [EMA]' if ema_loaded else ''}")
     print(f"   Чекпоинт: {ckpt_path}")

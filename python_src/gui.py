@@ -99,15 +99,18 @@ def move_to_uci(m_int):
 
 
 def value_to_wdl(v):
-    """Map a scalar value in [-1, 1] to a (win, draw, loss) triple."""
+    """Map a scalar value in [-1, 1] to a (win, draw, loss) triple.
+
+    Linear, so the bar's implied Q = W - L is exactly the Q printed next to it.
+    The old sqrt variant turned q=0.5 into W=0.71 / D=0.29 → an implied Q of
+    0.71, i.e. the WDL bar and the eval column disagreed. Same mapping
+    train.py uses for its value targets (`value_to_wdl` there).
+    """
     v = max(-1.0, min(1.0, float(v)))
-    p_win = max(0.0, v) ** 0.5
-    p_loss = max(0.0, -v) ** 0.5
-    p_draw = max(0.0, 1.0 - p_win - p_loss)
-    s = p_win + p_draw + p_loss
-    if s <= 1e-9:
-        return 0.0, 1.0, 0.0
-    return p_win / s, p_draw / s, p_loss / s
+    p_win = max(0.0, v)
+    p_loss = max(0.0, -v)
+    p_draw = max(0.0, 1.0 - abs(v))
+    return p_win, p_draw, p_loss
 
 
 _HASH_WARNED = [False]
@@ -155,12 +158,14 @@ class _TNode:
         self.children = {}          # move_int -> _TEdge
 
     def q(self):
-        # Virtual loss penalises in-flight paths: each pending leaf is counted
-        # as if it returned -1 from the side-to-move's POV. Without subtracting
-        # from the numerator (only inflating the denominator) the node stays
-        # equally attractive and parallel selects all collapse onto one move.
+        # value_sum is in THIS node's own side-to-move POV, and the parent
+        # scores a child as -child_q (negamax). So a virtual loss — which must
+        # make an in-flight node LESS attractive to its parent — has to push
+        # this node's q UP, i.e. count each pending visit as a WIN (+1) here.
+        # Subtracting instead made -child_q rise, so every parallel select
+        # piled back onto the same in-flight leaf (see _best_edge).
         d = self.visits + self.vloss
-        return (self.value_sum - self.vloss) / d if d > 0 else 0.0
+        return (self.value_sum + self.vloss) / d if d > 0 else 0.0
 
 
 class _TEdge:
@@ -223,11 +228,12 @@ class SearchThread(QThread):
             c = e.child
             started = c.visits + c.vloss
             if started > 0:
-                # Child Q is in child's POV — negate for parent. Subtract vloss
-                # from the numerator so parallel selects scatter across moves
-                # instead of all piling onto the current best (matches Rust).
-                # Contempt adds the (sign-invariant) draw mass scaled by `cont`.
-                q_child = (c.value_sum - c.vloss + cont * c.draw_sum) / started
+                # Child Q is in the child's POV — negate for the parent. Each
+                # in-flight visit counts as a WIN for the child (+vloss), so the
+                # parent's -q drops and parallel selects scatter across moves
+                # instead of all piling onto the same leaf (matches lib.rs
+                # MctsNode::q). Contempt adds the (sign-invariant) draw mass.
+                q_child = (c.value_sum + c.vloss + cont * c.draw_sum) / started
                 q_in_parent = -q_child
             else:
                 q_in_parent = fpu
@@ -360,11 +366,17 @@ class SearchThread(QThread):
 
             while self.running and total < self.max_sims:
                 tensors, pending = [], []
+                in_flight = set()     # ids of leaves already in this batch
                 attempts = 0
                 while (len(tensors) < bs and attempts < bs * 4 and self.running):
                     attempts += 1
                     path_nodes, path_moves, kind = self._select(root)
                     leaf = path_nodes[-1]
+                    # Virtual loss should already have steered us elsewhere; the
+                    # guard keeps a tiny tree from spending the whole GPU batch
+                    # on one position (mirrors RustMCTS::collect_leaves_append).
+                    if kind == 'leaf' and id(leaf) in in_flight:
+                        continue
 
                     if kind == 'rep':                    # repetition -> draw
                         self._backup(path_nodes, 0.0, 1.0)
@@ -389,6 +401,7 @@ class SearchThread(QThread):
                     tensors.append(np.asarray(sim.get_board_tensor(),
                                                dtype=np.float32))
                     pending.append((leaf, path_nodes, path_moves, sim))
+                    in_flight.add(id(leaf))
                     self._vloss(path_nodes, VIRTUAL_LOSS)
 
                 if pending:
