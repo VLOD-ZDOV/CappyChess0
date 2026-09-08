@@ -1,6 +1,6 @@
 // src/lib.rs — Capablanca Chess Engine (10x8 board)
 use pyo3::prelude::*;
-use numpy::{PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray, PyUntypedArrayMethods};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray, PyUntypedArrayMethods};
 use ndarray::Array2;
 
 type BB = u128;
@@ -565,9 +565,15 @@ impl CapablancaEngine {
         out
     }
 
-    pub fn get_board_tensor(&self) -> Vec<f32> {
-        // History planes (LC0-style): network sees 8 most recent positions (newest first).
-        // Current = board_history[0], previous = board_history[1], etc.
+    /// Flat (TOTAL_INPUT_PLANES*80,) float32 array of the network input.
+    ///
+    /// History planes (LC0-style): the network sees the 8 most recent positions
+    /// (newest first). Current = board_history[0], previous = board_history[1].
+    ///
+    /// Returns a NumPy array, not a Python list: the list form built 11120
+    /// boxed floats per call (~230 us) and every caller immediately fed it to
+    /// np.array(). `np.array(...)`/`np.asarray(...)` on the result still work.
+    pub fn get_board_tensor<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
         let reps = self.rep_flags();
         boards_to_tensor(
             &self.board_history,
@@ -575,7 +581,7 @@ impl CapablancaEngine {
             self.board.side,
             self.board.halfmove_clock,
             self.board.castling,
-        )
+        ).into_pyarray(py)
     }
 
     pub fn get_legal_moves_int(&mut self) -> Vec<u32> {
@@ -629,12 +635,10 @@ impl CapablancaEngine {
     }
 
     pub fn game_result(&mut self) -> f32 {
-        if self.board.halfmove_clock >= 100 { return 0.0; }
-        if self.board.is_insufficient_material() { return 0.0; }
-        // 3-fold repetition = draw
-        let cur = compute_board_hash(&self.board);
-        let repeats = self.position_history.iter().filter(|&&h| h == cur).count();
-        if repeats >= 3 { return 0.0; }
+        // Checkmate/stalemate FIRST: a mate delivered by the move that brings
+        // the halfmove clock to 100 still wins (FIDE 50-move rule yields to
+        // mate). This also matches SingleMcts::expand(), which scores the same
+        // position as ±1 — checking the clock first mislabeled it a draw.
         self.ensure_legal_cache();
         if self.legal_cache.as_ref().unwrap().is_empty() {
             if self.board.in_check(self.board.side) {
@@ -642,6 +646,12 @@ impl CapablancaEngine {
             }
             return 0.0; // Stalemate
         }
+        if self.board.halfmove_clock >= 100 { return 0.0; }
+        if self.board.is_insufficient_material() { return 0.0; }
+        // 3-fold repetition = draw
+        let cur = compute_board_hash(&self.board);
+        let repeats = self.position_history.iter().filter(|&&h| h == cur).count();
+        if repeats >= 3 { return 0.0; }
         0.0
     }
 
@@ -650,8 +660,8 @@ impl CapablancaEngine {
     /// Returns:
     ///   ±1.0 — decisive advantage (≥8 points): one side has a major piece
     ///          the opponent lacks. Counted as a win.
-    ///   ±0.5 — moderate advantage (3-7 points): likely win, but not guaranteed.
-    ///    0.0 — approximate equality (< 3 points).
+    ///   ±0.5 — moderate advantage (4-7 points): likely win, but not guaranteed.
+    ///    0.0 — approximate equality (≤ 3 points).
     ///
     /// 8-point threshold chosen for Capablanca: archbishop worth ~8, chancellor ~10.
     /// If one side has arch/chanc/queen and the other doesn't — advantage is decisive.
@@ -664,7 +674,25 @@ impl CapablancaEngine {
         0.0
     }
 
-    pub fn adjudication_result(&self) -> Option<f32> { None }
+    /// Adjudicate a clearly-decided game early to save the timeout tail and give
+    /// cleaner value targets (Lc0 TournamentManager::Adjudicate style). Returns
+    /// the result from WHITE's POV (+1 white wins / -1 black wins), or None if the
+    /// position isn't safely decisive. Conservative thresholds — only call it when
+    /// the position is settled, so we never mislabel a still-tactical game:
+    ///   - material balance ≥ 8 pawn-equivalents (an Archbishop / Rook+ up)
+    ///   - ≥ 20 ply (10 moves) with no capture or pawn move (halfmove_clock)
+    ///   - ≥ 15 full moves played (out of the opening)
+    /// Gated opt-in on the Python side (Config.adjudicate); not used unless enabled.
+    pub fn adjudication_result(&self) -> Option<f32> {
+        let balance = self.board.material_balance();   // + = white ahead
+        if balance.abs() >= 8
+            && self.board.halfmove_clock >= 20
+            && self.board.fullmove >= 15 {
+            Some(if balance > 0 { 1.0 } else { -1.0 })
+        } else {
+            None
+        }
+    }
 
     /// 64-bit hash of the current position: pieces + side + castling + en-passant.
     /// Excludes the halfmove clock, so it is a pure transposition key — two
@@ -786,6 +814,40 @@ mod tests {
         assert_eq!(count, 1, "root should not be counted as repetition on first expand");
         assert!(!mcts.is_repetition_at_leaf(root, &mcts.root_board),
                 "root should not be a 2-fold terminal");
+    }
+
+    #[test]
+    fn test_game_history_reaches_the_search_tree() {
+        // RustMCTS used to start every tree with position_history = [root_hash],
+        // so a tree built mid-game was blind to positions already played: eval /
+        // FSF / lagged play could not see a line repeating into a draw.
+        let start = Board::start();
+        let start_hash = SingleMcts::board_hash(&start);
+        let mut other = Board::start();
+        other.apply_move(1, 22, None);           // Nb1-c3
+        let other_hash = SingleMcts::board_hash(&other);
+
+        // Game history: startpos, then a position that also sits in the tree.
+        let mcts = SingleMcts::new_with_history(
+            start.clone(), vec![start.clone()], vec![start_hash, other_hash]);
+        assert_eq!(mcts.position_history, vec![start_hash, other_hash],
+            "the engine's game history must be carried into the tree");
+
+        // A non-root node landing on `other` repeats it: 1 from game history +
+        // itself = 2 → 2-fold, the search must score the line as a draw.
+        let mut m = mcts;
+        let child = m.arena.add(MctsNode::new(1 << 10, 0.5, 1, Some(m.root)));
+        assert_eq!(m.rep_count_at_leaf(child, &other), 2);
+        assert!(m.is_repetition_at_leaf(child, &other),
+            "a line returning to a position already played must count as 2-fold");
+
+        // ...but a root that already repeated once is NOT a terminal draw: it
+        // still has to expand and produce a move (3-fold is `is_over`'s job).
+        let root_repeat = SingleMcts::new_with_history(
+            start.clone(), vec![start.clone()], vec![start_hash, start_hash]);
+        assert_eq!(root_repeat.rep_count_at_leaf(root_repeat.root, &start), 2);
+        assert!(!root_repeat.is_repetition_at_leaf(root_repeat.root, &start),
+            "root must never expand as a 2-fold terminal — that empties the policy");
     }
 
     #[test]
@@ -968,6 +1030,188 @@ mod tests {
             picked, proven,
             "select must pick the proven-winning low-prior child, not a higher-prior unvisited one"
         );
+    }
+
+    // Independent reference: a knight/king move is legal iff the destination is
+    // on-board AND the file delta matches the geometric offset (no wrap). Built
+    // straight from (rank,file) arithmetic — no bitboard shifts — so it can't
+    // share a bug with init_attack_tables.
+    fn expected_attacks(sq: u32, deltas: &[(i32, i32)]) -> BB {
+        let r = (sq / 10) as i32;
+        let f = (sq % 10) as i32;
+        let mut m: BB = 0;
+        for &(dr, df) in deltas {
+            let nr = r + dr;
+            let nf = f + df;
+            if (0..8).contains(&nr) && (0..10).contains(&nf) {
+                m |= 1u128 << (nr * 10 + nf);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn test_knight_attacks_no_wrap() {
+        let kd = [(2, 1), (2, -1), (-2, 1), (-2, -1),
+                  (1, 2), (1, -2), (-1, 2), (-1, -2)];
+        // Cover corners, both edge files, and centre.
+        for &sq in &[0u32, 9, 70, 79, 5, 19, 40, 49, 44] {
+            let got = knight_attacks(sq);
+            let want = expected_attacks(sq, &kd);
+            assert_eq!(got, want,
+                "knight sq {} (file {}): got {:#x} want {:#x}", sq, sq % 10, got, want);
+        }
+        // Spot-check A1 corner explicitly: only B3(21) and C2(12).
+        assert_eq!(knight_attacks(0), (1u128 << 21) | (1u128 << 12),
+            "A1 knight must be exactly {{B3, C2}} — a wrap bug would add a J-file move");
+    }
+
+    #[test]
+    fn test_king_attacks_no_wrap() {
+        let kd = [(1, 0), (-1, 0), (0, 1), (0, -1),
+                  (1, 1), (1, -1), (-1, 1), (-1, -1)];
+        for &sq in &[0u32, 9, 70, 79, 5, 19, 40, 49, 44] {
+            let got = king_attacks(sq);
+            let want = expected_attacks(sq, &kd);
+            assert_eq!(got, want,
+                "king sq {} (file {}): got {:#x} want {:#x}", sq, sq % 10, got, want);
+        }
+    }
+
+    #[test]
+    fn test_adjudication_result() {
+        // Not decisive enough / too early → None.
+        let start = CapablancaEngine::new();
+        assert_eq!(start.adjudication_result(), None, "startpos must not adjudicate");
+
+        // White up a chancellor (+10), settled (halfmove 20), past opening (move 15).
+        let mut eng = CapablancaEngine::new();
+        eng.board.pieces = [[0; 8]; 2];
+        eng.board.pieces[0][KING] = 1u128 << 5;
+        eng.board.pieces[1][KING] = 1u128 << 75;
+        eng.board.pieces[0][CHANC] = 1u128 << 40;   // white +10
+        eng.board.halfmove_clock = 20;
+        eng.board.fullmove = 15;
+        assert_eq!(eng.adjudication_result(), Some(1.0), "white +chancellor settled → +1");
+
+        // Same material edge but still tactical (halfmove too low) → None.
+        eng.board.halfmove_clock = 5;
+        assert_eq!(eng.adjudication_result(), None, "decisive but unsettled → None");
+
+        // Black up a queen, settled → -1.
+        let mut eb = CapablancaEngine::new();
+        eb.board.pieces = [[0; 8]; 2];
+        eb.board.pieces[0][KING] = 1u128 << 5;
+        eb.board.pieces[1][KING] = 1u128 << 75;
+        eb.board.pieces[1][QUEEN] = 1u128 << 40;    // black +9
+        eb.board.halfmove_clock = 30;
+        eb.board.fullmove = 25;
+        assert_eq!(eb.adjudication_result(), Some(-1.0), "black +queen settled → -1");
+    }
+
+    #[test]
+    fn test_double_push_sets_ep_to_skipped_square() {
+        // The en-passant target is the SKIPPED square (rank the pawn passed over),
+        // not the pawn's origin. Reviewer claimed black should be to+20 (origin) —
+        // that is wrong; it must be the skipped square to+10.
+        // White B2(11) -> B4(31): ep = B3(21).
+        let mut bw = Board { pieces: [[0; 8]; 2], side: 0, castling: 0,
+            ep_square: None, halfmove_clock: 0, fullmove: 1 };
+        bw.pieces[0][PAWN] = 1u128 << 11;
+        bw.apply_move(11, 31, None);
+        assert_eq!(bw.ep_square, Some(21),
+            "white double push B2->B4 must set ep=B3(21) (skipped square)");
+        // Black B7(61) -> B5(41): ep = B6(51), NOT origin B7(61).
+        let mut bb = Board { pieces: [[0; 8]; 2], side: 1, castling: 0,
+            ep_square: None, halfmove_clock: 0, fullmove: 1 };
+        bb.pieces[1][PAWN] = 1u128 << 61;
+        bb.apply_move(61, 41, None);
+        assert_eq!(bb.ep_square, Some(51),
+            "black double push B7->B5 must set ep=B6(51) (skipped square), not origin 61");
+    }
+
+    #[test]
+    fn test_dirichlet_gamma_no_nan_low_alpha() {
+        // Claim: sample_gamma NaNs for alpha < 1/3 (Marsaglia-Tsang domain).
+        // The reduction branch + .max(1e-15) guards must prevent that. Hammer the
+        // low-alpha range actually used by self-play (dynamic_alpha = (10/n).max(0.1)).
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        for &alpha in &[0.1_f64, 0.2, 0.3, 0.333, 0.5, 1.0] {
+            for _ in 0..20_000 {
+                let g = sample_gamma(alpha, &mut rng);
+                assert!(g.is_finite() && g >= 0.0,
+                    "sample_gamma({}) produced {}", alpha, g);
+            }
+        }
+        // Full Dirichlet vector over many legal moves (small alpha) must be a
+        // finite probability simplex.
+        for n in [2usize, 20, 50, 100] {
+            let alpha = (10.0 / n as f64).max(0.1);
+            for _ in 0..2_000 {
+                let v = dirichlet_noise(alpha, n, &mut rng);
+                let s: f64 = v.iter().sum();
+                assert!(v.iter().all(|x| x.is_finite() && *x >= 0.0),
+                    "dirichlet n={} alpha={} has non-finite entry", n, alpha);
+                assert!((s - 1.0).abs() < 1e-9,
+                    "dirichlet n={} sums to {} not 1", n, s);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mate_beats_fifty_move_rule() {
+        // Mate delivered on the move that brings the halfmove clock to 100
+        // must still score as a win (matches expand()), not a 50-move draw.
+        // Black king a8 mated by Ra1+Rb1 (b-file escape squares covered).
+        let mut eng = CapablancaEngine::new();
+        eng.board.pieces = [[0; 8]; 2];
+        eng.board.pieces[1][KING] = 1u128 << 70;              // black Ka8
+        eng.board.pieces[0][ROOK] = (1u128 << 0) | (1u128 << 1); // white Ra1, Rb1
+        eng.board.pieces[0][KING] = 1u128 << 34;              // white Ke4
+        eng.board.side = 1;
+        eng.board.halfmove_clock = 100;
+        eng.legal_cache = None;
+        assert!(eng.is_game_over(), "mated position must be game over");
+        assert_eq!(eng.game_result(), 1.0,
+            "checkmate at halfmove 100 must be a WHITE WIN, not a 50-move draw");
+
+        // Same clock, but not mate → 50-move draw.
+        let mut draw = CapablancaEngine::new();
+        draw.board.halfmove_clock = 100;
+        draw.legal_cache = None;
+        assert_eq!(draw.game_result(), 0.0, "quiet position at clock 100 is a draw");
+    }
+
+    #[test]
+    fn test_en_passant_edge_files_both_colors() {
+        // White pawn on J5 (file 9, rank 4 = sq 49) captures e.p. to I6 (sq 58)
+        // when a black pawn just double-stepped I7->I5, ep square = I6 (58).
+        let mut b = Board { pieces: [[0; 8]; 2], side: 0, castling: 0,
+            ep_square: Some(58), halfmove_clock: 0, fullmove: 1 };
+        b.pieces[0][PAWN] = 1u128 << 49;   // white pawn J5
+        b.pieces[1][PAWN] = 1u128 << 48;   // black pawn I5 (the double-stepped pawn)
+        b.pieces[0][KING] = 1u128 << 0;
+        b.pieces[1][KING] = 1u128 << 79;
+        let ml = b.gen_pseudo_legal();
+        assert!(ml.iter().any(|&(fr, to, _)| fr == 49 && to == 58),
+            "white J5 pawn must be able to capture e.p. to I6 (no wrap to A-file)");
+        // It must NOT produce any move landing off the geometric diagonal (e.g. file 0).
+        assert!(!ml.iter().any(|&(fr, to, _)| fr == 49 && (to % 10) == 0),
+            "white edge e.p. must not wrap to the A file");
+
+        // Black pawn on A4 (file 0, rank 3 = sq 30) captures e.p. to B3 (sq 21)
+        // when white pawn double-stepped B2->B4, ep square = B3 (21).
+        let mut b2 = Board { pieces: [[0; 8]; 2], side: 1, castling: 0,
+            ep_square: Some(21), halfmove_clock: 0, fullmove: 1 };
+        b2.pieces[1][PAWN] = 1u128 << 30;  // black pawn A4
+        b2.pieces[0][PAWN] = 1u128 << 31;  // white pawn B4
+        b2.pieces[0][KING] = 1u128 << 5;
+        b2.pieces[1][KING] = 1u128 << 75;
+        let ml2 = b2.gen_pseudo_legal();
+        assert!(ml2.iter().any(|&(fr, to, _)| fr == 30 && to == 21),
+            "black A4 pawn must be able to capture e.p. to B3");
+        assert!(!ml2.iter().any(|&(fr, to, _)| fr == 30 && (to % 10) == 9),
+            "black edge e.p. must not wrap to the J file");
     }
 }
 
@@ -1152,6 +1396,15 @@ struct SingleMcts {
     // training; flipped off for eval / FSF / lagged play where we want a
     // deterministic measurement of the network's actual choice.
     add_dirichlet: bool,
+    // Per-slot repetition planes during search (match training's get_board_tensor).
+    // Default false = legacy slot-0-only encoding. See ROADMAP / KNOWN_QUIRKS.
+    rep_search_perslot: bool,
+    // Python-side "this game is done" (resigned / adjudicated / dropped). The
+    // Rust tree cannot see those verdicts — `is_over()` only knows the board
+    // rules — so without this flag collect_leaves kept walking resigned games
+    // and spending GPU batch slots on them. With a 60%+ resign rate that is a
+    // large share of every batch.
+    finished: bool,
 }
 
 fn compute_board_hash(b: &Board) -> u64 {
@@ -1175,25 +1428,74 @@ impl SingleMcts {
 
     #[cfg(test)]
     fn new(board: Board) -> Self {
-        Self::new_with_history(board.clone(), vec![board])
+        let h = Self::board_hash(&board);
+        Self::new_with_history(board.clone(), vec![board], vec![h])
     }
 
-    fn new_with_history(board: Board, root_history: Vec<Board>) -> Self {
+    /// `position_history` carries the REAL game history since the last
+    /// irreversible move (same invariant as `CapablancaEngine::position_history`,
+    /// root included). Without it a tree built mid-game could not see that a
+    /// line repeats a position already played, so eval / FSF / lagged play
+    /// walked into (or missed) repetition draws. Self-play was unaffected only
+    /// because it builds the tree from the start position and mirrors every
+    /// move through `make_move`.
+    fn new_with_history(board: Board, root_history: Vec<Board>,
+                        position_history: Vec<u64>) -> Self {
         let side = board.side as u8;
         let initial_hash = Self::board_hash(&board);
         let mut arena = Arena::new(8192);
         let root = arena.add(MctsNode::new(0, 1.0, side, None));
         arena.get_mut(root).position_hash = initial_hash;  // root always has valid hash
+        let position_history = if position_history.is_empty() {
+            vec![initial_hash]
+        } else {
+            position_history
+        };
         SingleMcts {
             arena, root, root_board: board,
             pending: Vec::new(), pending_boards: Vec::new(),
-            position_history: vec![initial_hash],
+            position_history,
             root_history,
             kld_prev_snapshot: None,
             move_start_visits: 0,
             contempt: 0.0,
             add_dirichlet: true,
+            rep_search_perslot: false,
+            finished: false,
         }
+    }
+
+    /// Per-slot repetition flags for a leaf's history, matching the training-side
+    /// `rep_flags()` semantics: each history board is flagged if its position has
+    /// occurred ≥2 times in the full context (game position_history + the
+    /// reconstructed hypothetical path root→leaf). Used only when
+    /// rep_search_perslot is on. O(HISTORY_LEN × context) — cheap.
+    fn history_reps_at(&self, idx: usize, history: &[Board]) -> Vec<bool> {
+        let mut context: Vec<u64> = self.position_history.clone();
+        // Replay root→leaf, pushing each non-root position hash (root is already
+        // in position_history → not double-counted).
+        let mut path = Vec::new();
+        let mut cur = idx;
+        while cur != self.root {
+            let node = self.arena.get(cur);
+            path.push(node.move_from_parent);
+            match node.parent { Some(p) => cur = p, None => break }
+        }
+        let mut board = self.root_board.clone();
+        for &m in path.iter().rev() {
+            if m != 0 {
+                let pv = m & 0b111;
+                let t  = (m >> 3) & 0x7F;
+                let f  = (m >> 10) & 0x7F;
+                let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                board.apply_move(f, t, p);
+            }
+            context.push(compute_board_hash(&board));
+        }
+        history.iter().map(|b| {
+            let h = compute_board_hash(b);
+            context.iter().filter(|&&x| x == h).count() >= 2
+        }).collect()
     }
 
     /// Snapshot of current root visits distribution for KLD-early-exit.
@@ -1352,19 +1654,31 @@ impl SingleMcts {
             let cpuct = C_PUCT_V
                 + C_PUCT_FACTOR * ((parent_visits as f32 + C_PUCT_BASE) / C_PUCT_BASE).ln();
 
-            // FPU strategies (LC0 params.cc:567-572):
-            //   non-root: "reduction" — fpu = parent_q - 0.330 * sqrt(visited_policy_sum)
-            //   root:     "absolute" — fpu = +1.0 (give maximum exploration to root children)
-            // At root unvisited moves get maximally optimistic score → quickly
-            // scan the ENTIRE root move set before going deeper into any one of them.
-            // Important for Dirichlet noise: otherwise noise only applies when children are visited,
-            // but at start all children are unvisited and get the same fpu=parent_q.
+            // FPU ("first play urgency") — the value an UNVISITED child is scored
+            // with. LC0 params.cc:568-572 and its resolution at params.cc:661-667:
+            //
+            //   FpuStrategy       = "reduction"
+            //   FpuStrategyAtRoot = "same"   → root inherits "reduction"
+            //   FpuValueAtRoot    = 1.0      → DEAD unless the strategy is switched
+            //                                  to "absolute" by hand
+            //
+            //   kFpuAbsoluteAtRoot = ("same" && kFpuAbsolute) || ("same"=="absolute")
+            //                      = false
+            //   kFpuValueAtRoot    = ("same") ? kFpuValue : 1.0  = 0.330
+            //
+            // So in LC0 the root uses reduction 0.330, exactly like every other node.
+            //
+            // This port used to hardcode `fpu = 1.0` at the root, reading the dead
+            // FpuValueAtRoot default as if it were in force. +1.0 is the top of the
+            // value scale ("certain win"), so every unvisited root child outscored
+            // every visited one until it had been visited once: the search was
+            // FORCED to sweep all ~42 root moves before deepening into any.
+            // At `--simulations 100` that is 2.4 visits per move — measured 2.3 —
+            // and the stored policy target came out uniform. Fixed 2026-09-08,
+            // see docs/experiments/policy_target_collapse.md.
             let parent_q = self.arena.get(idx).q();
             let n_ch = self.arena.get(idx).children.len();
-            let is_root = idx == self.root;
-            let fpu = if is_root {
-                1.0f32  // absolute strategy: forced exploration at root
-            } else {
+            let fpu = {
                 const FPU_REDUCTION: f32 = 0.330;
                 let mut visited_pol = 0.0f32;
                 for ci_pos in 0..n_ch {
@@ -1467,8 +1781,15 @@ impl SingleMcts {
         history_count + path_count
     }
 
+    /// 2-fold repetition inside the tree = draw (LC0 search heuristic).
+    ///
+    /// The ROOT is exempt: two-fold is not a draw by the rules, it only tells
+    /// the search that a *line* returns to a known position. Once the real game
+    /// `position_history` is carried into the tree, a root that already repeated
+    /// once would otherwise expand as a terminal draw — no children, empty
+    /// policy, no move to play. A genuine 3-fold root is handled by `is_over()`.
     fn is_repetition_at_leaf(&self, leaf_idx: usize, leaf_board: &Board) -> bool {
-        self.rep_count_at_leaf(leaf_idx, leaf_board) >= 2
+        leaf_idx != self.root && self.rep_count_at_leaf(leaf_idx, leaf_board) >= 2
     }
 
     // board is passed externally (already reconstructed via board_at or stored in pending_boards)
@@ -1676,10 +1997,17 @@ impl SingleMcts {
                 if self.pending.contains(&leaf) { continue; }
                 self.apply_vloss(leaf, VIRTUAL_LOSS_V);
                 let (leaf_board, history) = self.board_with_history_at(leaf);
-                let mut rep_flags = vec![false; history.len()];
-                if !history.is_empty() && self.rep_count_at_leaf(leaf, &leaf_board) >= 2 {
-                    rep_flags[0] = true;
-                }
+                let rep_flags = if self.rep_search_perslot {
+                    // Per-slot, matching training's get_board_tensor encoding.
+                    self.history_reps_at(leaf, &history)
+                } else {
+                    // Legacy: only the current position (slot 0).
+                    let mut rf = vec![false; history.len()];
+                    if !history.is_empty() && self.rep_count_at_leaf(leaf, &leaf_board) >= 2 {
+                        rf[0] = true;
+                    }
+                    rf
+                };
                 boards_to_tensor_into(
                     out, &history, &rep_flags,
                     leaf_board.side, leaf_board.halfmove_clock, leaf_board.castling,
@@ -1729,212 +2057,246 @@ impl SingleMcts {
                 self.propagate_bounds_from(leaf);
             }
         }
-                            }
+    }
 
-                            fn get_policy_sparse(&self) -> (Vec<i32>, Vec<f32>) {
-                                let root = self.arena.get(self.root);
-                                let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
-                                let mut idxs = Vec::with_capacity(root.children.len());
-                                let mut vals = Vec::with_capacity(root.children.len());
-                                if total > 0 {
-                                    let side = self.root_board.side;
-                                    for &ci in &root.children {
-                                        let c = self.arena.get(ci);
-                                        if c.visits <= 0 { continue; }
-                                        let m = c.move_from_parent;
-                                        let f = (m >> 10) & 0x7F;
-                                        let t = (m >> 3) & 0x7F;
-                                        let pv = m & 0b111;
-                                        let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
-                                        // Canonical index (see Board::move_to_idx).
-                                        let idx = Board::move_to_idx(f, t, p, side);
-                                        if idx < POLICY_SIZE_MCTS {
-                                            idxs.push(idx as i32);
-                                            vals.push(c.visits as f32 / total as f32);
-                                        }
-                                    }
-                                }
-                                (idxs, vals)
-                            }
+    fn get_policy_sparse(&self) -> (Vec<i32>, Vec<f32>) {
+        let root = self.arena.get(self.root);
+        let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
+        let mut idxs = Vec::with_capacity(root.children.len());
+        let mut vals = Vec::with_capacity(root.children.len());
+        if total > 0 {
+            let side = self.root_board.side;
+            for &ci in &root.children {
+                let c = self.arena.get(ci);
+                if c.visits <= 0 { continue; }
+                let m = c.move_from_parent;
+                let f = (m >> 10) & 0x7F;
+                let t = (m >> 3) & 0x7F;
+                let pv = m & 0b111;
+                let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                // Canonical index (see Board::move_to_idx).
+                let idx = Board::move_to_idx(f, t, p, side);
+                if idx < POLICY_SIZE_MCTS {
+                    idxs.push(idx as i32);
+                    vals.push(c.visits as f32 / total as f32);
+                }
+            }
+        }
+        (idxs, vals)
+    }
 
-                            fn get_policy(&self) -> Vec<f32> {
-                                let root = self.arena.get(self.root);
-                                let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
-                                let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
-                                if total > 0 {
-                                    let side = self.root_board.side;
-                                    for &ci in &root.children {
-                                        let c = self.arena.get(ci);
-                                        let m = c.move_from_parent;
-                                        let f = (m >> 10) & 0x7F;
-                                        let t = (m >> 3) & 0x7F;
-                                        let pv = m & 0b111;
-                                        let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
-                                        // Canonical index (see Board::move_to_idx).
-                                        let idx = Board::move_to_idx(f, t, p, side);
-                                        if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
-                                    }
-                                }
-                                pol
-                            }
+    /// Per-root-child stats for the Gumbel completed-Q policy
+    /// target (read-only; does not touch the tree). Returns
+    /// (policy_idxs, priors, visits, q_parent) where q_parent =
+    /// -child.q() = value of THIS move from the side-to-move's
+    /// POV (same sign convention as the value target / select()).
+    /// Unvisited children have q_parent=0 and visits=0 → caller
+    /// completes them with v_mix.
+    fn get_root_children_stats(&self) -> (Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>) {
+        let root = self.arena.get(self.root);
+        let side = self.root_board.side;
+        let n = root.children.len();
+        let mut idxs = Vec::with_capacity(n);
+        let mut priors = Vec::with_capacity(n);
+        let mut visits = Vec::with_capacity(n);
+        let mut qs = Vec::with_capacity(n);
+        for &ci in &root.children {
+            let c = self.arena.get(ci);
+            let m = c.move_from_parent;
+            let f = (m >> 10) & 0x7F;
+            let t = (m >> 3) & 0x7F;
+            let pv = m & 0b111;
+            let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+            let idx = Board::move_to_idx(f, t, p, side);
+            if idx < POLICY_SIZE_MCTS {
+                idxs.push(idx as i32);
+                priors.push(c.prior);
+                visits.push(c.visits);
+                // -child.q(): value of the move in the parent's POV
+                qs.push(-c.q());
+            }
+        }
+        (idxs, priors, visits, qs)
+    }
 
-                            fn is_over(&mut self) -> bool {
-                                if self.root_board.halfmove_clock >= 100 { return true; }
-                                if self.root_board.is_insufficient_material() { return true; }
-                                // Three-fold repetition: current position already in history (pushed in make_move),
-                                // 3-fold = this position occurred >= 3 times.
-                                let cur_hash = Self::board_hash(&self.root_board);
-                                let repeats = self.position_history.iter().filter(|&&h| h == cur_hash).count();
-                                if repeats >= 3 { return true; }
-                                self.root_board.gen_legal().is_empty()
-                            }
+    fn get_policy(&self) -> Vec<f32> {
+        let root = self.arena.get(self.root);
+        let total: i32 = root.children.iter().map(|&ci| self.arena.get(ci).visits).sum();
+        let mut pol = vec![0.0f32; POLICY_SIZE_MCTS];
+        if total > 0 {
+            let side = self.root_board.side;
+            for &ci in &root.children {
+                let c = self.arena.get(ci);
+                let m = c.move_from_parent;
+                let f = (m >> 10) & 0x7F;
+                let t = (m >> 3) & 0x7F;
+                let pv = m & 0b111;
+                let p = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                // Canonical index (see Board::move_to_idx).
+                let idx = Board::move_to_idx(f, t, p, side);
+                if idx < POLICY_SIZE_MCTS { pol[idx] = c.visits as f32 / total as f32; }
+            }
+        }
+        pol
+    }
 
-                            fn root_value(&self) -> f32 {
-                                self.arena.get(self.root).wl
-                            }
+    fn is_over(&mut self) -> bool {
+        if self.root_board.halfmove_clock >= 100 { return true; }
+        if self.root_board.is_insufficient_material() { return true; }
+        // Three-fold repetition: current position already in history (pushed in make_move),
+        // 3-fold = this position occurred >= 3 times.
+        let cur_hash = Self::board_hash(&self.root_board);
+        let repeats = self.position_history.iter().filter(|&&h| h == cur_hash).count();
+        if repeats >= 3 { return true; }
+        self.root_board.gen_legal().is_empty()
+    }
 
-                            fn root_draw(&self) -> f32 {
-                                self.arena.get(self.root).d
-                            }
+    fn root_value(&self) -> f32 {
+        self.arena.get(self.root).wl
+    }
 
-                            // Recursively copies a subtree from self.arena into new_arena (without Board).
-                            fn copy_subtree(&self, old_idx: usize, new_arena: &mut Arena, new_parent: Option<usize>) -> usize {
-                                let old_node = self.arena.get(old_idx);
-                                let mut new_node = MctsNode::new(
-                                    old_node.move_from_parent,
-                                    old_node.prior,
-                                    old_node.side,
-                                    new_parent,
-                                );
-                                // Preserve all accumulated statistics and caches.
-                                new_node.visits        = old_node.visits;
-                                new_node.wl            = old_node.wl;
-                                new_node.d             = old_node.d;
-                                new_node.m             = old_node.m;
-                                new_node.is_expanded   = old_node.is_expanded;
-                                new_node.is_terminal   = old_node.is_terminal;
-                                new_node.terminal_kind = old_node.terminal_kind;
-                                new_node.lower         = old_node.lower;
-                                new_node.upper         = old_node.upper;
-                                new_node.position_hash = old_node.position_hash;
-                                let new_idx = new_arena.add(new_node);
-                                let children: Vec<usize> = old_node.children.clone();
-                                let mut new_children = Vec::with_capacity(children.len());
-                                for child_old in children {
-                                    new_children.push(self.copy_subtree(child_old, new_arena, Some(new_idx)));
-                                }
-                                new_arena.get_mut(new_idx).children = new_children;
-                                new_idx
-                            }
+    fn root_draw(&self) -> f32 {
+        self.arena.get(self.root).d
+    }
 
-                            fn make_move(&mut self, m_int: u32) {
-                                // Apply move to root_board
-                                let pv = m_int & 0b111;
-                                let t  = (m_int >> 3) & 0x7F;
-                                let f  = (m_int >> 10) & 0x7F;
-                                let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
-                                self.root_board.apply_move(f, t, p);
-                                let new_side = self.root_board.side as u8;
+    // Recursively copies a subtree from self.arena into new_arena (without Board).
+    fn copy_subtree(&self, old_idx: usize, new_arena: &mut Arena, new_parent: Option<usize>) -> usize {
+        let old_node = self.arena.get(old_idx);
+        let mut new_node = MctsNode::new(
+            old_node.move_from_parent,
+            old_node.prior,
+            old_node.side,
+            new_parent,
+        );
+        // Preserve all accumulated statistics and caches.
+        new_node.visits        = old_node.visits;
+        new_node.wl            = old_node.wl;
+        new_node.d             = old_node.d;
+        new_node.m             = old_node.m;
+        new_node.is_expanded   = old_node.is_expanded;
+        new_node.is_terminal   = old_node.is_terminal;
+        new_node.terminal_kind = old_node.terminal_kind;
+        new_node.lower         = old_node.lower;
+        new_node.upper         = old_node.upper;
+        new_node.position_hash = old_node.position_hash;
+        let new_idx = new_arena.add(new_node);
+        let children: Vec<usize> = old_node.children.clone();
+        let mut new_children = Vec::with_capacity(children.len());
+        for child_old in children {
+            new_children.push(self.copy_subtree(child_old, new_arena, Some(new_idx)));
+        }
+        new_arena.get_mut(new_idx).children = new_children;
+        new_idx
+    }
 
-                                let child_idx = self.arena.get(self.root).children.iter()
-                                .copied()
-                                .find(|&ci| self.arena.get(ci).move_from_parent == m_int);
+    fn make_move(&mut self, m_int: u32) {
+        // Apply move to root_board
+        let pv = m_int & 0b111;
+        let t  = (m_int >> 3) & 0x7F;
+        let f  = (m_int >> 10) & 0x7F;
+        let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
+        self.root_board.apply_move(f, t, p);
+        let new_side = self.root_board.side as u8;
 
-                                // Tree GC — copy only the needed subtree into a new arena.
-                                let mut new_arena = Arena::new(8192);
-                                self.root = if let Some(ci) = child_idx {
-                                    self.copy_subtree(ci, &mut new_arena, None)
-                                } else {
-                                    // Move was not in the tree — create root from scratch
-                                    new_arena.add(MctsNode::new(m_int, 1.0, new_side, None))
-                                };
-                                self.arena = new_arena;
-                                // Accumulating tree reuse: record inherited visits —
-                                // new simulation budget will be counted on top of them.
-                                self.move_start_visits = self.arena.get(self.root).visits;
-                                self.pending.clear();
-                                self.pending_boards.clear();
-                                // Update history: on irreversible move (capture/pawn) old positions cannot repeat
-                                let new_hash = Self::board_hash(&self.root_board);
-                                if self.root_board.halfmove_clock == 0 {
-                                    self.position_history.clear();
-                                }
-                                self.position_history.push(new_hash);
-                                // board history (LC0 history planes): push new position to front.
-                                self.root_history.insert(0, self.root_board.clone());
-                                if self.root_history.len() > HISTORY_LEN {
-                                    self.root_history.truncate(HISTORY_LEN);
-                                }
-                                // LC0 EnsureNodeTwoFoldCorrectForDepth (search.cc:1532):
-                                // After root shift, revalidate path-dependent terminals.
-                                self.revalidate_after_root_shift();
-                            }
+        let child_idx = self.arena.get(self.root).children.iter()
+        .copied()
+        .find(|&ci| self.arena.get(ci).move_from_parent == m_int);
 
-                            /// Revalidate terminals after tree reuse (LC0 EnsureNodeTwoFoldCorrect):
-                            ///   - Natural terminals (checkmate/stalemate/50-move/insufficient) — permanent, keep.
-                            ///   - 2-fold terminals — recompute rep_count for the new path from ROOT.
-                            ///     If no longer a repetition → revert flag, re-expand.
-                            ///   - Bounds-prop terminals (terminal_kind=NONE+is_terminal=true) —
-                            ///     conservatively reset bounds (will be rediscovered by next simulations).
-                            fn revalidate_after_root_shift(&mut self) {
-                                let n_nodes = self.arena.nodes.len();
-                                for idx in 0..n_nodes {
-                                    let (term, kind) = {
-                                        let n = self.arena.get(idx);
-                                        (n.is_terminal, n.terminal_kind)
-                                    };
-                                    if !term { continue; }
-                                    if kind == TERMINAL_KIND_NATURAL { continue; }
-                                    if kind == TERMINAL_KIND_TWOFOLD {
-                                        // Reconstruct board + check for repetition
-                                        let board = self.board_at(idx);
-                                        if self.rep_count_at_leaf(idx, &board) >= 2 {
-                                            continue;  // still a repetition
-                                        }
-                                        // No longer a repetition — reset as leaf for re-expand.
-                                        let n = self.arena.get_mut(idx);
-                                        n.is_terminal = false;
-                                        n.is_expanded = false;
-                                        n.terminal_kind = TERMINAL_KIND_NONE;
-                                        n.lower = -1;
-                                        n.upper = 1;
-                                        n.children.clear();
-                                        // wl/d/visits preserved — will be refined by new simulations.
-                                    } else {
-                                        // kind == NONE + is_terminal=true → bounds-prop terminal.
-                                        // Children preserved, reset flag, may be rediscovered next simulation.
-                                        let n = self.arena.get_mut(idx);
-                                        n.is_terminal = false;
-                                        n.lower = -1;
-                                        n.upper = 1;
-                                    }
-                                }
-                            }
+        // Tree GC — copy only the needed subtree into a new arena.
+        let mut new_arena = Arena::new(8192);
+        self.root = if let Some(ci) = child_idx {
+            self.copy_subtree(ci, &mut new_arena, None)
+        } else {
+            // Move was not in the tree — create root from scratch
+            new_arena.add(MctsNode::new(m_int, 1.0, new_side, None))
+        };
+        self.arena = new_arena;
+        // Accumulating tree reuse: record inherited visits —
+        // new simulation budget will be counted on top of them.
+        self.move_start_visits = self.arena.get(self.root).visits;
+        self.pending.clear();
+        self.pending_boards.clear();
+        // Update history: on irreversible move (capture/pawn) old positions cannot repeat
+        let new_hash = Self::board_hash(&self.root_board);
+        if self.root_board.halfmove_clock == 0 {
+            self.position_history.clear();
+        }
+        self.position_history.push(new_hash);
+        // board history (LC0 history planes): push new position to front.
+        self.root_history.insert(0, self.root_board.clone());
+        if self.root_history.len() > HISTORY_LEN {
+            self.root_history.truncate(HISTORY_LEN);
+        }
+        // LC0 EnsureNodeTwoFoldCorrectForDepth (search.cc:1532):
+        // After root shift, revalidate path-dependent terminals.
+        self.revalidate_after_root_shift();
+    }
 
-                            /// Re-applies Dirichlet noise to priors of current root's children.
-                            /// Called after make_move with tree reuse — otherwise exploratory
-                            /// noise only applies on the FIRST move of the entire game.
-                            fn renoise_root(&mut self, rng: &mut u64) {
-                                let root_idx = self.root;
-                                let children: Vec<usize> = self.arena.get(root_idx).children.clone();
-                                let n = children.len();
-                                if n == 0 { return; }
-                                let dynamic_alpha = (10.0_f64 / n as f64).max(0.1);
-                                let noise = dirichlet_noise(dynamic_alpha, n, rng);
-                                for (i, ci) in children.iter().enumerate() {
-                                    let p = self.arena.get(*ci).prior;
-                                    let mixed = (1.0 - DIRICHLET_EPS_V as f32) * p
-                                              + DIRICHLET_EPS_V as f32 * noise[i] as f32;
-                                    self.arena.get_mut(*ci).prior = mixed;
-                                }
-                                // Re-sort children by NEW prior (LC0 SortEdges semantics).
-                                // Without this, early-exit in select() operates on stale order.
-                                let mut pairs: Vec<(usize, f32)> = children.iter()
-                                    .map(|&ci| (ci, self.arena.get(ci).prior))
-                                    .collect();
-                                pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                                self.arena.get_mut(root_idx).children = pairs.into_iter().map(|(ci, _)| ci).collect();
-                            }
+    /// Revalidate terminals after tree reuse (LC0 EnsureNodeTwoFoldCorrect):
+    ///   - Natural terminals (checkmate/stalemate/50-move/insufficient) — permanent, keep.
+    ///   - 2-fold terminals — recompute rep_count for the new path from ROOT.
+    ///     If no longer a repetition → revert flag, re-expand.
+    ///   - Bounds-prop terminals (terminal_kind=NONE+is_terminal=true) —
+    ///     conservatively reset bounds (will be rediscovered by next simulations).
+    fn revalidate_after_root_shift(&mut self) {
+        let n_nodes = self.arena.nodes.len();
+        for idx in 0..n_nodes {
+            let (term, kind) = {
+                let n = self.arena.get(idx);
+                (n.is_terminal, n.terminal_kind)
+            };
+            if !term { continue; }
+            if kind == TERMINAL_KIND_NATURAL { continue; }
+            if kind == TERMINAL_KIND_TWOFOLD {
+                // Reconstruct board + check for repetition
+                let board = self.board_at(idx);
+                if self.is_repetition_at_leaf(idx, &board) {
+                    continue;  // still a repetition
+                }
+                // No longer a repetition — reset as leaf for re-expand.
+                let n = self.arena.get_mut(idx);
+                n.is_terminal = false;
+                n.is_expanded = false;
+                n.terminal_kind = TERMINAL_KIND_NONE;
+                n.lower = -1;
+                n.upper = 1;
+                n.children.clear();
+                // wl/d/visits preserved — will be refined by new simulations.
+            } else {
+                // kind == NONE + is_terminal=true → bounds-prop terminal.
+                // Children preserved, reset flag, may be rediscovered next simulation.
+                let n = self.arena.get_mut(idx);
+                n.is_terminal = false;
+                n.lower = -1;
+                n.upper = 1;
+            }
+        }
+    }
+
+    /// Re-applies Dirichlet noise to priors of current root's children.
+    /// Called after make_move with tree reuse — otherwise exploratory
+    /// noise only applies on the FIRST move of the entire game.
+    fn renoise_root(&mut self, rng: &mut u64) {
+        let root_idx = self.root;
+        let children: Vec<usize> = self.arena.get(root_idx).children.clone();
+        let n = children.len();
+        if n == 0 { return; }
+        let dynamic_alpha = (10.0_f64 / n as f64).max(0.1);
+        let noise = dirichlet_noise(dynamic_alpha, n, rng);
+        for (i, ci) in children.iter().enumerate() {
+            let p = self.arena.get(*ci).prior;
+            let mixed = (1.0 - DIRICHLET_EPS_V as f32) * p
+                      + DIRICHLET_EPS_V as f32 * noise[i] as f32;
+            self.arena.get_mut(*ci).prior = mixed;
+        }
+        // Re-sort children by NEW prior (LC0 SortEdges semantics).
+        // Without this, early-exit in select() operates on stale order.
+        let mut pairs: Vec<(usize, f32)> = children.iter()
+            .map(|&ci| (ci, self.arena.get(ci).prior))
+            .collect();
+        pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        self.arena.get_mut(root_idx).children = pairs.into_iter().map(|(ci, _)| ci).collect();
+    }
 }
 
 /// RustMCTS — batched MCTS for N games simultaneously.
@@ -1943,7 +2305,9 @@ pub struct RustMCTS {
     games: Vec<SingleMcts>,
     parallel_sims: usize,
     rng: u64,
-    leaf_game_map: Vec<usize>,
+    /// Leaves collected per game in the last `collect_leaves` call. Python reads
+    /// it via `get_current_batch_counts()` and hands it back to
+    /// `apply_inference_buffered` so results land on the right games.
     leaf_counts: Vec<usize>,
 }
 
@@ -1952,7 +2316,8 @@ impl RustMCTS {
     #[new]
     pub fn new(engines: Vec<PyRef<CapablancaEngine>>, parallel_sims: usize) -> Self {
         let games = engines.iter().map(|e|
-            SingleMcts::new_with_history(e.board.clone(), e.board_history.clone())
+            SingleMcts::new_with_history(e.board.clone(), e.board_history.clone(),
+                                         e.position_history.clone())
         ).collect();
         // Seed from system time — so parallel RustMCTS instances (fsf/lagged
         // create one object per game) don't get identical Dirichlet noise.
@@ -1962,8 +2327,7 @@ impl RustMCTS {
             .unwrap_or(0xdeadbeefcafe1234u64)
             .wrapping_mul(0x9e3779b97f4a7c15)
             .wrapping_add(0xbf58476d1ce4e5b9);
-        RustMCTS { games, parallel_sims, rng: seed,
-            leaf_game_map: Vec::new(), leaf_counts: Vec::new() }
+        RustMCTS { games, parallel_sims, rng: seed, leaf_counts: Vec::new() }
     }
 
     /// Set the contempt factor on every per-game MCTS. 0.0 = standard play.
@@ -1981,13 +2345,32 @@ impl RustMCTS {
         for g in self.games.iter_mut() { g.add_dirichlet = enabled; }
     }
 
+    /// Toggle per-slot repetition planes during search (default false = legacy
+    /// slot-0-only). True aligns search encoding with training's get_board_tensor.
+    pub fn set_rep_search_perslot(&mut self, enabled: bool) {
+        for g in self.games.iter_mut() { g.rep_search_perslot = enabled; }
+    }
+
+    /// Mark a game as done so `collect_leaves` stops walking it.
+    ///
+    /// Resignation, adjudication and the max-game-length cap are Python-side
+    /// verdicts the board rules know nothing about; without this the tree keeps
+    /// expanding dead games and their leaves eat GPU batch slots. Idempotent;
+    /// out-of-range indices are ignored. Any pending virtual loss is drained so
+    /// the abandoned tree is left in a consistent state.
+    pub fn set_game_finished(&mut self, game_idx: usize) {
+        if game_idx < self.games.len() && !self.games[game_idx].finished {
+            self.games[game_idx].finished = true;
+            self.drain_pending_vloss(game_idx, game_idx + 1);
+        }
+    }
+
     /// Collects leaves for inference.
     /// Returns 2D NumPy array of shape (N, TOTAL_INPUT_PLANES*80) = (N, 11120) with history planes.
     /// target_sims_per_game = total simulations planned for each game
     /// (for honest sims_remaining estimation in best_move_is_decided).
     #[pyo3(signature = (target_sims_per_game=0))]
     pub fn collect_leaves<'py>(&mut self, py: Python<'py>, target_sims_per_game: i32) -> Bound<'py, PyArray2<f32>> {
-        self.leaf_game_map.clear();
         let mut new_counts = vec![0usize; self.games.len()];
         let cols = TOTAL_INPUT_PLANES * 80;
         let mut flat: Vec<f32> = Vec::with_capacity(
@@ -1996,7 +2379,7 @@ impl RustMCTS {
         let mut total = 0usize;
 
         for (g, game) in self.games.iter_mut().enumerate() {
-            if game.is_over() { continue; }
+            if game.finished || game.is_over() { continue; }
             // Accumulating tree reuse: count remaining from sims DONE THIS MOVE,
             // not from full root.visits. Otherwise visits inherited via tree reuse
             // artificially deflate sims_remaining → best_move_is_decided cuts off search
@@ -2013,13 +2396,12 @@ impl RustMCTS {
                 self.parallel_sims, &mut self.rng, &mut flat
             );
             new_counts[g] = count;
-            for _ in 0..count { self.leaf_game_map.push(g); }
             total += count;
         }
 
         // Python reads these counts via get_current_batch_counts() right after
         // collect_leaves and passes them back into apply_inference_buffered, so
-        // policies always land on the correct games even with double-buffering.
+        // policies always land on the correct games.
         self.leaf_counts = new_counts;
 
         // Single tensor size = TOTAL_INPUT_PLANES * 80 (139 * 80 = 11120 with history planes).
@@ -2048,69 +2430,8 @@ impl RustMCTS {
         hashes
     }
 
-    /// Applies GPU inference results to trees.
-    /// Accepts NumPy arrays directly — zero serialization overhead.
-    /// policies: shape (N, 7000) f32
-    /// values:   shape (N,)      f32 — Q = P(W) - P(L)
-    /// draws:    shape (N,)      f32 — P(D), for D-head tracking in nodes
-    pub fn apply_inference(
-        &mut self,
-        policies: PyReadonlyArray2<f32>,
-        values: PyReadonlyArray1<f32>,
-        draws: PyReadonlyArray1<f32>,
-        mlhs: PyReadonlyArray1<f32>,
-    ) {
-        let pol_flat = policies.as_slice().expect("policies must be C-contiguous");
-        let val     = values.as_slice().expect("values must be contiguous");
-        let drw     = draws.as_slice().expect("draws must be contiguous");
-        let mlh     = mlhs.as_slice().expect("mlhs must be contiguous");
-
-        let shape       = policies.shape();
-        let n_leaves    = shape[0];
-        let policy_size = shape[1];
-
-        let total: usize = self.leaf_counts.iter().sum();
-        if total != n_leaves || val.len() != n_leaves || drw.len() != n_leaves || mlh.len() != n_leaves {
-            eprintln!(
-                "apply_inference: size mismatch (leaf_counts.sum={} n_leaves={} val.len={} drw.len={} mlh.len={}) — resetting vloss",
-                total, n_leaves, val.len(), drw.len(), mlh.len()
-            );
-            let n = self.games.len();
-            self.drain_pending_vloss(0, n);
-            return;
-        }
-
-        let mut offset = 0;
-        let mut break_at: Option<usize> = None;
-        let counts = std::mem::take(&mut self.leaf_counts);
-        for (g, &count) in counts.iter().enumerate() {
-            if count == 0 { continue; }
-            let start = offset * policy_size;
-            let end   = (offset + count) * policy_size;
-            if end > pol_flat.len() {
-                eprintln!("apply_inference: pol_flat overflow at game {} — resetting vloss for remaining", g);
-                break_at = Some(g);
-                break;
-            }
-            let rng = &mut self.rng;
-            self.games[g].apply_inference_flat(
-                &pol_flat[start..end], policy_size,
-                &val[offset..offset + count],
-                &drw[offset..offset + count],
-                &mlh[offset..offset + count],
-                rng,
-            );
-            offset += count;
-        }
-        self.leaf_counts = counts;
-        if let Some(g) = break_at {
-            let n = self.games.len();
-            self.drain_pending_vloss(g, n);
-        }
-    }
-
-    /// Returns leaf_counts of current batch — Python saves and passes
-    /// to apply_inference_buffered for double-buffering.
+    /// Leaves collected per game in the batch `collect_leaves` just built.
+    /// Python passes it straight back into `apply_inference_buffered`.
     pub fn get_current_batch_counts(&self) -> Vec<usize> {
         self.leaf_counts.clone()
     }
@@ -2209,6 +2530,12 @@ impl RustMCTS {
         self.games.iter().map(|g| g.root_value()).collect()
     }
 
+    /// Per-root-child stats for the Gumbel completed-Q policy target.
+    /// One (policy_idxs, priors, visits, q_parent) tuple per game. Read-only.
+    pub fn get_root_children_stats(&self) -> Vec<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> {
+        self.games.iter().map(|g| g.get_root_children_stats()).collect()
+    }
+
     /// Root draw probabilities (D = P(Draw)). Used for WDL-based resign:
     /// P(L) = (1 - Q - D) / 2 — more precise than Q threshold (distinguishes "sure draw" vs "loss").
     pub fn get_draws(&self) -> Vec<f32> {
@@ -2267,5 +2594,4 @@ impl RustMCTS {
     }
 
     pub fn num_games(&self) -> usize { self.games.len() }
-    pub fn last_batch_size(&self) -> usize { self.leaf_game_map.len() }
 }

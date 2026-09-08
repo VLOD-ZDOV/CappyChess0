@@ -25,6 +25,16 @@ from typing import List, Tuple, Dict
 import numpy as np
 import torch
 
+# PyTorch's intra-op pool defaults to half the core count and busy-waits
+# between GPU calls. The CPU side of this workload is tree descent in Rust plus
+# sparse-policy assembly, not matrix work, so those threads buy nothing: measured
+# throughput flat across every thread count tried, while CPU use goes
+# up several times over. Freeing the cores also stops a co-running eval or GUI from
+# costing throughput (measured -30% under contention).
+# See docs/experiments/cpu_threads.md. Override with OMP_NUM_THREADS.
+if "OMP_NUM_THREADS" not in os.environ:
+    torch.set_num_threads(2)
+
 from model import CapablancaNet
 from mcts import UltraFastMCTS
 
@@ -72,7 +82,7 @@ def save_pgn(moves: list, result_str: str, pgn_path: str,
 
 # ── Model loading ──────────────────────────────────────────────────────────────
 
-def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
+def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str, str, str]:
     """
     Loads a checkpoint, automatically detecting the architecture.
     Supports old (scalar value, policy=6880) and new (WDL, policy=7000) formats.
@@ -86,7 +96,7 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
     # used to ignore the BT5 flags → checkpoints trained with them loaded into
     # a default net with random qkv.bias / ln.bias / no piece_embed, ruining
     # the transformer blocks and giving meaningless eval results.
-    from model import build_net_from_state_dict
+    from model import build_net_from_state_dict, describe_arch
     net, sd = build_net_from_state_dict(raw_sd)
     # Track shape-mismatch drops for the arch_tag warning below.
     full_sd = {k.replace("_orig_mod.", "").replace("module.", ""): v
@@ -95,7 +105,8 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
 
     result = net.load_state_dict(sd, strict=False)
     net.to(device).eval()
-    net = net.to(memory_format=torch.channels_last)
+    # NCHW on purpose: this net is GroupNorm-heavy — channels_last measured
+    # ~10-15% SLOWER (see experiments/perf/ and the notes in mcts.py/train.py).
 
     # Detect value head type for informational purposes
     vkey = next((k for k in sd if "value_head" in k and k.endswith(".weight")
@@ -112,7 +123,7 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str]:
         num = name.split("iter")[-1].lstrip("0") or "0"
         name = f"iter{num}"
 
-    return net, name, arch_tag
+    return net, name, arch_tag, describe_arch(net)
 
 
 def collect_checkpoints(paths: List[str], last: int = 0) -> List[str]:
@@ -151,6 +162,8 @@ def play_batch(
     black_name: str = "Black",
     compile_mode: str = None,
     kld_threshold: float = 0.0,
+    parallel_sims: int = None,
+    parallel_sims_black: int = None,
 ) -> List[float]:
     """
     Plays num_games games: net_white as white, net_black as black.
@@ -159,10 +172,14 @@ def play_batch(
     """
     mcts_w = UltraFastMCTS(net_white, device, c_puct=1.25,
                             batch_size=mcts_batch, add_dirichlet=False,
-                            compile_mode=compile_mode, kld_threshold=kld_threshold)
+                            compile_mode=compile_mode, kld_threshold=kld_threshold,
+                            parallel_sims=parallel_sims)
     mcts_b = UltraFastMCTS(net_black, device, c_puct=1.25,
                             batch_size=mcts_batch, add_dirichlet=False,
-                            compile_mode=compile_mode, kld_threshold=kld_threshold)
+                            compile_mode=compile_mode, kld_threshold=kld_threshold,
+                            parallel_sims=(parallel_sims_black
+                                           if parallel_sims_black is not None
+                                           else parallel_sims))
 
     engines = [CapablancaEngine() for _ in range(num_games)]
     active  = list(range(num_games))
@@ -170,30 +187,34 @@ def play_batch(
     move_counts = [0] * num_games
     histories = [[] for _ in range(num_games)]  # for verbose and PGN
 
+    # One persistent tree per network, both tracking the real game. Every move
+    # is applied to both, so each search resumes from the sub-tree the previous
+    # one already built (tree reuse) instead of starting from scratch. The old
+    # loop rebuilt the tree every ply, which measures the network playing WITHOUT
+    # the reuse it gets in self-play — i.e. weaker than it actually is.
+    tree_w = mcts_w.new_tree(engines)
+    tree_b = mcts_b.new_tree(engines)
+
     while active:
-        # Split active games by whose turn it is
-        white_games = [i for i in active if engines[i].side_to_move() == 0]
-        black_games = [i for i in active if engines[i].side_to_move() == 1]
+        # All games advance one ply per pass, so they stay in lockstep and the
+        # side to move is the same for every active game.
+        side = engines[active[0]].side_to_move()
+        searcher, tree = (mcts_w, tree_w) if side == 0 else (mcts_b, tree_b)
+        searcher.run_search(tree, simulations)
+        # Sparse root policy: one entry per visited legal move instead of a dense
+        # 7000-float vector per game per ply.
+        sparse_pols = tree.get_policies_sparse()
 
-        # MCTS for white
-        if white_games:
-            w_engines = [engines[i] for i in white_games]
-            w_policies = mcts_w.search_games(w_engines, simulations)
-            for j, gi in enumerate(white_games):
-                m = _apply_policy_move(engines[gi], w_policies[j],
-                                       move_counts[gi], temperature_moves)
-                if m is not None: histories[gi].append(m)
-                move_counts[gi] += 1
-
-        # MCTS for black
-        if black_games:
-            b_engines = [engines[i] for i in black_games]
-            b_policies = mcts_b.search_games(b_engines, simulations)
-            for j, gi in enumerate(black_games):
-                m = _apply_policy_move(engines[gi], b_policies[j],
-                                       move_counts[gi], temperature_moves)
-                if m is not None: histories[gi].append(m)
-                move_counts[gi] += 1
+        for gi in active:
+            pol_idx, pol_val = sparse_pols[gi]
+            lookup = {int(i): float(v) for i, v in zip(pol_idx, pol_val)}
+            m = _apply_policy_move(engines[gi], lookup,
+                                   move_counts[gi], temperature_moves)
+            if m is not None:
+                histories[gi].append(m)
+                tree_w.make_move(gi, m)
+                tree_b.make_move(gi, m)
+            move_counts[gi] += 1
 
         # Check for game completion
         new_active = []
@@ -206,6 +227,8 @@ def play_batch(
             else:
                 new_active.append(gi)
                 continue
+            tree_w.set_game_finished(gi)
+            tree_b.set_game_finished(gi)
             # Game over — verbose and PGN
             r = results[gi]
             if verbose and move_counts[gi] <= 10:
@@ -222,15 +245,16 @@ def play_batch(
     return results
 
 
-def _apply_policy_move(engine: CapablancaEngine, policy: np.ndarray,
+def _apply_policy_move(engine: CapablancaEngine, policy: dict,
                         move_num: int, temperature_moves: int) -> int:
-    """Selects and applies a move according to the policy. Returns the chosen move."""
+    """Selects and applies a move from a sparse root policy {policy_idx: prob}.
+    Returns the chosen move, or None if the position has no legal moves."""
     legal = engine.get_legal_moves_int()
     if not legal:
         return None
 
     probs = np.array([
-        policy[engine.move_int_to_policy_idx(m) or 0] for m in legal
+        policy.get(engine.move_int_to_policy_idx(m), 0.0) for m in legal
     ], dtype=np.float64)
 
     s = probs.sum()
@@ -264,6 +288,8 @@ def run_match(
     timeout_as_draw: bool = False,
     compile_mode: str = None,
     kld_threshold: float = 0.0,
+    parallel_sims: int = None,
+    parallel_sims_b: int = None,
 ) -> Dict:
     """
     Plays `games` games between A and B (half with A as white, half with B as white).
@@ -289,7 +315,8 @@ def run_match(
                       verbose=verbose, pgn_path=pgn1,
                       white_name=name_a, black_name=name_b,
                       timeout_as_draw=timeout_as_draw,
-                      compile_mode=compile_mode, kld_threshold=kld_threshold)
+                      compile_mode=compile_mode, kld_threshold=kld_threshold,
+                      parallel_sims=parallel_sims)
     for r in res1:
         if r > 0:   wins_a += 1
         elif r < 0: wins_b += 1
@@ -308,7 +335,8 @@ def run_match(
                       verbose=verbose, pgn_path=pgn2,
                       white_name=name_b, black_name=name_a,
                       timeout_as_draw=timeout_as_draw,
-                      compile_mode=compile_mode, kld_threshold=kld_threshold)
+                      compile_mode=compile_mode, kld_threshold=kld_threshold,
+                      parallel_sims=parallel_sims)
     for r in res2:
         # r — result for white (= B), convert to result for A
         r_a = -r
@@ -457,6 +485,15 @@ def main():
                         choices=["none", "default", "reduce-overhead", "max-autotune"],
                         help="torch.compile режим инференса (~1.5x на форварде). "
                              "default — безопасно; none — отключить (default: default)")
+    parser.add_argument("--mcts-parallel-sims", type=int, default=None,
+                        help="Листьев на вызов NN. ceil(simulations/это) = число "
+                             "последовательных раундов PUCT; ниже ~12 раундов "
+                             "поиск вырождается в равномерный "
+                             "(см. docs/experiments/policy_target_collapse.md)")
+    parser.add_argument("--mcts-parallel-sims-b", type=int, default=None,
+                        help="parallel_sims для ВТОРОЙ модели. Позволяет столкнуть "
+                             "одни и те же веса с разными настройками поиска — "
+                             "измерить настройку поиска без переобучения.")
     parser.add_argument("--kld", type=float, default=0.0,
                         help="Порог KLD early-exit: MCTS останавливается раньше, когда "
                              "распределение визитов стабилизировалось. 0 = выкл. "
@@ -482,11 +519,9 @@ def main():
     models: List[Tuple[str, CapablancaNet]] = []
     for path in ckpt_paths:
         try:
-            net, name, arch_tag = load_model(path, device)
+            net, name, arch_tag, arch = load_model(path, device)
             models.append((name, net))
-            ch = net.num_channels
-            bl = len(net.res_blocks)
-            print(f"  ✓ {name:<20} ({ch}ch × {bl} blocks){arch_tag}  [{path}]")
+            print(f"  ✓ {name:<14} {arch}{arch_tag}")
         except Exception as e:
             print(f"  ✗ Ошибка загрузки {path}: {e}")
 
@@ -518,6 +553,8 @@ def main():
             max_moves=args.max_moves,
             temperature_moves=args.temperature_moves,
             mcts_batch=args.mcts_batch,
+            parallel_sims=args.mcts_parallel_sims,
+            parallel_sims_b=args.mcts_parallel_sims_b,
             verbose=args.verbose,
             pgn_dir=args.pgn_dir,
             timeout_as_draw=args.timeout_as_draw,
