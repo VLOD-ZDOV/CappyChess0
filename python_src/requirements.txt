@@ -1,0 +1,16 @@
+# GUI / inference dependencies — enough to run gui.py.
+#
+# The Rust engine (capablanca_engine) is NOT a pip package: build it with
+#   maturin develop --release      (see the README, "Running from source").
+#
+# Training needs PyTorch — install it separately, matching your CUDA, e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# ONNX export (export_onnx.py) additionally needs:
+#   pip install onnx onnxscript
+
+numpy
+PyQt5
+
+# GPU inference on NVIDIA (bundles the CUDA runtime, needs only the driver).
+# On a machine without an NVIDIA GPU, replace this line with:  onnxruntime
+onnxruntime-gpu

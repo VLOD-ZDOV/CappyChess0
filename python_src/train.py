@@ -1,15 +1,12 @@
-# train.py — Optimized training loop
+# train.py — AlphaZero training loop for Capablanca Chess.
 #
-# FIX v3:
-#   - Collapse detector: policy_loss < threshold → warning, checkpoint not saved
-#   - Diversity diagnostics after each self-play (entropy, top1, value_std)
-#   - --reset-scheduler: recreates scheduler when loading checkpoint (needed on --lr change)
-#   - --reset-buffer: clears replay buffer at startup
-#   - Correct outcome counting (white/black/stalemate/timeout)
-#   - Deprecation fix: torch.amp.GradScaler instead of torch.cuda.amp.GradScaler
-#   - LR forcibly set in param_groups after loading optimizer
-#   - train_steps capped at 1 epoch of buffer
-#   - value_loss_weight=1.0, train_steps default=200
+# One iteration = self-play (Rust MCTS + GPU inference) → replay buffer →
+# supervised steps on sampled batches → checkpoint. Optional extras, all
+# opt-in from the CLI: Fairy-Stockfish curriculum, a lagged-checkpoint
+# opponent, distillation from a teacher buffer.
+#
+# Everything the loop needs lives in `Config`; `train(cfg)` is importable and
+# does not read argparse state.
 
 import os
 import time
@@ -19,9 +16,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.multiprocessing as mp
-from dataclasses import dataclass, field
-from typing import List, Tuple
+
+# PyTorch's intra-op pool defaults to half the core count and busy-waits
+# between GPU calls. The CPU side of this workload is tree descent in Rust plus
+# sparse-policy assembly, not matrix work, so those threads buy nothing: measured
+# throughput flat across every thread count tried, while CPU use goes
+# up several times over. Freeing the cores also stops a co-running eval or GUI from
+# costing throughput (measured -30% under contention).
+# See docs/experiments/cpu_threads.md. Override with OMP_NUM_THREADS.
+if "OMP_NUM_THREADS" not in os.environ:
+    torch.set_num_threads(2)
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 
 class ModelEMA:
@@ -134,10 +140,7 @@ def _int_to_uci(m: int) -> str:
 
 
 def _uci_to_int(uci: str, engine):
-    try:
-        from capablanca_engine import CapablancaEngine
-    except ImportError:
-        return None
+    """Resolve a UCI string against the engine's legal moves. None if illegal."""
     for m in engine.get_legal_moves_int():
         if _int_to_uci(m) == uci:
             return m
@@ -146,7 +149,15 @@ def _uci_to_int(uci: str, engine):
 
 class FairyStockfishWrapper:
     """UCI wrapper around Fairy-Stockfish for the Capablanca variant."""
-    def __init__(self, path: str):
+    def __init__(self, path: str, skill: int = None, elo: int = None):
+        """skill / elo — настоящие ручки силы движка.
+
+        `go nodes N` силу почти не снижает: даже при N=1 движок отвечает
+        статической оценкой с qsearch и обыгрывает всё, что мы обучали, всухую
+        (0 из 64 при 96% против Random). Ступеней между Random и FSF там нет.
+        `Skill Level` (-20..20) и `UCI_LimitStrength`+`UCI_Elo` (500..2850) дают
+        нормальную лестницу. См. docs/experiments/fsf_ladder.md.
+        """
         if not os.path.exists(path):
             raise FileNotFoundError(f"Fairy-Stockfish не найден: {path}")
         self.proc = subprocess.Popen(
@@ -155,6 +166,11 @@ class FairyStockfishWrapper:
         )
         self._send("uci");          self._wait("uciok")
         self._send("setoption name UCI_Variant value capablanca")
+        if skill is not None:
+            self._send(f"setoption name Skill Level value {int(skill)}")
+        if elo is not None:
+            self._send("setoption name UCI_LimitStrength value true")
+            self._send(f"setoption name UCI_Elo value {int(elo)}")
         self._send("isready");      self._wait("readyok")
 
     def _send(self, cmd: str):
@@ -162,7 +178,10 @@ class FairyStockfishWrapper:
 
     def _wait(self, target: str) -> str:
         while True:
-            line = self.proc.stdout.readline().strip()
+            raw = self.proc.stdout.readline()
+            if not raw:  # EOF — FSF process died; don't spin forever
+                raise RuntimeError("Fairy-Stockfish process closed unexpectedly")
+            line = raw.strip()
             if target in line: return line
 
     def best_move(self, uci_history, nodes: int) -> tuple:
@@ -195,7 +214,7 @@ class FairyStockfishWrapper:
 
 def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
                        fsf_nodes: int, mcts_sims: int = 100):
-    """Generates num_games games against an opponent.
+    """Generates num_games games against an external opponent.
 
     fsf_nodes == 0 : random mover — first curriculum level.
                      Opponent positions are NOT saved. Value = game result.
@@ -204,117 +223,154 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
                      where fsf_eval = -tanh(score_cp/400) after each NN move.
                      This gives a dense, position-specific value signal
                      instead of a single delayed game result for the whole game.
-    """
-    try:
-        from capablanca_engine import CapablancaEngine
-        from mcts import UltraFastMCTS
-    except ImportError:
-        print("  ❌ capablanca_engine или mcts не доступны")
-        return [], 0, 0, 0
 
+    Games run in batches with tree reuse. Fairy-Stockfish is a single serial
+    UCI process, so opponent plies are still queried game by game — but the NN
+    plies (the expensive half) now go to the GPU as one batch, and the search
+    tree survives from move to move instead of being rebuilt every ply.
+    All games in a batch share `nn_side` so the whole batch has the same side
+    to move each ply; the side alternates between batches.
+    """
     fsf_value_alpha = getattr(cfg, 'fsf_value_alpha', 0.7)
     fsf_noise_prob  = getattr(cfg, 'fsf_noise_prob', 0.0)
     use_random = (fsf_nodes == 0)
     fsf = None
     if not use_random:
         try:
-            fsf = FairyStockfishWrapper(fsf_path)
+            fsf = FairyStockfishWrapper(fsf_path,
+                                        skill=getattr(cfg, 'fsf_skill', None),
+                                        elo=getattr(cfg, 'fsf_elo', None))
         except Exception as e:
             print(f"  ❌ FSF: {e}")
             return [], 0, 0, 0
 
-    # Contempt is most useful here — vs an external opponent (FSF) the NN benefits
+    # Contempt is most useful here — vs an external opponent the NN benefits
     # from biasing away from draws to convert positional advantage into wins.
-    # parallel_sims>1 batches the leaves of a single game's tree per GPU call
-    # (was 1 → batch=1 inference per simulation, GPU idle). Even with one game
-    # in flight this collects mcts_parallel_sims leaves per step.
-    mcts = UltraFastMCTS(net, device, c_puct=1.745, batch_size=1,
+    # >=2 batches so `nn_side = b % 2` still splits the colours ~50/50;
+    # one giant batch would play every game as the same side.
+    batch_sz = max(1, min(cfg.mcts_batch, (num_games + 1) // 2))
+    mcts = UltraFastMCTS(net, device, c_puct=1.745, batch_size=batch_sz,
                          add_dirichlet=False, parallel_sims=cfg.mcts_parallel_sims,
-                         contempt=cfg.contempt)
+                         contempt=cfg.contempt,
+                         rep_search_perslot=cfg.rep_search_perslot)
+
     all_samples = []
     wins = draws = losses = errors = 0
     nn_wins = nn_draws = nn_losses = 0
+    num_batches = (num_games + batch_sz - 1) // batch_sz
 
-    for game_idx in range(num_games):
-        engine  = CapablancaEngine()
-        nn_side = game_idx % 2
-        uci_history = []
-        # NN positions only: [board_np, pol, side, fsf_eval_or_None]
-        # fsf_eval is filled when FSF moves after NN (evaluation of position after NN move)
-        # score_cp > 0 → FSF (side-to-move) is winning → fsf_eval < 0 for NN
-        nn_positions = []
-        move_num, ok = 0, True
-        adjudicated_result = None
+    for b in range(num_batches):
+        n = min(batch_sz, num_games - b * batch_sz)
+        nn_side = b % 2
+        engines = [CapablancaEngine() for _ in range(n)]
+        tree = mcts.new_tree(engines)
 
-        while not engine.is_game_over() and move_num < cfg.max_game_length and adjudicated_result is None:
-            side = engine.side_to_move()
-            legal = engine.get_legal_moves_int()
-            if not legal: break
-            board_np = np.array(engine.get_board_tensor(), dtype=np.float32)
+        # NN positions only: (board, sparse_pol, side, ply, root_q, root_d, [fsf_eval])
+        # fsf_eval is filled when the opponent replies (its eval of the position
+        # right after our move); score_cp > 0 means the mover (FSF) is winning,
+        # so the NN's view is -tanh(cp/400).
+        positions = [[] for _ in range(n)]
+        uci_history = [[] for _ in range(n)]
+        game_plies = [0] * n
+        adjudicated = [None] * n
+        broken = [False] * n
+        active = list(range(n))
+        move_num = 0
 
-            if side == nn_side:
-                pol = mcts.search_games([engine], mcts_sims)[0]
-                raw = np.array([pol[engine.move_int_to_policy_idx(m) or 0]
-                               for m in legal], dtype=np.float64)
-                raw = np.power(np.maximum(raw, 1e-8), 1.0 / 0.8)
-                probs = raw / raw.sum()
-                move = int(np.random.choice(legal, p=probs))
-                # Position BEFORE NN move, fsf_eval will be filled on FSF's next turn
-                nn_positions.append([board_np, pol.copy(), side, None])
+        while active and move_num < cfg.max_game_length:
+            is_nn = (move_num % 2) == nn_side
+            new_active = []
 
-            elif use_random:
-                # Random mover: not saved, no useful policy signal
-                move = int(np.random.choice(legal))
+            if is_nn:
+                mcts.run_search(tree, mcts_sims)
+                sparse_pols = tree.get_policies_sparse()
+                vals = np.asarray(tree.get_values(), dtype=np.float32)
+                draw_ps = np.asarray(tree.get_draws(), dtype=np.float32)
 
-            else:  # FSF's turn
-                # fsf_noise_prob > 0: FSF occasionally makes random moves → softened opponent
-                if fsf_noise_prob > 0.0 and np.random.random() < fsf_noise_prob:
+            for g in active:
+                eng = engines[g]
+                legal = eng.get_legal_moves_int()
+                if not legal:
+                    tree.set_game_finished(g)
+                    continue
+
+                if is_nn:
+                    side = eng.side_to_move()
+                    pol_idx, pol_val = sparse_pols[g]
+                    pol_lookup = {int(i): float(v) for i, v in zip(pol_idx, pol_val)}
+                    positions[g].append([
+                        np.asarray(eng.get_board_tensor(), dtype=np.float32),
+                        (np.asarray(pol_idx, dtype=np.int16),
+                         np.asarray(pol_val, dtype=np.float16)),
+                        side, move_num,
+                        float(vals[g]) if g < len(vals) else None,
+                        float(draw_ps[g]) if g < len(draw_ps) else None,
+                        None,
+                    ])
+                    move = _sample_move_from_policy(eng, pol_lookup, legal)
+                elif use_random:
                     move = int(np.random.choice(legal))
-                    # No eval for random move — don't fill fsf_eval
                 else:
-                    uci, score_cp = fsf.best_move(uci_history, nodes=fsf_nodes)
-                    if uci == "(none)": break
-                    move = _uci_to_int(uci, engine)
-                    if move is None:
-                        errors += 1; ok = False; break
-                    # FSF evaluates position AFTER the last NN move (now it's FSF's turn)
-                    # score_cp > 0 → FSF (side to move) is winning → bad for NN
-                    if nn_positions and nn_positions[-1][3] is None:
-                        nn_positions[-1][3] = -float(np.tanh(score_cp / 400.0))
+                    # fsf_noise_prob > 0: FSF occasionally plays at random →
+                    # a softened opponent. No eval recorded for a random move.
+                    if fsf_noise_prob > 0.0 and np.random.random() < fsf_noise_prob:
+                        move = int(np.random.choice(legal))
+                    else:
+                        uci, score_cp = fsf.best_move(uci_history[g], nodes=fsf_nodes)
+                        if uci == "(none)":
+                            broken[g] = True
+                            tree.set_game_finished(g)
+                            continue
+                        move = _uci_to_int(uci, eng)
+                        if move is None:
+                            errors += 1
+                            broken[g] = True
+                            tree.set_game_finished(g)
+                            continue
+                        if positions[g] and positions[g][-1][6] is None:
+                            positions[g][-1][6] = -float(np.tanh(score_cp / 400.0))
 
-            engine.make_move_int(move)
-            uci_history.append(_int_to_uci(move))
+                eng.make_move_int(move)
+                uci_history[g].append(_int_to_uci(move))
+                tree.make_move(g, move)
+                game_plies[g] += 1
+                if eng.is_game_over():
+                    tree.set_game_finished(g)
+                    continue
+                adj = eng.adjudication_result() if cfg.adjudicate else None
+                if adj is not None:
+                    adjudicated[g] = adj
+                    tree.set_game_finished(g)
+                else:
+                    new_active.append(g)
+
+            active = new_active
             move_num += 1
-            adj = engine.adjudication_result()
-            if adj is not None:
-                adjudicated_result = adj
 
-        if not ok: continue
-        if adjudicated_result is not None: result = adjudicated_result
-        elif engine.is_game_over(): result = engine.game_result()
-        else: result = 0.0 if cfg.timeout_as_draw else engine.material_result()
+        for g, eng in enumerate(engines):
+            if broken[g]:
+                continue
+            result = _finish_result(cfg, eng, adjudicated[g])
+            if result > 0.5:    wins   += 1
+            elif result < -0.5: losses += 1
+            else:               draws  += 1
+            nn_result = result if nn_side == 0 else -result
+            if nn_result > 0.5:    nn_wins   += 1
+            elif nn_result < -0.5: nn_losses += 1
+            else:                  nn_draws  += 1
 
-        if result > 0.5:    wins   += 1
-        elif result < -0.5: losses += 1
-        else:               draws  += 1
-        nn_result = result if nn_side == 0 else -result
-        if nn_result > 0.5:    nn_wins   += 1
-        elif nn_result < -0.5: nn_losses += 1
-        else:                  nn_draws  += 1
-
-        total_nn = len(nn_positions)
-        for k, (board_np, pol, side, fsf_eval) in enumerate(nn_positions):
-            v_game = result if side == 0 else -result
-            if not use_random and fsf_eval is not None:
-                # Mix: FSF eval (dense, positional) + game result (long-term)
-                v = fsf_value_alpha * fsf_eval + (1.0 - fsf_value_alpha) * v_game
-            else:
-                v = v_game
-            # MLH: NN positions recorded in game order (NN moves only, not FSF). Use
-            # NN position index in its sequence — few positions, normalization still [0,1].
-            remaining = max(0, total_nn - 1 - k)
-            mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
-            all_samples.append(pack_sample(board_np, pol, float(v), float(mlh_norm)))
+            total_plies = game_plies[g]
+            for board_np, pol_sparse, side, ply, root_q, root_d, fsf_eval in positions[g]:
+                z = result if side == 0 else -result
+                if not use_random and fsf_eval is not None:
+                    # Mix FSF's dense positional eval with the game result.
+                    z = fsf_value_alpha * fsf_eval + (1.0 - fsf_value_alpha) * z
+                v, draw_target = _blend_value(cfg, z, root_q, root_d, result)
+                remaining = max(0, total_plies - 1 - ply)
+                mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
+                all_samples.append(pack_sample_sparse(
+                    board_np, pol_sparse, float(v), float(mlh_norm),
+                    -1, float(draw_target)))
 
     if fsf is not None:
         fsf.close()
@@ -325,23 +381,64 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
     return all_samples, nn_wins, nn_draws, nn_losses
 
 
+def _sample_move_from_policy(eng, pol_lookup, legal, tau: float = 0.8):
+    """Pick a move from a sparse root policy with temperature `tau`."""
+    raw = np.array([pol_lookup.get(eng.move_int_to_policy_idx(m), 0.0)
+                    for m in legal], dtype=np.float64)
+    if not np.isfinite(raw).all() or raw.max(initial=0.0) <= 0.0:
+        return int(np.random.choice(legal))
+    raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
+    s = raw.sum()
+    probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
+    return int(np.random.choice(legal, p=probs))
+
+
+def _blend_value(cfg, z: float, root_q, root_d, result: float):
+    """KataGo/LC0 value target: (1-w)*z + w*root_Q, plus the WDL draw axis.
+
+    Returns (value, draw_target) where draw_target < 0 means "reconstruct the
+    WDL from the value" (legacy). Same formula generate_games uses — the
+    opponent generators used to emit pure-z targets, so half the curriculum
+    data missed the variance reduction entirely.
+    """
+    if cfg.value_q_weight <= 0.0 or root_q is None:
+        return z, -1.0
+    w = cfg.value_q_weight
+    v = (1.0 - w) * z + w * float(root_q)
+    if root_d is None:
+        return v, -1.0
+    z_is_draw = 1.0 if abs(result) < 1e-6 else 0.0
+    return v, (1.0 - w) * z_is_draw + w * float(root_d)
+
+
+def _finish_result(cfg, eng, adjudicated):
+    if adjudicated is not None:
+        return float(adjudicated)
+    if eng.is_game_over():
+        return float(eng.game_result())
+    return 0.0 if cfg.timeout_as_draw else float(eng.material_result())
+
+
 def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
                            num_games: int, mcts_sims: int = 50):
     """Plays the current model against an old checkpoint (lagged_sd).
 
     Current network (NN): with Dirichlet, full exploratory mode.
     Lagged network (OPP): without Dirichlet, deterministic mode.
-    Only saves positions from the current network (as in generate_fsf_games).
+    Only positions played by the CURRENT network are saved.
+
+    Games run in batches with tree reuse, exactly like `generate_games`: both
+    sides are networks, so there is nothing serial to wait on. The old
+    one-game-at-a-time / fresh-tree-every-ply loop measured ~4.7x slower per
+    game (37.8 vs 8.0 ms per half-move on 256ch×15+4tb at 100 sims) and threw
+    the whole sub-tree away on every move.
+
+    All games inside one batch share the same `nn_side` so the whole batch has
+    the same side to move on every ply and one GPU call serves all of them;
+    the side alternates between batches to keep colours balanced.
 
     Returns: (samples, cur_wins, cur_draws, cur_losses)
     """
-    try:
-        from capablanca_engine import CapablancaEngine
-        from mcts import UltraFastMCTS
-    except ImportError:
-        print("  ❌ capablanca_engine не доступен для lagged games")
-        return [], 0, 0, 0
-
     from model import CapablancaNet
 
     lagged_net = CapablancaNet(
@@ -353,66 +450,113 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
         qkv_bias=cfg.qkv_bias,
         use_rmsnorm=cfg.use_rmsnorm,
         piece_embed_dim=cfg.piece_embed_dim,
+        qk_norm=cfg.qk_norm,
+        swiglu=cfg.swiglu,
+        attn_policy=cfg.attn_policy,
+        ffn_mult=cfg.ffn_mult,
+        restricted_policy=cfg.restricted_policy,
+        abs_pos_embed=cfg.abs_pos_embed,
+        wide_value=cfg.wide_value,
+        num_registers=cfg.num_registers,
+        value_residual=cfg.value_residual,
+        hyper_streams=cfg.hyper_streams,
     ).to(device)
     lagged_net.load_state_dict(lagged_sd, strict=False)
     lagged_net.eval()
 
-    # parallel_sims>1: batch the single game's leaves per GPU call (was 1 → idle GPU).
-    mcts_cur = UltraFastMCTS(net, device, c_puct=1.745, batch_size=1,
-                              add_dirichlet=True, parallel_sims=cfg.mcts_parallel_sims)
-    mcts_lag = UltraFastMCTS(lagged_net, device, c_puct=1.745, batch_size=1,
-                              add_dirichlet=False, parallel_sims=cfg.mcts_parallel_sims)
+    # >=2 batches so `nn_side = b % 2` still splits the colours ~50/50;
+    # one giant batch would play every game as the same side.
+    batch_sz = max(1, min(cfg.mcts_batch, (num_games + 1) // 2))
+    mcts_cur = UltraFastMCTS(net, device, c_puct=1.745, batch_size=batch_sz,
+                             add_dirichlet=True, parallel_sims=cfg.mcts_parallel_sims,
+                             rep_search_perslot=cfg.rep_search_perslot)
+    mcts_lag = UltraFastMCTS(lagged_net, device, c_puct=1.745, batch_size=batch_sz,
+                             add_dirichlet=False, parallel_sims=cfg.mcts_parallel_sims,
+                             rep_search_perslot=cfg.rep_search_perslot)
 
     all_samples = []
     cur_wins = cur_draws = cur_losses = 0
+    num_batches = (num_games + batch_sz - 1) // batch_sz
 
-    for game_idx in range(num_games):
-        engine  = CapablancaEngine()
-        nn_side = game_idx % 2
-        positions = []   # (board_np, pol, side) — current network positions only
+    for b in range(num_batches):
+        n = min(batch_sz, num_games - b * batch_sz)
+        nn_side = b % 2                      # whole batch plays the same colour
+        engines = [CapablancaEngine() for _ in range(n)]
+        # Two trees over the same games: one per network. Both get every move
+        # applied so their roots stay on the real game position.
+        tree_cur = mcts_cur.new_tree(engines)
+        tree_lag = mcts_lag.new_tree(engines)
+
+        positions = [[] for _ in range(n)]   # (board, sparse_pol, side, ply, q, d)
+        game_plies = [0] * n                 # per-game length; batches end ragged
+        adjudicated = [None] * n
+        active = list(range(n))
         move_num = 0
-        adjudicated_result = None
 
-        while not engine.is_game_over() and move_num < cfg.max_game_length and adjudicated_result is None:
-            side  = engine.side_to_move()
-            legal = engine.get_legal_moves_int()
-            if not legal:
-                break
-            board_np = np.array(engine.get_board_tensor(), dtype=np.float32)
+        while active and move_num < cfg.max_game_length:
+            is_current = (move_num % 2) == nn_side
+            searcher = mcts_cur if is_current else mcts_lag
+            tree = tree_cur if is_current else tree_lag
+            searcher.run_search(tree, mcts_sims)
+            sparse_pols = tree.get_policies_sparse()
+            vals = np.asarray(tree.get_values(), dtype=np.float32)
+            draws = np.asarray(tree.get_draws(), dtype=np.float32)
 
-            is_current = (side == nn_side)
-            pol = (mcts_cur if is_current else mcts_lag).search_games([engine], mcts_sims)[0]
+            new_active = []
+            for g in active:
+                eng = engines[g]
+                legal = eng.get_legal_moves_int()
+                if not legal:
+                    tree_cur.set_game_finished(g); tree_lag.set_game_finished(g)
+                    continue
+                side = eng.side_to_move()
+                pol_idx, pol_val = sparse_pols[g]
+                pol_lookup = {int(i): float(v) for i, v in zip(pol_idx, pol_val)}
 
-            raw   = np.array([pol[engine.move_int_to_policy_idx(m) or 0]
-                               for m in legal], dtype=np.float64)
-            raw   = np.power(np.maximum(raw, 1e-8), 1.0 / 0.8)
-            probs = raw / raw.sum()
-            move  = int(np.random.choice(legal, p=probs))
+                if is_current:
+                    positions[g].append((
+                        np.asarray(eng.get_board_tensor(), dtype=np.float32),
+                        (np.asarray(pol_idx, dtype=np.int16),
+                         np.asarray(pol_val, dtype=np.float16)),
+                        side, move_num,
+                        float(vals[g]) if g < len(vals) else None,
+                        float(draws[g]) if g < len(draws) else None,
+                    ))
 
-            if is_current:
-                positions.append((board_np, pol.copy(), side))
+                move = _sample_move_from_policy(eng, pol_lookup, legal)
+                eng.make_move_int(move)
+                game_plies[g] += 1
+                tree_cur.make_move(g, move)   # keep BOTH trees on the real position
+                tree_lag.make_move(g, move)
+                if eng.is_game_over():
+                    tree_cur.set_game_finished(g); tree_lag.set_game_finished(g)
+                    continue
+                adj = eng.adjudication_result() if cfg.adjudicate else None
+                if adj is not None:
+                    adjudicated[g] = adj
+                    tree_cur.set_game_finished(g); tree_lag.set_game_finished(g)
+                else:
+                    new_active.append(g)
 
-            engine.make_move_int(move)
+            active = new_active
             move_num += 1
-            adj = engine.adjudication_result()
-            if adj is not None:
-                adjudicated_result = adj
 
-        if adjudicated_result is not None: result = adjudicated_result
-        elif engine.is_game_over():        result = engine.game_result()
-        else:                              result = 0.0 if cfg.timeout_as_draw else engine.material_result()
+        for g, eng in enumerate(engines):
+            result = _finish_result(cfg, eng, adjudicated[g])
+            cur_result = result if nn_side == 0 else -result
+            if cur_result > 0.5:    cur_wins   += 1
+            elif cur_result < -0.5: cur_losses += 1
+            else:                   cur_draws  += 1
 
-        cur_result = result if nn_side == 0 else -result
-        if cur_result > 0.5:    cur_wins   += 1
-        elif cur_result < -0.5: cur_losses += 1
-        else:                   cur_draws  += 1
-
-        total_pos = len(positions)
-        for k, (board_np, pol, side) in enumerate(positions):
-            v = result if side == 0 else -result
-            remaining = max(0, total_pos - 1 - k)
-            mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
-            all_samples.append(pack_sample(board_np, pol, float(v), float(mlh_norm)))
+            total_plies = game_plies[g]
+            for board_np, pol_sparse, side, ply, root_q, root_d in positions[g]:
+                z = result if side == 0 else -result
+                v, draw_target = _blend_value(cfg, z, root_q, root_d, result)
+                remaining = max(0, total_plies - 1 - ply)
+                mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
+                all_samples.append(pack_sample_sparse(
+                    board_np, pol_sparse, float(v), float(mlh_norm),
+                    -1, float(draw_target)))
 
     del lagged_net
     total = cur_wins + cur_draws + cur_losses
@@ -421,11 +565,8 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
           f"| wr={wr:.1%} | {len(all_samples)} позиций")
     return all_samples, cur_wins, cur_draws, cur_losses
 
-
-import queue
-
 from model import CapablancaNet
-from mcts import UltraFastMCTS, POLICY_SIZE
+from mcts import UltraFastMCTS
 
 try:
     from capablanca_engine import CapablancaEngine
@@ -471,6 +612,27 @@ class Config:
     use_rmsnorm: bool = False        # True  → RMSNorm instead of LayerNorm
     piece_embed_dim: int = 0         # >0    → per-square Linear(16 → N) added to input
 
+    # Modern-transformer stack, borrowed from LLM practice. All default-off so
+    # existing checkpoints keep loading; they change the architecture, so they
+    # only make sense for a fresh run or a distillation into a new net.
+    qk_norm: bool = False        # RMSNorm on Q and K before the dot product
+    swiglu: bool = False         # gated FFN instead of Linear→Mish→Linear
+    attn_policy: bool = False    # bilinear from→to policy head instead of Linear(C*80, 7000)
+    ffn_mult: int = 2                # FFN multiplier in transformer blocks
+    restricted_policy: bool = False  # policy head only on the 2672 reachable indices
+    abs_pos_embed: bool = False      # absolute 80xC position on the token stream
+    wide_value: bool = False         # value head 32ch->512 instead of 8ch->256
+    num_registers: int = 0       # extra learnable non-square tokens for the transformer
+    value_residual: bool = False # ResFormer: mix layer-0 values into later layers
+    hyper_streams: int = 0       # mHC: widen the residual into N streams (0 = plain residual)
+    # Optimizer: "adamw" or "muon". Muon orthogonalises the momentum of 2D
+    # weights (Newton-Schulz) and keeps AdamW for everything else — norms,
+    # biases, and any 1D/4D tensor.
+    optimizer: str = "adamw"
+    # Muon's update is unit-scale by construction, so its LR lives on a different
+    # scale from AdamW's (~1e-2 vs ~1e-3) and is annealed on the same cosine.
+    muon_lr: float = 2e-2
+
     # Self-play
     simulations: int = 100
 
@@ -491,7 +653,7 @@ class Config:
     mcts_parallel_sims: int = 32  # leaves per MCTS step (more = fewer round-trips Python↔GPU)
     # torch.compile mode for inference net: None / 'default' / 'reduce-overhead' / 'max-autotune'.
     # None = no compilation (fast start). 'reduce-overhead' = CUDA graphs, up to 50% speedup on Blackwell.
-    compile_inference: str = None
+    compile_inference: Optional[str] = None
 
     # KLD-early-exit (Lc0 style smart pruning).
     # Per-visit KLD gain = max KL(prev || curr) / Δsims. If for all games gain < threshold
@@ -513,6 +675,37 @@ class Config:
     train_steps: int = 200
     min_train_steps: int = 20
     value_loss_weight: float = 1.0
+    # Value target = (1-w)*game_outcome_z + w*MCTS_root_Q  (KataGo/LC0).
+    # 0.0 = legacy pure-z (high variance). ~0.5 = KataGo-style blend: the search's
+    # own evaluation of each position is a much lower-variance target than the
+    # single game result, improving value calibration and sample efficiency.
+    # Applied at self-play time in generate_games (the root-Q is already computed).
+    value_q_weight: float = 0.0
+    # Rebalance each training batch to ~33/33/33 W/D/L (sample_balanced). True =
+    # legacy behavior. False = sample on the NATURAL outcome distribution (KataGo/
+    # LC0 style) — avoids distorting the value-head prior and the (shared) policy
+    # sampling. Worth A/B-ing together with value_q_weight, since balancing
+    # partially undoes the calibration the Q-blend buys.
+    value_balance: bool = True
+    # Policy target: "visits" (legacy AlphaZero visit-count distribution) or
+    # "gumbel" (Gumbel completed-Q improved policy, Danihelka 2022). Gumbel is a
+    # lower-variance, stronger target at low sim counts — only the stored TARGET
+    # changes; move selection stays on visit counts, so search/KLD/resign are
+    # untouched. Default "visits" = byte-identical legacy behavior.
+    policy_target_mode: str = "visits"
+    # Adjudicate clearly-decided games early (material ≥8, ≥20 ply quiet, ≥15
+    # moves) → saves timeout-tail compute, cleaner value targets. Default False
+    # (legacy: games run to natural end / resign / timeout). Changes training data.
+    adjudicate: bool = False
+    # Q-gate for adjudication (lc0-style): only adjudicate if the network's own
+    # root value agrees with the material verdict and is confident — guards
+    # against false adjudication of fortresses / compensation where material
+    # leads but the position isn't won. Require root_Q (white-POV) · adj ≥ gate.
+    # 0 = material-only (no net confirmation). Free: root_Q is already computed.
+    adjudicate_q_gate: float = 0.5
+    # Per-slot repetition planes during search (align with training encoding).
+    # Default False = legacy slot-0-only. Changes search-time NN inputs.
+    rep_search_perslot: bool = False
     # LC0 MLH loss weight. Too large → MLH dominates over policy/value.
     # 0.1 — standard value in LC0.
     mlh_loss_weight: float = 0.1
@@ -556,6 +749,14 @@ class Config:
     # Infrastructure
     device: str = "cuda"
     checkpoint_dir: str = "checkpoints"
+    # Stop after this many iterations (counting from start_iter). 0 = run forever.
+    # Needed for controlled experiments: two arms must do the SAME number of
+    # iterations, not the same wall-clock time.
+    max_iters: int = 0
+    # Seed for torch/numpy. -1 = leave both alone (previous behaviour). Set it
+    # for ablations: otherwise arms differ by weight init and self-play RNG on
+    # top of the thing you are actually measuring.
+    seed: int = -1
     save_every: int = 5
     log_every: int = 50
 
@@ -573,6 +774,14 @@ class Config:
     # random weights → worse than live NN. Always updated, only used from ema_start_iter.
     ema_start_iter: int = 10
     force_save: bool = False  # if True — save checkpoint even at low loss
+
+    # Fairy-Stockfish opponent. Empty path = pure self-play (FSF branches off).
+    # These live in Config (not on the argparse namespace) so train(cfg) is
+    # callable as a library, not only from __main__.
+    fsf_path: Optional[str] = None
+    fsf_nodes: int = 500              # node limit for FSF in the non-curriculum schedule
+    fsf_mcts_sims: int = 100          # MCTS sims for our net when playing FSF
+    reset_ema: bool = False           # re-seed EMA from the live net on checkpoint load
 
     # FSF eval as value target: mix FSF position evaluation with game result.
     # fsf_eval = -tanh(score_cp/400) — position evaluation after NN move from NN's perspective.
@@ -615,26 +824,32 @@ class Config:
 
 # Tuple: (board_f16, sparse_policy, value, mlh_norm)
 # mlh_norm = remaining_plies / MLH_PLY_NORM ∈ [0, 1], 0.0 for old samples without MLH
-CompactSample = Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], float, float, int]
+# (board, (pol_idx, pol_val), value, mlh_norm, future_idx, draw_target)
+# draw_target = -1.0 → WDL reconstructed from value (legacy); ≥0 → full-WDL blend.
+CompactSample = Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray], float, float, int, float]
 Sample = CompactSample
 MLH_PLY_NORM = 200.0   # must match CapablancaNet.MLH_PLY_NORM
 
 
 def pack_sample(board: np.ndarray, policy: np.ndarray, value: float,
-                mlh_norm: float = 0.0, future_idx: int = -1) -> CompactSample:
-    """future_idx: policy index of our move 2 half-moves ahead (-1 = unknown/none)."""
+                mlh_norm: float = 0.0, future_idx: int = -1,
+                draw: float = -1.0) -> CompactSample:
+    """future_idx: policy index of our move 2 half-moves ahead (-1 = unknown/none).
+    draw: explicit WDL draw target ∈[0,1] for the full-WDL Q-blend; -1 = none
+    (WDL reconstructed from value)."""
     board_f16 = board.astype(np.float16)
     nz = np.nonzero(policy)[0]
     pol_idx = nz.astype(np.int16)
     pol_val = policy[nz].astype(np.float16)
     return (board_f16, (pol_idx, pol_val), np.float32(value),
-            np.float32(mlh_norm), np.int32(future_idx))
+            np.float32(mlh_norm), np.int32(future_idx), np.float32(draw))
 
 
 def pack_sample_sparse(board: np.ndarray, pol_sparse: Tuple[np.ndarray, np.ndarray],
                        value: float, mlh_norm: float = 0.0,
-                       future_idx: int = -1) -> CompactSample:
-    """Pack a sample when MCTS already returned sparse visit probabilities."""
+                       future_idx: int = -1, draw: float = -1.0) -> CompactSample:
+    """Pack a sample when MCTS already returned sparse visit probabilities.
+    draw: explicit WDL draw target ∈[0,1] (full-WDL Q-blend); -1 = none."""
     board_f16 = board.astype(np.float16)
     pol_idx, pol_val = pol_sparse
     return (
@@ -644,6 +859,7 @@ def pack_sample_sparse(board: np.ndarray, pol_sparse: Tuple[np.ndarray, np.ndarr
         np.float32(value),
         np.float32(mlh_norm),
         np.int32(future_idx),
+        np.float32(draw),
     )
 
 
@@ -653,6 +869,188 @@ def unpack_policy(pol_sparse: Tuple[np.ndarray, np.ndarray],
     idx, val = pol_sparse
     pol[idx.astype(np.int32)] = val.astype(np.float32)
     return pol
+
+
+def gumbel_improved_policy(idxs: np.ndarray, priors: np.ndarray,
+                           visits: np.ndarray, qs: np.ndarray, root_v: float,
+                           maxvisit_init: float = 50.0, value_scale: float = 0.1
+                           ) -> Tuple[np.ndarray, np.ndarray]:
+    """Gumbel completed-Q improved policy target (Danihelka et al. 2022).
+
+    Matches DeepMind mctx `qtransform_completed_by_mix_value`:
+      completedQ(a) = Q(a) if N(a)>0 else v_mix
+      v_mix = (v_root + ΣN · Σ_vis P·Q / Σ_vis P) / (1 + ΣN)
+      normQ = (completedQ - lo) / (hi - lo)   # lo/hi over completedQ ∪ {v_mix}
+      σ(a)  = (maxvisit_init + max_N) · value_scale · normQ
+      π'(a) = softmax( log P(a) + σ(a) )
+
+    The min-max normalize + value_scale=0.1 are essential: without them σ scales
+    with the raw Q magnitude and saturates the target to one-hot. A lower-variance,
+    stronger target than raw visit counts, especially at low sim counts. All inputs
+    are side-to-move POV (Q = -child.q() from Rust, root_v from get_values).
+    Falls back to the prior when there is no search signal. Returns (idxs, probs).
+    """
+    idxs = np.asarray(idxs, dtype=np.int64)
+    priors = np.asarray(priors, dtype=np.float64)
+    visits = np.asarray(visits, dtype=np.float64)
+    qs = np.asarray(qs, dtype=np.float64)
+    n = idxs.shape[0]
+    sum_n = float(visits.sum())
+    if n == 0 or sum_n <= 0.0:
+        s = priors.sum()
+        probs = (priors / s) if s > 0 else np.full(n, 1.0 / max(n, 1))
+        return idxs, probs.astype(np.float32)
+
+    vis_mask = visits > 0
+    sum_pi_vis = float(priors[vis_mask].sum())
+    if sum_pi_vis > 1e-9:
+        weighted_q = float((priors[vis_mask] * qs[vis_mask]).sum()) / sum_pi_vis
+    else:
+        weighted_q = float(root_v)
+    v_mix = (float(root_v) + sum_n * weighted_q) / (1.0 + sum_n)
+
+    completed_q = np.where(vis_mask, qs, v_mix)
+    # Min-max rescale to [0,1], range taken over completedQ and v_mix (mctx).
+    lo = min(v_mix, float(completed_q.min()))
+    hi = max(v_mix, float(completed_q.max()))
+    norm_q = (completed_q - lo) / max(hi - lo, 1e-8)
+
+    max_n = float(visits.max())
+    sigma = (maxvisit_init + max_n) * value_scale * norm_q
+    logits = np.log(np.maximum(priors, 1e-9)) + sigma
+    logits -= logits.max()  # softmax stabilization
+    e = np.exp(logits)
+    probs = e / e.sum()
+    return idxs, probs.astype(np.float32)
+
+
+# ── Optimizer ─────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def _newton_schulz_orthogonalize(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """Approximate the orthogonal factor of G (Muon, Jordan et al. 2024).
+
+    Runs a quintic Newton-Schulz iteration on the normalised matrix. The
+    coefficients are the ones tuned in the reference implementation: they do not
+    converge to an exact orthogonalisation, they push the singular values into a
+    band around 1 fast, which is all the update needs. Runs in bfloat16 — the
+    iteration is numerically forgiving and this is per-step overhead on every 2D
+    weight, so precision here is not worth the bandwidth.
+    """
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16()
+    transposed = X.size(0) > X.size(1)
+    if transposed:
+        X = X.T
+    X = X / (X.norm() + 1e-7)
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.T
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Momentum-orthogonalised SGD for 2D weight matrices.
+
+    Standard momentum takes a step along a matrix whose singular values can be
+    wildly uneven, so a few directions dominate the update. Muon replaces the
+    momentum buffer with its orthogonal factor before stepping, which equalises
+    them. It only applies to genuinely matrix-shaped parameters — norms, biases
+    and anything 1D or 4D belong in AdamW, and `build_param_groups` splits them.
+
+    lr is not comparable to AdamW's: the update is unit-scale by construction,
+    so this wants something in the 1e-2 range where AdamW wants 1e-3.
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 ns_steps=5, weight_decay=0.0):
+        super().__init__(list(params), dict(lr=lr, momentum=momentum,
+                                            nesterov=nesterov, ns_steps=ns_steps,
+                                            weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        for group in self.param_groups:
+            mom, nesterov = group["momentum"], group["nesterov"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                st = self.state[p]
+                if "momentum_buffer" not in st:
+                    st["momentum_buffer"] = torch.zeros_like(g)
+                buf = st["momentum_buffer"]
+                buf.lerp_(g, 1.0 - mom)
+                upd = g.lerp_(buf, mom) if nesterov else buf
+                upd = _newton_schulz_orthogonalize(upd, group["ns_steps"])
+                # Scale by the aspect ratio so wide and tall matrices move by a
+                # comparable amount (reference implementation's rule).
+                scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                if group["weight_decay"] > 0.0:
+                    p.mul_(1.0 - group["lr"] * group["weight_decay"])
+                p.add_(upd, alpha=-group["lr"] * scale)
+        return loss
+
+
+class _MultiOptimizer:
+    """Two optimizers behind one optimizer-shaped surface.
+
+    `param_groups` is the concatenation, which is what makes the LR scheduler
+    work unchanged: CosineAnnealingWarmRestarts records each group's own
+    `base_lr` and scales it, so Muon's much larger LR is annealed on the same
+    cosine without being overwritten by AdamW's value.
+    """
+
+    def __init__(self, *opts):
+        self.opts = [o for o in opts if o is not None]
+
+    @property
+    def param_groups(self):
+        return [g for o in self.opts for g in o.param_groups]
+
+    def zero_grad(self, set_to_none: bool = True):
+        for o in self.opts:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for o in self.opts:
+            o.step()
+
+    def state_dict(self):
+        return {"multi": [o.state_dict() for o in self.opts]}
+
+    def load_state_dict(self, sd):
+        if "multi" not in sd:
+            raise ValueError("checkpoint holds a single-optimizer state")
+        for o, s in zip(self.opts, sd["multi"]):
+            o.load_state_dict(s)
+
+
+def build_optimizer(net, cfg, device):
+    """AdamW, or Muon on the 2D weights + AdamW on everything else."""
+    fused = (device.type == "cuda")   # fused AdamW is CUDA-only
+    if cfg.optimizer != "muon":
+        return torch.optim.AdamW(net.parameters(), lr=cfg.learning_rate,
+                                 weight_decay=cfg.weight_decay, fused=fused)
+    matrices, others = [], []
+    for name, p in net.named_parameters():
+        if not p.requires_grad:
+            continue
+        # 2D and matrix-shaped: Linear weights, the RPB table, piece embeddings.
+        # Conv kernels are 4D and stay with AdamW — orthogonalising a reshaped
+        # conv is not what the method is about.
+        (matrices if p.ndim == 2 and min(p.shape) > 1 else others).append(p)
+    adamw = torch.optim.AdamW(others, lr=cfg.learning_rate,
+                              weight_decay=cfg.weight_decay, fused=fused)
+    muon = Muon(matrices, lr=cfg.muon_lr, weight_decay=cfg.weight_decay)
+    print(f"   Оптимайзер:    Muon на {len(matrices)} матрицах "
+          f"({sum(p.numel() for p in matrices)/1e6:.1f}M) + AdamW на "
+          f"{len(others)} прочих ({sum(p.numel() for p in others)/1e6:.1f}M)")
+    return _MultiOptimizer(adamw, muon)
 
 
 # ── Replay Buffer ─────────────────────────────────────────────────────────────
@@ -680,9 +1078,16 @@ class ReplayBuffer:
             self._ptr = (self._ptr + 1) % self.max_size
 
     def rebuild_val_arr(self):
-        """Rebuild _val_arr from data after loading from pickle."""
-        for i, s in enumerate(self.data):
-            self._val_arr[i] = float(s[2])
+        """Rebuild _val_arr from data after loading. Cap to max_size: a buffer
+        file saved with a larger --buffer-max would otherwise index past _val_arr
+        (and break the ring-buffer invariant)."""
+        if len(self.data) > self.max_size:
+            self.data = self.data[-self.max_size:]
+            self._ptr = 0
+            self._full = True
+        n = min(len(self.data), self.max_size)
+        for i in range(n):
+            self._val_arr[i] = float(self.data[i][2])
 
     def save_npz(self, path: str):
         """Save the buffer as a numpy archive. ~5-10× faster than pickle on 1M
@@ -719,6 +1124,9 @@ class ReplayBuffer:
                               dtype=np.float16, count=n)
         futures = np.fromiter((int(s[4]) if len(s) > 4 else -1 for s in self.data),
                               dtype=np.int32, count=n)
+        # Full-WDL Q-blend draw target (-1 = none → reconstruct from value).
+        draws = np.fromiter((float(s[5]) if len(s) > 5 else -1.0 for s in self.data),
+                            dtype=np.float16, count=n)
         meta = np.array([self._ptr, int(self._full)], dtype=np.int64)
 
         # np.savez auto-appends `.npz` to the path it gets. Pass a base name
@@ -726,7 +1134,7 @@ class ReplayBuffer:
         tmp_base = path + ".tmp"
         np.savez(tmp_base, boards=boards,
                  pol_idx=pol_idx_arr, pol_val=pol_val_arr,
-                 values=values, mlhs=mlhs, futures=futures, meta=meta)
+                 values=values, mlhs=mlhs, futures=futures, draws=draws, meta=meta)
         os.replace(tmp_base + ".npz", path)
 
     def load_npz(self, path: str):
@@ -738,6 +1146,8 @@ class ReplayBuffer:
         values   = z["values"]
         mlhs     = z["mlhs"]
         futures  = z["futures"]
+        # draws: optional (added for full-WDL Q-blend). Old buffers lack it → -1.
+        draws    = z["draws"] if "draws" in z.files else None
         meta     = z["meta"]
         self._ptr  = int(meta[0]) % self.max_size
         self._full = bool(meta[1])
@@ -753,6 +1163,7 @@ class ReplayBuffer:
                 float(values[i]),
                 float(mlhs[i]),
                 int(futures[i]),
+                float(draws[i]) if draws is not None else -1.0,
             ))
         self.rebuild_val_arr()
 
@@ -889,17 +1300,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         move_num = 0
         adjudicated = [None] * n
 
-        # Tree reuse: one RustMCTS for the entire game batch.
-        # After each move call make_move(game_idx, move) —
-        # the root is shifted to the selected child, statistics are preserved.
-        # This gives 2-3x better quality at the same inference cost.
-        from capablanca_engine import RustMCTS as _RustMCTS
-        _parallel = cfg.mcts_parallel_sims
-        rust_mcts_reuse = _RustMCTS(engines, _parallel)
-        if mcts.contempt != 0.0:
-            rust_mcts_reuse.set_contempt(mcts.contempt)
-        if not mcts.add_dirichlet:
-            rust_mcts_reuse.set_add_dirichlet(False)
+        # Tree reuse: one RustMCTS for the entire game batch. After each move
+        # make_move(game_idx, move) shifts the root to the chosen child and
+        # keeps the sub-tree — 2-3x better quality at the same inference cost.
+        rust_mcts_reuse = mcts.new_tree(engines)
 
         while active and move_num < cfg.max_game_length:
             # Playout Cap Randomization: on fast_sim_fraction moves use fast_simulations
@@ -907,44 +1311,16 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             use_full_search = np.random.random() >= cfg.fast_sim_fraction
             current_sims = cfg.simulations if use_full_search else cfg.fast_simulations
 
-            # Tree reuse inference loop (no new RustMCTS per move).
-            # KLD-early-exit computed in Rust → marshalling = 1 float instead of 7000*128
-            # per check. Reset snapshot before the sim series for the current move
-            # because tree reuse may have shifted the root.
-            steps = max(1, (current_sims + _parallel - 1) // _parallel)
-            _kld_active = mcts.kld_threshold > 0.0
-            _kld_min_steps = int(np.ceil(steps * mcts.kld_min_sims_frac)) if _kld_active else steps + 1
-            if _kld_active:
-                rust_mcts_reuse.kld_reset_all()
-            mcts._kld_total_calls += 1
-            mcts._kld_sims_requested += current_sims
-            for _step in range(steps):
-                _lm = rust_mcts_reuse.collect_leaves(current_sims)
-                if _lm.shape[0] == 0:
-                    break
-                _lh = rust_mcts_reuse.get_leaf_hashes() if mcts.nn_cache_enabled else None
-                _rp, _rv, _rd, _rm = mcts._infer(_lm, hashes=_lh)
-                rust_mcts_reuse.apply_inference_buffered(
-                    np.ascontiguousarray(_rp, dtype=np.float32),
-                    np.ascontiguousarray(_rv, dtype=np.float32),
-                    np.ascontiguousarray(_rd, dtype=np.float32),
-                    np.ascontiguousarray(_rm, dtype=np.float32),
-                    rust_mcts_reuse.get_current_batch_counts(),
-                )
-                # KLD-early-exit (computed on Rust side)
-                if (_kld_active and _step >= _kld_min_steps
-                        and (_step + 1) % mcts.kld_check_every == 0
-                        and _step + 1 < steps):
-                    _max_kl = rust_mcts_reuse.kld_snapshot_and_check()
-                    if _max_kl != float('inf'):
-                        _gain = _max_kl / max(1, mcts.kld_check_every * _parallel)
-                        if _gain < mcts.kld_threshold:
-                            mcts._kld_early_exits += 1
-                            mcts._kld_sims_saved += (steps - _step - 1) * _parallel
-                            break
+            # collect → infer → apply (+ KLD early exit) lives in UltraFastMCTS
+            # so self-play, eval and game_stats all drive the same loop.
+            mcts.run_search(rust_mcts_reuse, current_sims)
             sparse_pols = rust_mcts_reuse.get_policies_sparse()
             raw_vals  = rust_mcts_reuse.get_values()
             raw_draws = rust_mcts_reuse.get_draws()
+            # Gumbel completed-Q policy target: fetch per-child root stats. Only
+            # the STORED target uses it; move selection below stays on visit counts.
+            gumbel = cfg.policy_target_mode == "gumbel"
+            child_stats = rust_mcts_reuse.get_root_children_stats() if gumbel else None
             # get_policies_sparse()/get_values() return one entry per EACH game
             # in rust_mcts_reuse.games (length = n, not len(active)).
             # Index by game_idx; otherwise after the first game in the batch finishes
@@ -957,6 +1333,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 eng = engines[game_idx]
                 legal = eng.get_legal_moves_int()
                 if not legal:
+                    rust_mcts_reuse.set_game_finished(game_idx)
                     continue
 
                 side = eng.side_to_move()
@@ -966,24 +1343,36 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     for idx, val in zip(pol_idx_raw, pol_val_raw)
                 }
                 root_v_raw = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
+                root_d_raw = float(draws_np[game_idx]) if game_idx < len(draws_np) else 0.0
                 keep_position = (
                     (not cfg.playout_cap_train_only_full) or use_full_search
                 )
                 if keep_position:
                     # Board encoding is expensive. For PCR fast-search moves the
                     # sample is discarded later, so do not compute/store it.
-                    board_np = np.array(eng.get_board_tensor(), dtype=np.float32)
-                    pol_sparse = (
-                        np.asarray(pol_idx_raw, dtype=np.int16),
-                        np.asarray(pol_val_raw, dtype=np.float16),
-                    )
+                    board_np = np.asarray(eng.get_board_tensor(), dtype=np.float32)
+                    if gumbel and game_idx < len(child_stats):
+                        c_idx, c_pri, c_vis, c_q = child_stats[game_idx]
+                        g_idx, g_val = gumbel_improved_policy(
+                            c_idx, c_pri, c_vis, c_q, root_v_raw)
+                        pol_sparse = (
+                            np.asarray(g_idx, dtype=np.int16),
+                            np.asarray(g_val, dtype=np.float16),
+                        )
+                    else:
+                        pol_sparse = (
+                            np.asarray(pol_idx_raw, dtype=np.int16),
+                            np.asarray(pol_val_raw, dtype=np.float16),
+                        )
                 else:
                     board_np = None
                     pol_sparse = None
-                # 6th element (move_idx) — policy index of selected move, patched
-                # below after sampling. List (not tuple) so it can be mutated.
+                # idx 5 (move_idx) — policy index of selected move, patched below
+                # after sampling. idx 6 (root_d_raw) — search draw prob for the
+                # full-WDL Q-blend. List (not tuple) so move_idx can be mutated.
                 histories[game_idx].append(
-                    [board_np, pol_sparse, side, root_v_raw, use_full_search, -1])
+                    [board_np, pol_sparse, side, root_v_raw, use_full_search, -1,
+                     root_d_raw])
 
                 # Temperature decay (argmax branch below catches tau ≈ 0)
                 if move_num < cfg.temperature_moves:
@@ -1023,6 +1412,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 rust_mcts_reuse.make_move(game_idx, move)  # tree reuse
 
                 if eng.is_game_over():
+                    rust_mcts_reuse.set_game_finished(game_idx)
                     continue
 
                 # Resign: WDL-based (LC0-style), with playthrough probability.
@@ -1047,15 +1437,27 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
 
                     if resign_counts[game_idx][side] >= cfg.resign_consec:
                         resigned[game_idx] = True
+                        # Rust cannot see a resignation — tell it, or the dead
+                        # game keeps eating leaves out of every GPU batch.
+                        rust_mcts_reuse.set_game_finished(game_idx)
                         continue
 
                 # Adjudication:
                 # If after the move there is a decisive material advantage
                 # (≥8 points, ≥10 moves without captures, ≥15 full moves) —
                 # end the game without waiting for checkmate or timeout.
-                adj = eng.adjudication_result()
+                adj = eng.adjudication_result() if cfg.adjudicate else None
+                if adj is not None and cfg.adjudicate_q_gate > 0.0:
+                    # lc0-style net confirmation: root_v_raw is the side-to-move
+                    # (mover) POV value of the pre-move position; convert to white
+                    # POV and require it to agree with the material verdict (adj is
+                    # white POV ±1). Rejects fortress/compensation false positives.
+                    root_v_white = root_v_raw if side == 0 else -root_v_raw
+                    if root_v_white * adj < cfg.adjudicate_q_gate:
+                        adj = None
                 if adj is not None:
                     adjudicated[game_idx] = adj
+                    rust_mcts_reuse.set_game_finished(game_idx)
                 else:
                     new_active.append(game_idx)
 
@@ -1106,6 +1508,22 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 if board_np is None or pol_sparse is None:
                     continue
                 v = result if side == 0 else -result
+                draw_target = -1.0   # sentinel → WDL reconstructed from v (legacy)
+                # Value target = blend of game outcome z and the MCTS root value
+                # (KataGo/LC0). Pure z is high-variance: one late blunder flips the
+                # label on every earlier position. The search already evaluated THIS
+                # position (entry[3]=root_Q, entry[6]=root_D, side-to-move POV, same
+                # sign as z), a far lower-variance estimate. Full WDL: blend the
+                # win-loss axis (Q) AND the draw axis (D). value_q_weight=0 → pure-z.
+                if cfg.value_q_weight > 0.0:
+                    root_q = entry[3]
+                    root_d = entry[6] if len(entry) > 6 else None
+                    if root_q is not None:
+                        w = cfg.value_q_weight
+                        v = (1.0 - w) * v + w * float(root_q)
+                        if root_d is not None:
+                            z_is_draw = 1.0 if abs(result) < 1e-6 else 0.0
+                            draw_target = (1.0 - w) * z_is_draw + w * float(root_d)
                 # MLH target: how many half-moves REMAIN from this position to game end.
                 # Normalized to [0, 1] by dividing by MLH_PLY_NORM.
                 # (On timeout the final position is unknown → use the game "tail" as-is.)
@@ -1116,7 +1534,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 future_idx = histories[i][k + 2][5] if k + 2 < total_plies else -1
                 all_samples.append(
                     pack_sample_sparse(board_np, pol_sparse, float(v),
-                                       float(mlh_norm), int(future_idx)))
+                                       float(mlh_norm), int(future_idx),
+                                       float(draw_target)))
                 batch_positions += 1
 
         # Aggregate totals per colour across all outcome types. Adjudications
@@ -1164,6 +1583,24 @@ def value_to_wdl(v: float) -> np.ndarray:
     return np.array([p_win, p_draw, p_loss], dtype=np.float32)
 
 
+def value_draw_to_wdl(v: float, d: float) -> np.ndarray:
+    """Build [W, D, L] from an explicit value v=W−L and draw prob d (the search's
+    own D). Used by the full-WDL Q-blend: keeps the search's draw estimate instead
+    of reconstructing it as 1−|v| (value_to_wdl). W=(1−d+v)/2, L=(1−d−v)/2.
+    Falls back to value_to_wdl when d<0 (sentinel = no explicit draw)."""
+    if d < 0.0:
+        return value_to_wdl(v)
+    v = float(np.clip(v, -1.0, 1.0))
+    d = float(np.clip(d, 0.0, 1.0))
+    p_win  = max(0.0, (1.0 - d + v) / 2.0)
+    p_loss = max(0.0, (1.0 - d - v) / 2.0)
+    p_draw = max(0.0, d)
+    s = p_win + p_draw + p_loss
+    if s <= 1e-8:
+        return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    return np.array([p_win / s, p_draw / s, p_loss / s], dtype=np.float32)
+
+
 def _collate_batch(samples: List[CompactSample]):
     """Pack a small list of samples into batched tensors.
 
@@ -1176,7 +1613,13 @@ def _collate_batch(samples: List[CompactSample]):
         -1, CapablancaNet.INPUT_PLANES, CapablancaNet.BOARD_H, CapablancaNet.BOARD_W
     )
     policies_np = np.stack([unpack_policy(s[1]) for s in samples])
-    wdl_np = np.stack([value_to_wdl(float(s[2])) for s in samples])
+    # s[5] = explicit draw target (full-WDL Q-blend). Absent / <0 → reconstruct
+    # via value_to_wdl (legacy one-hot / scalar path).
+    wdl_np = np.stack([
+        value_draw_to_wdl(float(s[2]), float(s[5])) if len(s) > 5
+        else value_to_wdl(float(s[2]))
+        for s in samples
+    ])
     mlh_np = np.array(
         [float(s[3]) if len(s) > 3 else 0.0 for s in samples],
         dtype=np.float32,
@@ -1229,11 +1672,13 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
     steps = 0
 
     for step_idx in range(effective_steps):
-        samples = buffer.sample_balanced(cfg.batch_size)
+        samples = (buffer.sample_balanced(cfg.batch_size) if cfg.value_balance
+                   else buffer.sample(cfg.batch_size))
         boards, policies, values, mlh_targets, future_targets = _collate_batch(samples)
 
-        boards = boards.to(device, non_blocking=True,
-                           memory_format=torch.channels_last)
+        # NCHW: the net runs NCHW (channels_last is slower here — see model build
+        # site above), so feed plain contiguous input.
+        boards = boards.to(device, non_blocking=True)
         policies = policies.to(device, non_blocking=True)
         values = values.to(device, non_blocking=True)  # WDL: (batch, 3)
         mlh_targets = mlh_targets.to(device, non_blocking=True)  # (batch,) in [0,1]
@@ -1339,6 +1784,13 @@ def train(cfg: Config = None):
         cfg = Config()
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    if cfg.seed >= 0:
+        torch.manual_seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.seed)
+        print(f"🎲 seed={cfg.seed} (Rust MCTS сеет себя от времени — полной "
+              f"детерминированности не даёт)")
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     if not torch.cuda.is_available():
         print("⚠️  CUDA не найдена, используется CPU — будет медленно")
@@ -1360,8 +1812,23 @@ def train(cfg: Config = None):
         qkv_bias=cfg.qkv_bias,
         use_rmsnorm=cfg.use_rmsnorm,
         piece_embed_dim=cfg.piece_embed_dim,
+        qk_norm=cfg.qk_norm,
+        swiglu=cfg.swiglu,
+        attn_policy=cfg.attn_policy,
+        ffn_mult=cfg.ffn_mult,
+        restricted_policy=cfg.restricted_policy,
+        abs_pos_embed=cfg.abs_pos_embed,
+        wide_value=cfg.wide_value,
+        num_registers=cfg.num_registers,
+        value_residual=cfg.value_residual,
+        hyper_streams=cfg.hyper_streams,
     ).to(device)
-    net = net.to(memory_format=torch.channels_last)
+    # NCHW (default), NOT channels_last: this net is GroupNorm-heavy (~32 GN ops).
+    # Tensor-core convs want NHWC but GroupNorm wants NCHW, so channels_last forces
+    # NHWC<->NCHW transposes around every norm. Measured ~10-11% SLOWER for both
+    # training (fwd+bwd, bs 64/128/512: 0.88-0.91x) and inference (bs 256-4096:
+    # 0.86-0.91x). See experiments/perf/. NCHW is also what lc0 uses for fp16
+    # conv nets <=384 filters.
 
     if hasattr(torch, "compile"):
         try:
@@ -1370,12 +1837,7 @@ def train(cfg: Config = None):
         except Exception as e:
             print(f"⚠️  torch.compile() недоступен: {e}\n")
 
-    optimizer = torch.optim.AdamW(
-        net.parameters(),
-        lr=cfg.learning_rate,
-        weight_decay=cfg.weight_decay,
-        fused=True,
-    )
+    optimizer = build_optimizer(net, cfg, device)
 
     # EMA copy of weights for self-play (AlphaZero-style stabilization)
     ema = ModelEMA(net, decay=cfg.ema_decay) if cfg.use_ema else None
@@ -1386,26 +1848,43 @@ def train(cfg: Config = None):
     WARMUP_ITERS = 5
 
     class WarmupCosineScheduler:
-        def __init__(self, optimizer, warmup_iters, T_0, T_mult, eta_min, base_lr):
+        """Linear warmup, then CosineAnnealingWarmRestarts.
+
+        With Muon there are two optimizers and two very different LR scales, and
+        torch's scheduler only accepts a real `Optimizer`. So the cosine is
+        attached to the AdamW half (`cosine_on`) and every group — including
+        Muon's — is then set to `its own base LR × the same factor`. With a plain
+        AdamW setup `cosine_on is optimizer` and the behaviour is unchanged.
+        """
+
+        def __init__(self, optimizer, warmup_iters, T_0, T_mult, eta_min, base_lr,
+                     cosine_on=None):
             self.warmup_iters = warmup_iters
             self.base_lr = base_lr
+            self.optimizer = optimizer
+            self._base_lrs = [pg['lr'] for pg in optimizer.param_groups]
+            cosine_on = cosine_on if cosine_on is not None else optimizer
+            self._cosine_base = cosine_on.param_groups[0]['lr']
             self.cosine = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min
+                cosine_on, T_0=T_0, T_mult=T_mult, eta_min=eta_min
             )
             self._last_lr = [base_lr]
             self._iter = 0
-            self.optimizer = optimizer
+
+        def _apply(self, factor):
+            # Each group keeps its own scale — a single shared LR would clobber
+            # Muon's (which lives ~10x above AdamW's).
+            for pg, base in zip(self.optimizer.param_groups, self._base_lrs):
+                pg['lr'] = base * factor
 
         def step(self):
             self._iter += 1
             if self._iter <= self.warmup_iters:
-                lr = self.base_lr * self._iter / self.warmup_iters
-                for pg in self.optimizer.param_groups:
-                    pg['lr'] = lr
-                self._last_lr = [lr]
+                self._apply(self._iter / self.warmup_iters)
             else:
                 self.cosine.step()
-                self._last_lr = self.cosine.get_last_lr()
+                self._apply(self.cosine.get_last_lr()[0] / self._cosine_base)
+            self._last_lr = [self.optimizer.param_groups[0]['lr']]
 
         def get_last_lr(self):
             return self._last_lr
@@ -1418,11 +1897,15 @@ def train(cfg: Config = None):
             self._iter = sd.get("_iter", 0)
 
     def make_scheduler(opt):
+        # torch's scheduler type-checks for a real Optimizer, so drive the cosine
+        # from the AdamW half when Muon is in play.
+        inner = opt.opts[0] if isinstance(opt, _MultiOptimizer) else opt
         return WarmupCosineScheduler(
             opt, warmup_iters=WARMUP_ITERS,
             T_0=50, T_mult=2,
             eta_min=cfg.learning_rate * 0.05,
             base_lr=cfg.learning_rate,
+            cosine_on=inner,
         )
 
     scheduler = make_scheduler(optimizer)
@@ -1527,7 +2010,7 @@ def train(cfg: Config = None):
 
         # Load EMA if present, OR reset if --reset-ema flag is set
         if ema is not None and "ema" in ckpt:
-            if getattr(args, 'reset_ema', False):
+            if cfg.reset_ema:
                 # Re-initialize EMA from the current network — needed when a checkpoint was saved
                 # by old code with per-iter EMA updates (decay=0.999 → 99% random weights).
                 src = net._orig_mod if hasattr(net, '_orig_mod') else net
@@ -1604,7 +2087,10 @@ def train(cfg: Config = None):
                       "для перехода в self-play.\n")
                 return
 
-    for iteration in range(start_iter, 100_000):
+    # Baseline temperature the entropy controller relaxes back toward (see below).
+    base_temperature = cfg.temperature
+    last_iter = (start_iter + cfg.max_iters) if cfg.max_iters > 0 else 100_000
+    for iteration in range(start_iter, last_iter):
         iter_start = time.time()
 
         # ── Self-play / Curriculum ────────────────────────────────────────────
@@ -1622,7 +2108,7 @@ def train(cfg: Config = None):
         else:
             print(f"  ℹ️  EMA отложен до iter {cfg.ema_start_iter} (сейчас {iteration}), используется live NN")
 
-        fsf_path = getattr(args, 'fsf_path', None)
+        fsf_path = cfg.fsf_path
         fsf_enabled = bool(fsf_path and os.path.exists(fsf_path))
 
         if cfg.curriculum_mode and not fsf_enabled:
@@ -1668,7 +2154,7 @@ def train(cfg: Config = None):
                 fsf_samples, fsf_w, fsf_d, fsf_l = generate_fsf_games(
                     net, device, cfg,
                     num_games=fsf_count, fsf_path=fsf_path,
-                    fsf_nodes=cfg.fsf_nodes_current, mcts_sims=args.fsf_mcts_sims,
+                    fsf_nodes=cfg.fsf_nodes_current, mcts_sims=cfg.fsf_mcts_sims,
                 )
             samples = samples + fsf_samples
             total_fsf = fsf_w + fsf_d + fsf_l
@@ -1717,13 +2203,13 @@ def train(cfg: Config = None):
             finally:
                 cfg.games_per_iter = orig_games
             if fsf_games_n > 0:
-                print(f"  ⚔️  FSF: {fsf_games_n} игр vs Stockfish ({args.fsf_nodes} nodes)...")
+                print(f"  ⚔️  FSF: {fsf_games_n} игр vs Stockfish ({cfg.fsf_nodes} nodes)...")
                 net.eval()
                 with torch.inference_mode():
                     fsf_r = generate_fsf_games(
                         net, device, cfg,
                         num_games=fsf_games_n, fsf_path=fsf_path,
-                        fsf_nodes=args.fsf_nodes, mcts_sims=args.fsf_mcts_sims,
+                        fsf_nodes=cfg.fsf_nodes, mcts_sims=cfg.fsf_mcts_sims,
                     )
                 samples = samples + fsf_r[0]
 
@@ -1751,6 +2237,10 @@ def train(cfg: Config = None):
 
         # Proactive temperature control by entropy (react BEFORE collapse, not after).
         # For 7000 outputs normal range: 2.5-4.0 bits.
+        # Symmetric: raise fast on low entropy, then RELAX back toward the
+        # configured baseline on healthy batches. The old code only decayed when
+        # entropy>3.5 (rare) by 5%, so a few low-entropy batches ratcheted
+        # temperature stuck near the 2.5 cap → permanently noisy self-play.
         entropy = stats.get('entropy_mean', 2.0)
         if entropy < 1.0:
             cfg.temperature = min(cfg.temperature * 1.25, 2.5)
@@ -1758,8 +2248,13 @@ def train(cfg: Config = None):
         elif entropy < 1.6:
             cfg.temperature = min(cfg.temperature * 1.10, 2.0)
             print(f"  ⚡ entropy={entropy:.3f} < 1.6 → temperature→{cfg.temperature:.2f}")
-        elif entropy > 3.5 and cfg.temperature > 0.8:
-            cfg.temperature = max(cfg.temperature * 0.95, 0.8)
+        elif abs(cfg.temperature - base_temperature) > 1e-3:
+            # healthy entropy → pull 25% back toward baseline each iteration
+            cfg.temperature += (base_temperature - cfg.temperature) * 0.25
+            if abs(cfg.temperature - base_temperature) < 1e-3:
+                cfg.temperature = base_temperature
+            print(f"  🌡️  entropy={entropy:.3f} ok → temperature→{cfg.temperature:.2f} "
+                  f"(→ baseline {base_temperature:.2f})")
         print()
 
         # ── Training ─────────────────────────────────────────────────────────
@@ -1867,6 +2362,48 @@ if __name__ == "__main__":
                         default=False,
                         help="BT5: использовать RMSNorm вместо LayerNorm (без centering и bias). "
                              "Парная фича с --no-qkv-bias.")
+    parser.add_argument("--qk-norm", action="store_true",
+                        help="RMSNorm на Q и K перед скалярным произведением "
+                             "(Gemma 2 / ViT-22B). Стабилизирует attention при большом lr.")
+    parser.add_argument("--swiglu", action="store_true",
+                        help="Gated FFN (SwiGLU) вместо Linear→Mish→Linear при том же "
+                             "числе параметров.")
+    parser.add_argument("--ffn-mult", type=int, default=2,
+                        help="Множитель FFN в трансформерных блоках. По "
+                             "умолчанию 2 (hidden = d*2*2/3 = 341 при 256d) — "
+                             "мало; lc0 держит около 4.")
+    parser.add_argument("--restricted-policy", action="store_true",
+                        help="Policy-голова только на 2672 геометрически "
+                             "достижимых индекса вместо 7000. Остальные 4328 "
+                             "строк умеют лишь выдавать -inf: 11.1M мёртвых "
+                             "параметров (model.reachable_policy_indices).")
+    parser.add_argument("--abs-pos-embed", action="store_true",
+                        help="Абсолютный позиционный эмбеддинг 80×C на токенах "
+                             "перед трансформером (в attention только "
+                             "ОТНОСИТЕЛЬНЫЙ bias, абсолютной позиции нет).")
+    parser.add_argument("--wide-value", action="store_true",
+                        help="Value-голова 32ch→512 вместо 8ch→256. 0.17M на "
+                             "сети в 28M — узкое место, и именно value ломалась "
+                             "при прошлых дистилляциях.")
+    parser.add_argument("--attn-policy", action="store_true",
+                        help="Билинейная policy-голова from→to вместо Linear(C*80, 7000). "
+                             "17.9M → 0.18M параметров на голову (и столько же на future).")
+    parser.add_argument("--registers", type=int, default=0,
+                        help="Сколько register-токенов добавить к 80 клеточным (0 = выкл).")
+    parser.add_argument("--value-residual", action="store_true",
+                        help="ResFormer: подмешивать value первого блока во все "
+                             "последующие. Лечит value-state drain в глубоких слоях.")
+    parser.add_argument("--hyper-streams", type=int, default=0,
+                        help="mHC (DeepSeek): расширить residual-поток до N параллельных "
+                             "потоков, матрица смешивания проецируется на многогранник "
+                             "Биркгофа через Синкхорна. 0=выкл, 4=как в статье. "
+                             "При инициализации численно тождественно обычному residual.")
+    parser.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw",
+                        help="muon: ортогонализация моментума для 2D-весов, AdamW для "
+                             "остального. Меньше состояния оптимизатора и обычно быстрее "
+                             "сходится на трансформерах.")
+    parser.add_argument("--muon-lr", type=float, default=2e-2,
+                        help="LR для Muon-групп (другая шкала, чем у AdamW; default 2e-2)")
     parser.add_argument("--piece-embed-dim", type=int, default=0,
                         help="BT3 trick: per-square Linear(16 → N) от plane piece-планов, "
                              "конкатенируется к input. 0 = выключено. 32 — рекомендуемое значение. "
@@ -1888,8 +2425,12 @@ if __name__ == "__main__":
                         help="Температура после --temperature-moves (0.5=мягкий argmax, 0=жадный)")
     parser.add_argument("--temperature-moves",    type=int,   default=50,
                         help="Ходов с высокой температурой")
-    parser.add_argument("--mcts-parallel-sims", type=int, default=32,
-                        help="Листьев за шаг MCTS. Больше = меньше round-trips GPU.")
+    parser.add_argument("--mcts-parallel-sims", type=int, default=8,
+                        help="Листьев за шаг MCTS. ceil(--simulations/это) = число "
+                             "ПОСЛЕДОВАТЕЛЬНЫХ раундов PUCT; держать >= 12, иначе "
+                             "virtual loss размазывает визиты и цель обучения "
+                             "вырождается в равномерную "
+                             "(docs/experiments/policy_target_collapse.md). Было 32.")
     parser.add_argument("--compile-inference", type=str, default=None,
                         choices=[None, "default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode для inference (selfplay). None=off. "
@@ -1913,7 +2454,35 @@ if __name__ == "__main__":
     parser.add_argument("--device",              type=str,   default="cuda")
     parser.add_argument("--checkpoint-dir",      type=str,   default="checkpoints")
     parser.add_argument("--save-every",          type=int,   default=5)
+    parser.add_argument("--seed",                type=int,   default=-1,
+                        help="Сид torch/numpy (-1 = не трогать). Нужен для абляций.")
+    parser.add_argument("--max-iters",           type=int,   default=0,
+                        help="Остановиться после N итераций (0 = бесконечно). "
+                             "Нужно для контролируемых A/B-прогонов.")
+    parser.add_argument("--log-every",           type=int,   default=50,
+                        help="Печатать средние лоссы каждые N шагов тренировки")
     parser.add_argument("--value-loss-weight",   type=float, default=1.0)
+    parser.add_argument("--value-q-weight",      type=float, default=0.0,
+                        help="Blend MCTS root value into the value target "
+                             "(KataGo/LC0): v=(1-w)*z + w*Q, full WDL with search D. "
+                             "0=pure game outcome (legacy), ~0.5=KataGo-style.")
+    parser.add_argument("--no-value-balance",    action="store_true",
+                        help="Train on the natural outcome distribution instead of "
+                             "rebalancing each batch to 33/33/33 W/D/L.")
+    parser.add_argument("--policy-target",       choices=["visits", "gumbel"],
+                        default="visits",
+                        help="Policy training target: 'visits' (legacy visit-count "
+                             "distribution) or 'gumbel' (completed-Q improved policy, "
+                             "stronger at low sim counts). Move selection is unchanged.")
+    parser.add_argument("--adjudicate",          action="store_true",
+                        help="End clearly-decided games early (material ≥8, ≥20 ply "
+                             "quiet, ≥15 moves) — saves timeout-tail compute.")
+    parser.add_argument("--adjudicate-q-gate",   type=float, default=0.5,
+                        help="Require the net's root value to confirm adjudication "
+                             "(root_Q·verdict ≥ gate). 0 = material-only. Default 0.5.")
+    parser.add_argument("--rep-search-perslot",  action="store_true",
+                        help="Use per-slot repetition planes during search (align "
+                             "with the training-side encoding).")
     parser.add_argument("--mlh-loss-weight",     type=float, default=0.1,
                         help="LC0 MLH loss weight (default: 0.1)")
     parser.add_argument("--future-loss-weight",  type=float, default=0.15,
@@ -1927,10 +2496,8 @@ if __name__ == "__main__":
     parser.add_argument("--reset-buffer",        action="store_true",
                         help="Очистить replay buffer при старте")
     parser.add_argument("--collapse-threshold",  type=float, default=0.01)
-    parser.add_argument("--use-ema",             action="store_true", default=True,
-                        help="Использовать EMA веса для self-play (default: True)")
     parser.add_argument("--no-ema",              dest="use_ema", action="store_false",
-                        help="Отключить EMA")
+                        default=True, help="Отключить EMA для self-play (по умолчанию включён)")
     parser.add_argument("--ema-decay",           type=float, default=0.9999,
                         help="EMA decay coefficient (default: 0.9999, per-step). "
                              "0.9999 = окно ~10K шагов ≈ 10 итераций (LC0 selfplay-style).")
@@ -2005,7 +2572,7 @@ if __name__ == "__main__":
     parser.add_argument("--buffer-max",       type=int,   default=1_000_000,
                         help="Максимальный размер replay буфера (default: 1000000, рек. 300000 при большом потоке данных)")
     parser.add_argument("--max-game-length",  type=int,   default=300,
-                        help="Максимальная длина партии в полуходах (default: 110, рек. 80 на ранних итерациях)")
+                        help="Максимальная длина партии в полуходах (default: 300)")
     parser.add_argument("--timeout-as-draw",  action="store_true", default=False,
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
 
@@ -2048,13 +2615,34 @@ if __name__ == "__main__":
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
         save_every=args.save_every,
+        log_every=args.log_every,
+        max_iters=args.max_iters,
+        seed=args.seed,
         value_loss_weight=args.value_loss_weight,
+        value_q_weight=args.value_q_weight,
+        value_balance=not args.no_value_balance,
+        policy_target_mode=args.policy_target,
+        adjudicate=args.adjudicate,
+        adjudicate_q_gate=args.adjudicate_q_gate,
+        rep_search_perslot=args.rep_search_perslot,
         mlh_loss_weight=args.mlh_loss_weight,
         future_loss_weight=args.future_loss_weight,
         enable_future=args.enable_future,
         qkv_bias=args.qkv_bias,
         use_rmsnorm=args.use_rmsnorm,
         piece_embed_dim=args.piece_embed_dim,
+        qk_norm=args.qk_norm,
+        swiglu=args.swiglu,
+        attn_policy=args.attn_policy,
+        ffn_mult=args.ffn_mult,
+        restricted_policy=args.restricted_policy,
+        abs_pos_embed=args.abs_pos_embed,
+        wide_value=args.wide_value,
+        num_registers=args.registers,
+        value_residual=args.value_residual,
+        hyper_streams=args.hyper_streams,
+        optimizer=args.optimizer,
+        muon_lr=args.muon_lr,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_only=args.pretrain_only,
         reset_scheduler=args.reset_scheduler,
@@ -2063,6 +2651,10 @@ if __name__ == "__main__":
         ema_decay=args.ema_decay,
         ema_start_iter=args.ema_start_iter,
         contempt=args.contempt,
+        fsf_path=args.fsf_path,
+        fsf_nodes=args.fsf_nodes,
+        fsf_mcts_sims=args.fsf_mcts_sims,
+        reset_ema=args.reset_ema,
         fsf_value_alpha=args.fsf_value_alpha,
         resign_threshold=args.resign_threshold,
         resign_threshold_early=args.resign_threshold_early,

@@ -56,7 +56,23 @@ class OnnxEngine:
         active = self.session.get_providers()
         self.gpu = "CUDAExecutionProvider" in active
         self.provider = active[0] if active else "CPUExecutionProvider"
-        self.input_name = self.session.get_inputs()[0].name
+        inp = self.session.get_inputs()[0]
+        self.input_name = inp.name
+
+        # The plane counts above are duplicated from model.py on purpose (this
+        # module must stay PyTorch-free), so verify them against the graph:
+        # a stale .onnx reshapes silently and the GUI would analyse garbage.
+        want = (INPUT_PLANES, BOARD_H, BOARD_W)
+        got = tuple(inp.shape[1:])
+        if len(got) == 3 and all(isinstance(d, int) for d in got) and got != want:
+            raise ValueError(
+                f"{onnx_path}: вход {got}, ожидалось {want}. "
+                f"Пересоберите модель: python export_onnx.py <checkpoint.pth>")
+        out_pol = self.session.get_outputs()[0].shape
+        if len(out_pol) == 2 and isinstance(out_pol[1], int) and out_pol[1] != POLICY_SIZE:
+            raise ValueError(
+                f"{onnx_path}: policy {out_pol[1]}, ожидалось {POLICY_SIZE}. "
+                f"Пересоберите модель: python export_onnx.py <checkpoint.pth>")
 
         self.c_puct = c_puct
         self.batch_size = batch_size

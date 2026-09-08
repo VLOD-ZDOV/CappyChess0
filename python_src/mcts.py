@@ -1,11 +1,8 @@
-# mcts.py — Python wrapper for RustMCTS
+# mcts.py — thin Python driver for the Rust MCTS.
 #
-# OPTIMIZATIONS v2:
-#   - _infer now accepts np.ndarray (N, FLAT_SIZE) directly — list comprehension removed
-#   - PARALLEL_SIMS raised to 32: fewer round-trips Python↔Rust↔GPU per game
-#   - _infer: intermediate np.stack removed (leaf_matrix is already a ready matrix)
-#   - cuda.synchronize removed — non_blocking=True + autocast is sufficient
-#   - pinned memory reused without extra copies
+# The search tree lives in `capablanca_engine.RustMCTS`; this module only
+# feeds it batched GPU inference (BF16 weights, pinned staging buffer,
+# optional transposition cache) and owns the KLD early-exit bookkeeping.
 
 import numpy as np
 import torch
@@ -47,7 +44,7 @@ def _bucket_size(n: int, step: int, pow2: bool = True) -> int:
                compile shapes bounded while wasting much less compute.
     pow2=False (eager path): next multiple of `step` only. Measured GPU
                throughput is *linear* in batch size (≈0.115 ms/leaf for the
-               384×15+4 net on a 5080), so power-of-two padding is pure wasted
+               384×15+4 net), so power-of-two padding is pure wasted
                compute — up to ~1.8x on an under-filled call (e.g. 2100→4096).
                A fine grid keeps padding waste ≤ step/n while cudnn.benchmark
                autotune of each new shape is a one-time ~1-forward cost that
@@ -65,45 +62,46 @@ def _bucket_size(n: int, step: int, pow2: bool = True) -> int:
 
 try:
     from capablanca_engine import RustMCTS as _RustMCTS
-    RUST_MCTS_AVAILABLE = True
-except ImportError:
-    RUST_MCTS_AVAILABLE = False
-    print("⚠️  RustMCTS не найден — нужно пересобрать: maturin develop --release")
+except ImportError as exc:  # the search tree lives in Rust — there is no fallback
+    raise ImportError(
+        "capablanca_engine not found. Build it with: maturin develop --release"
+    ) from exc
 
-# Import input constants — all sizes/reshapes must derive from these
-from model import CapablancaNet
+# Import network constants — all sizes/reshapes must derive from these,
+# so the wrapper can never drift from the architecture it is feeding.
+from model import CapablancaNet, POLICY_SIZE
 INPUT_PLANES = CapablancaNet.INPUT_PLANES   # 139 (8 history × 17 + 3 meta)
 BOARD_H = CapablancaNet.BOARD_H              # 8
 BOARD_W = CapablancaNet.BOARD_W              # 10
 FLAT_SIZE = INPUT_PLANES * BOARD_H * BOARD_W # 11120
 
-POLICY_SIZE   = 7000
-VIRTUAL_LOSS  = 3
-# High parallel_sims (>64) saturates virtual_loss → exploration breaks,
-# PUCT starts selecting weak branches. Low (<16) under-utilizes GPU.
-# 32 — sweet spot for most networks.
-PARALLEL_SIMS = 32
+# parallel_sims is the number of leaves collected per NN call. The binding
+# constraint is NOT this number on its own but the count of *sequential* PUCT
+# rounds a search gets: ceil(simulations / parallel_sims). Virtual loss pushes
+# the leaves of one round onto different children, so with too few rounds the
+# visits spread flat across the root and the policy target degenerates to
+# uniform. On a 10x8 board (~41 legal moves) `simulations 100 / parallel 32` is
+# 4 rounds — about 2.3 visits per root move, i.e. no target at all;
+# `--fast-simulations 50` at parallel 32 is 2 rounds and is *literally* uniform.
+#
+# Keep simulations / parallel_sims >= 12.
+#
+# The old comment here claimed "low (<16) under-utilizes GPU". Measured on this
+# machine that is false: 128 games x 8 parallel = 1024 leaves per call already
+# saturates the card and runs marginally FASTER than 4096 (the total leaf count
+# per search is identical either way — only the batch size changes). See
+# docs/experiments/policy_target_collapse.md.
+#
+# Lowered 32 -> 8 on 2026-09-08 after a 40-iteration A/B from a common
+# checkpoint: 300 games, parallel 8 scored 69.8% at a parallel-32 match search
+# and 76.0% at a parallel-8 one (+146 / +200 Elo).
+PARALLEL_SIMS = 8
 
 # LC0 transposition cache: same position is evaluated by NN only once.
 # Useful for: transpositions in MCTS, repeated roots between games, tree reuse.
 # Key — bytes view of tensor (FLAT_SIZE float32 ≈ 44KB with history planes). Hash bytes is fast (cityhash in CPython).
 # 50K entries × ~30KB per entry (tensor+policy+q+d) ≈ 1.5GB — set higher if needed.
 NN_CACHE_DEFAULT_MAX = 50_000
-
-
-class MCTSNode:
-    """Stub for backward compatibility with gui.py."""
-    __slots__ = ("parent", "move", "prior", "children", "visits",
-                 "value_sum", "virtual_loss", "is_expanded", "is_terminal")
-
-    def __init__(self, parent, move, prior):
-        self.parent = parent; self.move = move; self.prior = float(prior)
-        self.children = {}; self.visits = 0; self.value_sum = 0.0
-        self.virtual_loss = 0; self.is_expanded = False; self.is_terminal = False
-
-    def q(self):
-        d = self.visits + self.virtual_loss
-        return self.value_sum / d if d > 0 else 0.0
 
 
 class UltraFastMCTS:
@@ -118,7 +116,7 @@ class UltraFastMCTS:
                  compile_mode: str = None, bf16_weights: bool = True,
                  kld_threshold: float = 0.0, kld_check_every: int = 4,
                  kld_min_sims_frac: float = 0.25,
-                 contempt: float = 0.0):
+                 contempt: float = 0.0, rep_search_perslot: bool = False):
         # compile_mode: None (no compile), 'default', 'reduce-overhead', 'max-autotune'.
         # 'default' — safest, ~15-25% speedup, minimal warmup.
         # 'reduce-overhead' — uses CUDA graphs, up to 50% speedup, but recompiles on shape change.
@@ -134,12 +132,8 @@ class UltraFastMCTS:
             src = net._orig_mod if hasattr(net, '_orig_mod') else net
             inference_net = _copy.deepcopy(src).to(torch.bfloat16).eval()
             self.net = inference_net
-            # Keep reference to the original FP32 net to update the BF16 copy
-            # via update_inference_weights() after each train epoch.
-            self._fp32_src = src
         else:
             self.net = net
-            self._fp32_src = None
         self.device = device
         self.c_puct = c_puct
         self.batch_size = batch_size
@@ -147,6 +141,8 @@ class UltraFastMCTS:
         # Contempt: 0.0 = standard play. > 0 → avoid draws, < 0 → welcome them.
         # Applied by RustMCTS.set_contempt on every per-game tree right after creation.
         self.contempt = float(contempt)
+        # Per-slot repetition planes during search (match training encoding).
+        self._rep_search_perslot = bool(rep_search_perslot)
         self._parallel_sims = parallel_sims if parallel_sims is not None else PARALLEL_SIMS
         if self._parallel_sims > 64:
             print(f"⚠️  parallel_sims={self._parallel_sims} > 64: PUCT exploration "
@@ -173,10 +169,14 @@ class UltraFastMCTS:
         self._has_cuda = torch.cuda.is_available()
         MAX_LEAVES = max(8192, batch_size * self._parallel_sims * 2)
         if self._has_cuda:
+            # NCHW (contiguous), NOT channels_last: the inference net is
+            # GroupNorm-heavy and runs fastest with NCHW weights (measured —
+            # channels_last is ~10-15% slower, see experiments/perf/). A NCHW
+            # pinned buffer also makes the per-step copy a plain contiguous memcpy
+            # instead of a strided layout-convert (measured 1.1-1.3x faster H2D).
             self.pinned_buf = torch.empty(
                 (MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W),
-                pin_memory=True, dtype=torch.bfloat16,
-                memory_format=torch.channels_last)
+                pin_memory=True, dtype=torch.bfloat16)
         else:
             self.pinned_buf = torch.empty(
                 (MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W),
@@ -222,44 +222,6 @@ class UltraFastMCTS:
             "savings": (self._kld_sims_saved / self._kld_sims_requested
                         if self._kld_sims_requested > 0 else 0.0),
             "calls": self._kld_total_calls,
-        }
-
-    def update_inference_weights(self, fp32_net: torch.nn.Module = None) -> None:
-        """Synchronizes BF16 inference network weights with the current FP32 net.
-
-        Call after every train_epoch / EMA apply so self-play uses fresh weights.
-        Does nothing if bf16_weights=False.
-
-        fp32_net: optionally pass a different FP32 net (e.g., EMA shadow).
-                  Defaults to self._fp32_src (the net passed at init).
-        """
-        if not self._bf16_weights:
-            return
-        src = fp32_net if fp32_net is not None else self._fp32_src
-        if src is None:
-            return
-        # Unwrap compiled wrapper if present
-        src_inner = src._orig_mod if hasattr(src, '_orig_mod') else src
-        # Unwrap target if it's under torch.compile
-        target = self.net._orig_mod if hasattr(self.net, '_orig_mod') else self.net
-        with torch.no_grad():
-            target_state = target.state_dict()
-            for k, v in src_inner.state_dict().items():
-                if k not in target_state:
-                    continue
-                if target_state[k].dtype.is_floating_point:
-                    target_state[k].copy_(v.detach().to(target_state[k].dtype))
-                else:
-                    target_state[k].copy_(v.detach())
-        self.clear_nn_cache()
-
-    def nn_cache_stats(self) -> dict:
-        total = self._cache_hits + self._cache_misses
-        return {
-            "hits": self._cache_hits,
-            "misses": self._cache_misses,
-            "hit_rate": (self._cache_hits / total) if total > 0 else 0.0,
-            "size": len(self.nn_cache) if self.nn_cache is not None else 0,
         }
 
     @torch.no_grad()
@@ -376,11 +338,10 @@ class UltraFastMCTS:
                 arr = np.concatenate([arr, arr[pad_idx]], axis=0)
             target_dtype = torch.bfloat16 if self._has_cuda else torch.float32
             cpu_t = torch.from_numpy(arr).to(target_dtype)
-            x = cpu_t.to(self.device, non_blocking=True,
-                         memory_format=torch.channels_last)
+            x = cpu_t.to(self.device, non_blocking=True)
 
-        if not x.is_contiguous(memory_format=torch.channels_last):
-            x = x.to(memory_format=torch.channels_last)
+        # NCHW throughout — the net runs NCHW (channels_last is slower here), so
+        # no layout conversion; x stays contiguous from the pinned buffer.
         if self._bf16_weights:
             # Both weights and input in BF16 — no autocast needed.
             out = self.net(x)
@@ -431,99 +392,39 @@ class UltraFastMCTS:
 
         return policies[:n], q_values[:n], d_values[:n], m_values[:n]
 
-    def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
-        if RUST_MCTS_AVAILABLE:
-            return self._search_rust(engines, simulations)
-        return self._search_python(engines, simulations)
-
-    def search_games_with_values(self, engines: List, simulations: int = 80):
-        """Returns (policies, values). values are needed for resign logic.
-
-        If self.kld_threshold > 0, MCTS may stop early when the
-        visit distribution stops changing (Lc0 smart pruning).
-        """
-        if RUST_MCTS_AVAILABLE:
-            rust_mcts = _RustMCTS(engines, self._parallel_sims)
-            if self.contempt != 0.0:
-                rust_mcts.set_contempt(self.contempt)
-            # add_dirichlet=False (eval/FSF/lagged) must actually disable noise
-            # in Rust — the flag was silently ignored before.
-            if not self.add_dirichlet:
-                rust_mcts.set_add_dirichlet(False)
-            steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
-
-            # NOTE: this path applies inference *immediately* after each
-            # collect_leaves, in the same step. The previous "double-buffered"
-            # variant overlapped GPU work with the next collect by deferring
-            # apply_inference_buffered by one step — but collect_leaves clears
-            # `game.pending` on the Rust side, so the deferred apply wrote the
-            # previous batch's NN outputs onto the *new* leaves. That was a
-            # silent correctness bug in every search_games_with_values caller
-            # (eval.py, FSF games, lagged games, play_fsf). We trade a tiny
-            # CPU/GPU overlap window for a guaranteed-correct alignment.
-            kld_enabled = self.kld_threshold > 0.0
-            kld_min_steps = int(np.ceil(steps * self.kld_min_sims_frac))
-            if kld_enabled:
-                rust_mcts.kld_reset_all()
-            self._kld_total_calls += 1
-            self._kld_sims_requested += simulations
-            early_exit_step = None
-
-            for step in range(steps):
-                leaf_matrix = rust_mcts.collect_leaves(simulations)
-                if leaf_matrix.shape[0] == 0:
-                    break
-                curr_counts = rust_mcts.get_current_batch_counts()
-                curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
-                p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
-                rust_mcts.apply_inference_buffered(
-                    np.ascontiguousarray(p, dtype=np.float32),
-                    np.ascontiguousarray(v, dtype=np.float32),
-                    np.ascontiguousarray(d, dtype=np.float32),
-                    np.ascontiguousarray(m, dtype=np.float32),
-                    curr_counts,
-                )
-
-                if (kld_enabled and step >= kld_min_steps
-                        and (step + 1) % self.kld_check_every == 0
-                        and step + 1 < steps):
-                    max_kl = rust_mcts.kld_snapshot_and_check()
-                    if max_kl != float('inf'):
-                        sims_added = self.kld_check_every * self._parallel_sims
-                        kl_gain = max_kl / max(1, sims_added)
-                        if kl_gain < self.kld_threshold:
-                            self._kld_early_exits += 1
-                            self._kld_sims_saved += (steps - step - 1) * self._parallel_sims
-                            early_exit_step = step
-                            break
-
-            raw_policies = rust_mcts.get_policies()
-            raw_values   = rust_mcts.get_values()
-            policies = [np.array(p, dtype=np.float32) for p in raw_policies]
-            return policies, np.array(raw_values, dtype=np.float32)
-
-        policies = self._search_python(engines, simulations)
-        return policies, np.zeros(len(engines), dtype=np.float32)
-
-    def _search_rust(self, engines: List, simulations: int) -> List[np.ndarray]:
-        policies, _ = self.search_games_with_values(engines, simulations)
-        return policies
-
-    def _search_rust_full(self, engines: List, simulations: int) -> List[np.ndarray]:
+    def new_tree(self, engines: List):
+        """Fresh RustMCTS over `engines`, configured from this instance's flags."""
         rust_mcts = _RustMCTS(engines, self._parallel_sims)
         if self.contempt != 0.0:
             rust_mcts.set_contempt(self.contempt)
+        # add_dirichlet=False (eval / FSF / lagged) must actually disable root
+        # noise in Rust — the flag used to be silently ignored.
         if not self.add_dirichlet:
             rust_mcts.set_add_dirichlet(False)
-        steps = max(1, (simulations + self._parallel_sims - 1) // self._parallel_sims)
+        if self._rep_search_perslot:
+            rust_mcts.set_rep_search_perslot(True)
+        return rust_mcts
 
-        # Correct double buffering:
-        # GPU processes batch N while Rust collects batch N+1.
-        # Inference applied in-step (no double-buffering). The old "collect
-        # next, apply previous" scheme silently wrote previous-batch NN outputs
-        # onto fresh pending leaves: collect_leaves clears Rust's `pending`,
-        # so by the time apply_inference_buffered ran, the leaves it indexed
-        # were already from the next step. Same fix as search_games_with_values.
+    def run_search(self, rust_mcts, simulations: int) -> None:
+        """Run one search on an existing tree: collect → infer → apply, with
+        Lc0-style KLD early exit. Leaves the tree in place, so callers doing
+        tree reuse (self-play, game_stats) drive the same loop as one-shot
+        callers instead of each keeping their own copy of it.
+
+        Inference is applied *immediately* after each collect_leaves, in the
+        same step. The old "double-buffered" variant deferred the apply by one
+        step, but collect_leaves clears Rust's `pending`, so the deferred apply
+        wrote the previous batch's NN outputs onto the new leaves.
+        """
+        parallel = self._parallel_sims
+        steps = max(1, (simulations + parallel - 1) // parallel)
+        kld_enabled = self.kld_threshold > 0.0
+        kld_min_steps = int(np.ceil(steps * self.kld_min_sims_frac))
+        if kld_enabled:
+            rust_mcts.kld_reset_all()
+        self._kld_total_calls += 1
+        self._kld_sims_requested += simulations
+
         for step in range(steps):
             leaf_matrix = rust_mcts.collect_leaves(simulations)
             if leaf_matrix.shape[0] == 0:
@@ -539,135 +440,30 @@ class UltraFastMCTS:
                 curr_counts,
             )
 
-        raw = rust_mcts.get_policies()
-        return [np.array(p, dtype=np.float32) for p in raw]
+            if (kld_enabled and step >= kld_min_steps
+                    and (step + 1) % self.kld_check_every == 0
+                    and step + 1 < steps):
+                max_kl = rust_mcts.kld_snapshot_and_check()
+                if max_kl != float('inf'):
+                    kl_gain = max_kl / max(1, self.kld_check_every * parallel)
+                    if kl_gain < self.kld_threshold:
+                        self._kld_early_exits += 1
+                        self._kld_sims_saved += (steps - step - 1) * parallel
+                        break
 
-    # ── Python fallback ────────────────────────────────────────────────────────
+    def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
+        return self.search_games_with_values(engines, simulations)[0]
 
-    def _search_python(self, engines: List, simulations: int) -> List[np.ndarray]:
-        """Old Python MCTS — only used if RustMCTS is not compiled."""
-        import math
-        num_games = len(engines)
-        roots = [MCTSNode(None, -1, 1.0) for _ in range(num_games)]
-        root_tensors = np.stack([
-            np.array(e.get_board_tensor(), dtype=np.float32) for e in engines
-        ]).reshape(num_games, FLAT_SIZE)
-        policies, _, _, _ = self._infer(root_tensors)
-        for i in range(num_games):
-            self._expand_node_py(roots[i], engines[i], policies[i],
-                                 add_noise=self.add_dirichlet)
+    def search_games_with_values(self, engines: List, simulations: int = 80):
+        """Returns (policies, values). values are needed for resign logic.
 
-        steps = max(1, (simulations + PARALLEL_SIMS - 1) // PARALLEL_SIMS)
-        for _ in range(steps):
-            all_tensors, all_meta = [], []
-            for g in range(num_games):
-                if engines[g].is_game_over(): continue
-                for _ in range(PARALLEL_SIMS):
-                    node, stack = self._select_py(roots[g])
-                    if node.is_terminal:
-                        sim = engines[g].copy()
-                        for m in stack: sim.make_move_int(m)
-                        r = sim.game_result()
-                        v = r if sim.side_to_move() == 0 else -r
-                        self._backup_py(node, v)
-                        continue
-                    sim = engines[g].copy()
-                    for m in stack: sim.make_move_int(m)
-                    all_tensors.append(np.array(sim.get_board_tensor(), dtype=np.float32))
-                    all_meta.append((g, node, stack))
-                    self._vloss_py(node, VIRTUAL_LOSS)
-            if not all_tensors: continue
-            tensor_matrix = np.stack(all_tensors).reshape(len(all_tensors), FLAT_SIZE)
-            pols, vals, _, _ = self._infer(tensor_matrix)
-            for i, (g, node, stack) in enumerate(all_meta):
-                sim = engines[g].copy()
-                for m in stack: sim.make_move_int(m)
-                if not node.is_expanded:
-                    self._expand_node_py(node, sim, pols[i], add_noise=False)
-                self._vloss_py(node, -VIRTUAL_LOSS)
-                self._backup_py(node, float(vals[i]))
+        If self.kld_threshold > 0, MCTS may stop early when the
+        visit distribution stops changing (Lc0 smart pruning).
+        """
+        rust_mcts = self.new_tree(engines)
+        self.run_search(rust_mcts, simulations)
+        raw_policies = rust_mcts.get_policies()
+        raw_values   = rust_mcts.get_values()
+        policies = [np.array(p, dtype=np.float32) for p in raw_policies]
+        return policies, np.array(raw_values, dtype=np.float32)
 
-        result = []
-        for g, root in enumerate(roots):
-            pol = np.zeros(POLICY_SIZE, dtype=np.float32)
-            total = sum(c.visits for c in root.children.values())
-            if total > 0:
-                for m, child in root.children.items():
-                    idx = engines[g].move_int_to_policy_idx(m)
-                    if idx is not None: pol[idx] = child.visits / total
-            result.append(pol)
-        return result
-
-    # ── Helpers for gui.py ─────────────────────────────────────────────────────
-
-    def _select_py(self, root):
-        import math
-        FPU_REDUCTION = 0.330
-        node, stack = root, []
-        while node.is_expanded and node.children and not node.is_terminal:
-            parent_q = node.q()
-            sqrt_n = math.sqrt(max(node.visits + node.virtual_loss, 1))
-            # Relative FPU: fpu = parent_q - 0.330 * sqrt(sum_of_visited_priors)
-            visited_pol = sum(c.prior for c in node.children.values()
-                              if c.visits > 0 or c.virtual_loss > 0)
-            fpu = max(parent_q - FPU_REDUCTION * math.sqrt(visited_pol), -1.0)
-            best, best_s = None, -1e18
-            for child in node.children.values():
-                started = child.visits + child.virtual_loss
-                q_in_parent = -child.q() if started > 0 else fpu
-                s = q_in_parent + self.c_puct * child.prior * sqrt_n / (1 + started)
-                if s > best_s: best_s = s; best = child
-            node = best; stack.append(node.move)
-        return node, stack
-
-    def _expand_node_py(self, node, engine, policy_vec, add_noise=False):
-        if node.is_expanded: return
-        legal = engine.get_legal_moves_int()
-        if not legal:
-            node.is_terminal = True; node.is_expanded = True; return
-        n = len(legal)
-        priors = np.array([
-            float(policy_vec[idx]) if (idx := engine.move_int_to_policy_idx(m)) is not None
-                                       and 0 <= idx < len(policy_vec) else 1e-8
-            for m in legal
-        ], dtype=np.float64)
-        s = priors.sum()
-        if s > 1e-12:
-            priors = priors / s
-        else:
-            # dead policy: all priors ≈ 0 → uniform fallback
-            # Frequent occurrences = policy collapse
-            priors = np.ones(n) / n
-            if not hasattr(self, '_dead_policy_count'):
-                self._dead_policy_count = 0
-            self._dead_policy_count += 1
-        if add_noise and n > 0:
-            priors = 0.75 * priors + 0.25 * np.random.dirichlet([0.3] * n)
-        for j, m in enumerate(legal):
-            node.children[m] = MCTSNode(node, m, float(priors[j]))
-        node.is_expanded = True
-
-    def _vloss_py(self, node, delta):
-        cur = node
-        while cur:
-            cur.virtual_loss = max(0, cur.virtual_loss + delta) if delta < 0 else cur.virtual_loss + delta
-            cur = cur.parent
-
-    def _backup_py(self, leaf, value):
-        cur, sign = leaf, 1.0
-        while cur:
-            cur.visits += 1; cur.value_sum += value * sign; sign *= -1.0; cur = cur.parent
-
-    def _select(self, root): return self._select_py(root)
-    def _expand_node(self, node, engine, policy_vec, add_noise=False):
-        return self._expand_node_py(node, engine, policy_vec, add_noise)
-    def _apply_virtual_loss(self, node, delta): return self._vloss_py(node, delta)
-    def _backup(self, leaf, move_stack, value, apply_vloss=False):
-        return self._backup_py(leaf, value)
-
-
-def mcts_policy_vector(engine, net, simulations=80, c_puct=1.25, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    mcts = UltraFastMCTS(net, device, c_puct, batch_size=256, add_dirichlet=True)
-    return mcts.search_games([engine], simulations)[0]
