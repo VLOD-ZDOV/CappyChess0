@@ -32,12 +32,9 @@ nibbler/
 # ── Мусор редакторов и ОС ────────────────────────────────────────────────────
 .vscode/
 .idea/
-*.swp
-.DS_Store
-
-docs/
-python_src/bt5.txt
-
-# ── Локальные настройки инструментов ─────────────────────────────────────────
 .claude/
 .directory
+*.swp
+.DS_Store
+docs/
+python_src/bt5.txt
