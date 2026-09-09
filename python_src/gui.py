@@ -20,6 +20,7 @@ English.
 
 import math
 import os
+import subprocess
 import sys
 import json
 import time
@@ -1054,6 +1055,10 @@ class NibblerGUI(QMainWindow):
         self.ttable = {}             # persistent search DAG — reused across moves
         self.mode = "analyze"
         self.analysis_on = False     # off until ▶ / Space — no auto-search on open
+        # Подсказки на СВОЁМ ходу. Анализ при этом может работать: он нужен,
+        # чтобы движок отвечал, и чтобы после партии был разбор. Скрывается
+        # только показ — стрелки, список ходов, полоса и оценка в строке.
+        self.hints_on = True
         self.contempt = 0.0          # LC0-style draw bias in PUCT selection
 
         self._build_ui()
@@ -1164,6 +1169,14 @@ class NibblerGUI(QMainWindow):
                                   else "▶ Запустить анализ")
         self.btn_go.clicked.connect(self._toggle_analysis)
         lay.addWidget(self.btn_go)
+
+        self.chk_hints = QCheckBox("Подсказки на моём ходу")
+        self.chk_hints.setChecked(self.hints_on)
+        self.chk_hints.setToolTip(
+            "Снять — и на своём ходу не видно ни стрелок, ни оценки.\n"
+            "Ходы движка и разбор после партии остаются как были.")
+        self.chk_hints.toggled.connect(self._toggle_hints)
+        lay.addWidget(self.chk_hints)
 
         btn_new = QPushButton("🆕 Новая")
         btn_new.clicked.connect(self.new_game)
@@ -1285,6 +1298,11 @@ class NibblerGUI(QMainWindow):
 
     def _load_onnx(self, path):
         try:
+            # Старая сессия держит свою память на карте, пока жива. Ссылку из
+            # потока поиска надо снять до создания новой, иначе две сессии
+            # какое-то время сосуществуют и занятое на карте удваивается.
+            self.stop_search()
+            self.mcts = None
             # nn_cache_max=150_000 ≈ 4 GB RAM ceiling (each entry holds the
             # 7000-prob policy + scalars). The old default 600 000 could grow
             # to ~17 GB on long analysis sessions, which is what users see as
@@ -1305,6 +1323,18 @@ class NibblerGUI(QMainWindow):
     def _mode_changed(self, idx):
         self.mode = MODES[idx]
         self.refresh()
+
+    def _toggle_hints(self, on):
+        self.hints_on = bool(on)
+        self.refresh()
+
+    def hints_hidden(self):
+        """Скрывать ли показ анализа: игра против движка, мой ход, живая
+        позиция. Разбор сыгранного (курсор в истории) не трогаем."""
+        return (not self.hints_on
+                and self.mode in ("play_white", "play_black")
+                and self.cursor == len(self.history)
+                and not self.engine_should_move())
 
     def _toggle_analysis(self):
         self.analysis_on = not self.analysis_on
@@ -1516,12 +1546,40 @@ class NibblerGUI(QMainWindow):
         self.graph.set_data(self.evals, self.cursor, len(self.history))
         self._rebuild_table()
 
+    _vram_cache = (0.0, "")
+
+    def vram_note(self):
+        """Занятое процессом на карте, опрошенное не чаще раза в 5 секунд.
+
+        Нужно потому, что после одной партии GUI держал 14.6 ГБ, а замер самой
+        ONNX-сессии даёт ровно 2.3 ГБ и не растёт за 8000 вызовов. Причина
+        расхождения не найдена; без цифры на экране её и не поймать."""
+        now = time.time()
+        if now - self._vram_cache[0] < 5.0:
+            return self._vram_cache[1]
+        note = ""
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2).stdout
+            for line in out.strip().splitlines():
+                pid, mem = [x.strip() for x in line.split(",")]
+                if int(pid) == os.getpid():
+                    note = f"  ·  карта: {int(mem) / 1024:.1f} ГБ"
+                    break
+        except Exception:
+            pass
+        NibblerGUI._vram_cache = (now, note)
+        return note
+
     def apply_payload(self, payload, live):
         """Render an analysis payload (live result or cached snapshot)."""
         moves = payload["moves"]
         stm = payload["stm"]
-        self.infobox.set_moves(moves)
-        self.board.analysis = moves
+        hide = self.hints_hidden()
+        self.infobox.set_moves([] if hide else moves)
+        self.board.analysis = [] if hide else moves
         self.board.update()
 
         wr_stm = (payload["root_q"] + 1.0) / 2.0
@@ -1552,7 +1610,12 @@ class NibblerGUI(QMainWindow):
                     mate_in = +n if stm == 0 else -n
                 else:
                     mate_in = -n if stm == 0 else +n
-        self.eval_bar.set_eval(wr_white, mate_in)
+        # Оценку в self.evals кладём всегда — она нужна графику и разбору
+        # после партии. Прячем только показ.
+        if hide:
+            self.eval_bar.set_eval(0.5, None)
+        else:
+            self.eval_bar.set_eval(wr_white, mate_in)
         self.evals[self.cursor] = wr_white
 
         side = "белые" if stm == 0 else "чёрные"
@@ -1561,13 +1624,15 @@ class NibblerGUI(QMainWindow):
             reused = payload.get("reused", 0)
             fresh = max(0, payload["sims"] - reused)
             self.statusBar().showMessage(
-                f"Ход: {side}  ·  узлов: {payload['sims']:,} (♻ {reused:,})  ·  "
+                f"Ход: {side}{self.vram_note()}  ·  "
+                f"узлов: {payload['sims']:,} (♻ {reused:,})  ·  "
                 f"{fresh / elapsed:.0f}/с  ·  слияний транспозиций: "
-                f"{payload['merges']:,}  ·  оценка (белые): {wr_white * 100:.1f}%")
+                f"{payload['merges']:,}" +
+                ("" if hide else f"  ·  оценка (белые): {wr_white * 100:.1f}%"))
         else:
             self.statusBar().showMessage(
-                f"Позиция {self.cursor} · слепок {payload['sims']:,} узлов · "
-                f"оценка (белые): {wr_white * 100:.1f}%")
+                f"Позиция {self.cursor} · слепок {payload['sims']:,} узлов" +
+                ("" if hide else f" · оценка (белые): {wr_white * 100:.1f}%"))
 
     def on_update(self, payload):
         if payload.get("game_over"):
@@ -1575,7 +1640,12 @@ class NibblerGUI(QMainWindow):
         new_ply = self.cursor not in self.snapshots
         self.snapshots[self.cursor] = payload      # cache before any move
         self.apply_payload(payload, live=True)
-        self.graph.set_data(self.evals, self.cursor, len(self.history))
+        # График — тоже подсказка: последняя точка выдаёт оценку текущей
+        # позиции. На своём ходу с выключенными подсказками её не рисуем.
+        shown = self.evals
+        if self.hints_hidden():
+            shown = {k: v for k, v in self.evals.items() if k != self.cursor}
+        self.graph.set_data(shown, self.cursor, len(self.history))
 
         # During continuous analysis only the current row changes — a full
         # rebuild every tick would flicker, so refresh just that row.
