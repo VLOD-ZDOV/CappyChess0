@@ -1471,11 +1471,15 @@ class NibblerGUI(QMainWindow):
         snapshot = self.snapshots.get(self.cursor)
         if getattr(self, "logger", None) is None:
             self.logger = GameLogger(self.mode, getattr(self, "net_path", None))
+        # Запись партии не должна ронять партию. Своя же правка логгера уже
+        # уронила игру на середине через AttributeError — цена ошибки здесь
+        # строка в статусе, а не потерянная позиция.
         try:
             n_legal = len(self.board.engine.get_legal_moves_int())
-        except Exception:
-            n_legal = None
-        self.logger.add(self.cursor, by, m, snapshot, n_legal)
+            self.logger.add(self.cursor, by, m, snapshot, n_legal)
+        except Exception as e:
+            self.statusBar().showMessage(f"запись партии отключена: {e}")
+            self.logger = None
         del self.history[self.cursor:]
         self.history.append(m)
         self.cursor += 1
@@ -1537,10 +1541,13 @@ class NibblerGUI(QMainWindow):
             msg = ("Ничья" if abs(r) < 1e-6
                    else ("Белые выиграли" if r > 0 else "Чёрные выиграли"))
             lg = getattr(self, "logger", None)
-            if lg is not None and lg.data["result"] is None:
-                lg.finish(r)
-                msg += ("  ·  записано: games/"
-                        f"{os.path.basename(lg.txt_path)} и .json")
+            try:
+                if lg is not None and lg.head["result"] is None:
+                    lg.finish(r)
+                    msg += ("  ·  записано: games/"
+                            f"{os.path.basename(lg.txt_path)} и .json")
+            except Exception as e:
+                msg += f"  ·  запись не сохранена: {e}"
             self.statusBar().showMessage(f"Партия окончена — {msg}")
         elif snap is not None:
             self.apply_payload(snap, live=False)        # instant placeholder
