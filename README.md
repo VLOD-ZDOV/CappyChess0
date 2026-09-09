@@ -16,126 +16,228 @@ The project has three parts:
 
 ## ⚡ Quick start
 
-Copy-paste, in order. Everything runs from the repository root unless stated.
+Step by step, in order. Commands are given for **Linux/macOS** and **Windows**;
+pick your column and keep to it. Everything runs from the repository root
+unless a step says otherwise.
 
-### 1. Dependencies
+### 0. The game, in thirty seconds
+
+The board is **10×8** — files `a`…`j`, ranks `1`…`8`. Two pieces do not exist in
+normal chess:
+
+| | moves as |
+|---|---|
+| **A** — archbishop | bishop **+** knight |
+| **C** — chancellor | rook **+** knight |
+
+Opening rank: `R N A B Q K B C N R`, so the king starts on **f1** (`f8` for
+Black).
+
+**Castling moves the king three squares, not two:**
+
+| | king | rook | must be empty |
+|---|---|---|---|
+| kingside | `f1` → `i1` | `j1` → `h1` | `g1 h1 i1` |
+| queenside | `f1` → `c1` | `a1` → `d1` | `b1 c1 d1 e1` |
+
+Type castling as the king move: `f1i1` or `f1c1`. Moves are UCI (`e2e4`);
+promotion adds a suffix — `q r b n` as usual, plus **`a`** archbishop and
+**`c`** chancellor (`e7e8a`).
+
+### 1. Prerequisites
+
+- **Python 3.10+**
+- **Rust** — [rustup.rs](https://rustup.rs). The search engine is a compiled
+  Rust module; there is no pure-Python fallback.
+- **NVIDIA GPU with CUDA** for training. Playing works on CPU, just slower.
+
+### 2. Create the environment
+
+<table><tr><th>Linux / macOS</th><th>Windows (PowerShell)</th></tr><tr><td>
 
 ```bash
-python -m venv venv && source venv/bin/activate     # fish: source venv/bin/activate.fish
+python -m venv venv
+source venv/bin/activate
+# fish: source venv/bin/activate.fish
 pip install maturin numpy torch
 ```
 
-### 2. Build the Rust engine
+</td><td>
 
-It compiles into a Python module named `capablanca_engine`. Without this step
-nothing else imports.
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+pip install maturin numpy torch
+```
+
+</td></tr></table>
+
+### 3. Build the Rust engine
+
+It installs as a Python module named `capablanca_engine`. **Nothing else
+imports until this succeeds.**
+
+<table><tr><th>Linux / macOS</th><th>Windows</th></tr><tr><td>
 
 ```bash
 cd rust_engine
-PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 maturin develop --release
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 \
+  maturin develop --release
 cd ..
 ```
 
-Check it worked:
+</td><td>
 
-```bash
+```powershell
+cd rust_engine
+$env:PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+maturin develop --release
+cd ..
+```
+
+</td></tr></table>
+
+Check it:
+
+```
 python -c "import capablanca_engine; print('ok')"
 ```
 
-### 3. Get a network
+> **The single most common error is `No module named 'capablanca_engine'`.**
+> It almost always means the environment is not active and the *system* Python
+> ran instead. Either activate it (step 2) or call the interpreter by full
+> path: `venv/bin/python …` on Linux, `venv\Scripts\python.exe …` on Windows.
 
-Either download one from [Releases](../../releases) into `python_src/`, or
-train your own (next step). Everything below assumes a `.pth` file exists.
+### 4. Get a network
 
-### 4. Play against it in the terminal
+Download a `.pth` from [Releases](../../releases), or train your own (step 6).
+Put it anywhere; the commands below take the path as an argument.
 
-```bash
-cd python_src
-python play_cli.py <weights.pth> --sims 800 --side white
+### 5. Play against it
+
+**In the GUI** — board, arrows ranked by the network's own preference,
+evaluation bar:
+
 ```
-
-Moves are UCI: `e2e4`, promotions get a suffix (`q r b n a c` — `a` archbishop,
-`c` chancellor). `moves` lists legal moves, `quit` exits.
-
-Over SSH, one move per invocation, state kept in a file:
-
-```bash
-python play_cli.py <weights.pth> --new              # start a game
-python play_cli.py <weights.pth> --move e2e4        # your move, engine replies
-```
-
-### 5. Train
-
-```bash
-cd python_src
-python -u train.py \
-    --channels 256 --res-blocks 10 \
-    --transformer-blocks 10 --transformer-heads 8 --ffn-mult 4 \
-    --restricted-policy --abs-pos-embed --wide-value --no-future \
-    --games 128 --mcts-batch 128 --mcts-parallel-sims 8 \
-    --simulations 600 --fast-simulations 150 \
-    --batch-size 512 --train-steps 200 \
-    --buffer-max 150000 --lr 2e-4 \
-    --save-every 10 --checkpoint-dir checkpoints
-```
-
-Two settings deserve attention, because getting them wrong quietly wrecks
-training rather than crashing:
-
-- **`--mcts-parallel-sims`** is how many leaves go to the GPU per call.
-  `ceil(--simulations / --mcts-parallel-sims)` is the number of *sequential*
-  PUCT rounds the search gets. Below about 12 rounds virtual loss spreads the
-  visits flat across the root and the stored policy target degenerates towards
-  uniform. Keep the ratio at 12 or more.
-- **`--simulations`** decides how accurate that target is, and the network
-  cannot end up sharper than what it is trained on.
-
-**Run long training outside your terminal multiplexer**, not inside a pane —
-if the multiplexer server dies it takes the run with it:
-
-```bash
-setsid nohup python -u train.py ... >> train.log 2>&1 < /dev/null &
-tail -f train.log
-```
-
-### 6. Check that it is actually learning
-
-Loss alone will not tell you. Two commands:
-
-```bash
-python policy_health.py checkpoints/model_iter*.pth
-```
-
-Reports `max(p)*n_legal` — how much sharper than uniform the best move is.
-`1.0` is uniform, `1.04` is a randomly initialised head, `3.5+` is healthy. A
-value drifting downwards means the policy head is being flattened; the loss
-curve looks like a plateau while this happens.
-
-```bash
-python eval.py <old.pth> <new.pth> --games 200 --simulations 200 \
-       --mcts-parallel-sims 8
-```
-
-Head-to-head is the only trustworthy strength measure here. Score against a
-random mover ranks networks in the *wrong order* — a stronger network draws
-more against a random opponent because it fails to convert, not because it
-plays worse.
-
-For an absolute reading, use the Fairy-Stockfish ladder — and use
-`Skill Level`, not `--fsf-nodes`; node limits barely weaken the engine, so
-every network in this project scored 0% against it regardless of strength.
-
-### 7. GUI
-
-```bash
 pip install -r python_src/requirements.txt   # PyQt5 + onnxruntime-gpu
 pip install onnx onnxscript
-python python_src/export_onnx.py <weights.pth> capablanca.onnx
 python python_src/gui.py
+```
+
+Open your `.pth` straight from *Load network* — the GUI converts it to ONNX on
+first open and caches the result next to the checkpoint, so later opens are
+instant. A `capablanca.onnx` sitting next to `gui.py` loads automatically at
+startup.
+
+Convert by hand instead, if you prefer, or if PyTorch is not installed
+alongside the GUI:
+
+```
+python python_src/export_onnx.py weights.pth capablanca.onnx
 ```
 
 Export from a *snapshot*, never from a `latest.pth` that a training run is
 still overwriting.
+
+**In the terminal** — no GUI, no display:
+
+```
+cd python_src
+python play_cli.py ../weights.pth --sims 800 --side white
+```
+
+`moves` lists legal moves, `quit` exits. One move per invocation, with the game
+kept in a state file (handy over ssh, or for scripting an opponent):
+
+```
+python play_cli.py ../weights.pth --new --side white --move e2e4
+python play_cli.py ../weights.pth --move d2d4
+```
+
+After each move the engine prints its own evaluation: `Q` is **from the
+network's own point of view** — `Q=+0.9` means the network thinks *it* is
+winning.
+
+### 6. Train
+
+```
+cd python_src
+python -u train.py \
+    --channels 256 --res-blocks 10 \
+    --transformer-blocks 10 --transformer-heads 8 --ffn-mult 4 \
+    --swiglu --qk-norm --rmsnorm --no-qkv-bias \
+    --restricted-policy --abs-pos-embed --wide-value --no-future \
+    --games 256 --mcts-batch 128 --mcts-parallel-sims 8 \
+    --simulations 400 --fast-simulations 100 \
+    --batch-size 512 --train-steps 40 \
+    --buffer-max 200000 --lr 2e-4 \
+    --save-every 5 --checkpoint-dir checkpoints
+```
+
+On Windows drop the backslashes and put it on one line, or use a backtick `` ` ``
+for line continuation.
+
+Three settings wreck training *quietly* — no crash, just a weaker network:
+
+- **`--mcts-parallel-sims`** — how many leaves go to the GPU per call.
+  `ceil(--simulations / --mcts-parallel-sims)` is the number of *sequential*
+  PUCT rounds. Below about 12 rounds virtual loss spreads visits flat across
+  the root and the stored policy target degenerates towards uniform.
+  **Keep that ratio at 12 or above.**
+- **`--train-steps` against `--games`** — the ratio
+  `train_steps × batch_size / new_positions_per_iteration` is how many times
+  the gradient walks over each position. Around **5 is healthy**; at 38 the
+  network memorises the replay buffer instead of learning chess, and loses
+  strength while its training loss falls towards zero. Leela keeps this
+  between 1 and 4.
+- **Architecture flags must match exactly when resuming.** The network is
+  rebuilt from the flags and weights are loaded with `strict=False`, so a
+  mismatch does not raise — it silently drops tensors.
+
+Run long training detached, not inside a terminal multiplexer pane — if the
+multiplexer server dies it takes the run with it:
+
+```bash
+setsid nohup python -u train.py … >> train.log 2>&1 < /dev/null &
+tail -f train.log
+```
+
+### 7. Check that it is actually learning
+
+The training loss will not tell you — a *falling* loss is compatible with a
+network getting weaker. Three commands, cheapest first:
+
+```
+python overfit_check.py checkpoints/buffer.npz checkpoints/model_iter*.pth
+```
+
+Runs the network over the oldest and the newest positions in the replay buffer.
+Old ones have had many gradient passes, fresh ones almost none, so a **gap of
+2× or more means the network is memorising** the buffer rather than
+generalising — and its reported `value_loss` is measuring memory. Takes seconds.
+
+```
+python policy_health.py checkpoints/model_iter*.pth
+```
+
+Reports `max(p)·n_legal` — how much sharper than uniform the best move is.
+`1.0` is uniform, `1.04` a randomly initialised head. Catches a policy head
+being flattened, which looks like a loss plateau. Note that *sharper is not
+stronger*: in this project sharpness has gone up while strength went down.
+
+```
+python eval.py old.pth new.pth --games 200 --simulations 200 \
+       --mcts-parallel-sims 8
+```
+
+Head-to-head is **the only trustworthy strength measure**. Score against a
+random mover ranks networks in the *wrong order* — a stronger network draws
+more against a random opponent because it fails to convert, not because it
+plays worse.
+
+For an absolute reading use the Fairy-Stockfish ladder with `UCI_Elo`
+(`fsf_ladder.py`). Do not use `--fsf-nodes`: node limits barely weaken the
+engine, so every network here scored 0% against it regardless of strength.
 
 ---
 
@@ -515,7 +617,8 @@ python gui.py
 ```
 
 If `capablanca.onnx` sits next to `gui.py` it loads automatically; otherwise
-pick one through «Загрузить сеть». GPU acceleration is automatic when an
+pick one through «Загрузить сеть» — that dialog takes a training checkpoint
+(`.pth`) as well and converts it on the fly. GPU acceleration is automatic when an
 NVIDIA GPU is present (the status bar shows `GPU · CUDA`), with a silent
 CPU fallback.
 

@@ -27,7 +27,7 @@ import traceback
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QPushButton, QLabel,
-                             QFileDialog, QSpinBox, QGroupBox, QDialog, QComboBox,
+                             QFileDialog, QSpinBox, QGroupBox, QDialog, QComboBox, QMessageBox,
                              QCheckBox, QSizePolicy, QShortcut, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView,
                              QFrame)
@@ -38,8 +38,24 @@ try:
     from capablanca_engine import CapablancaEngine
     from onnx_engine import OnnxEngine, VIRTUAL_LOSS
 except ImportError as e:
-    print(f"Ошибка импорта! {e}")
-    traceback.print_exc()
+    # Самая частая причина — запуск системным питоном. Движок `capablanca_engine`
+    # это скомпилированный Rust-модуль, он ставится в виртуальное окружение
+    # проекта и системному интерпретатору не виден.
+    _venv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "venv")
+    print(f"Ошибка импорта: {e}\n")
+    if "capablanca_engine" in str(e):
+        _py = os.path.join(_venv, "Scripts" if os.name == "nt" else "bin",
+                           "python.exe" if os.name == "nt" else "python")
+        if os.path.exists(_py):
+            print("Похоже, GUI запущен системным Python. Запускай питоном из окружения проекта:\n")
+            print(f"    {_py} {os.path.abspath(__file__)}\n")
+        else:
+            print("Движок не собран. Из корня проекта:\n")
+            print("    python -m venv venv")
+            print("    venv/bin/pip install -r requirements.txt   (Windows: venv\\Scripts\\pip)")
+            print("    venv/bin/pip install ./rust_engine         (нужен Rust: https://rustup.rs)\n")
+    else:
+        traceback.print_exc()
     sys.exit(1)
 
 
@@ -1150,9 +1166,44 @@ class NibblerGUI(QMainWindow):
     # ---- model loading ----
     def load_weights(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Загрузить сеть", "", "ONNX-модель (*.onnx)")
-        if path:
-            self._load_onnx(path)
+            self, "Загрузить сеть", "",
+            "Сеть (*.onnx *.pth);;ONNX-модель (*.onnx);;Чекпоинт PyTorch (*.pth)")
+        if not path:
+            return
+        if path.lower().endswith(".pth"):
+            path = self._onnx_from_checkpoint(path)
+            if not path:
+                return
+        self._load_onnx(path)
+
+    def _onnx_from_checkpoint(self, pth):
+        """Convert a training checkpoint to ONNX so the GUI can play it.
+
+        The GUI itself needs only onnxruntime; PyTorch is pulled in here and
+        only here, when the user actually picks a .pth. The result is cached
+        next to the checkpoint, so re-opening the same net is instant."""
+        dst = os.path.splitext(pth)[0] + ".onnx"
+        if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(pth):
+            return dst
+        try:
+            from export_onnx import export
+        except ImportError as e:
+            QMessageBox.warning(
+                self, "Нужен PyTorch",
+                f"Чтобы открыть .pth, нужен PyTorch в этом окружении:\n\n{e}\n\n"
+                "Либо конвертируй заранее:\n"
+                "    python export_onnx.py чекпоинт.pth сеть.onnx")
+            return None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            export(pth, dst)
+        except Exception as e:
+            QMessageBox.critical(self, "Не удалось конвертировать",
+                                 f"{type(e).__name__}: {e}")
+            return None
+        finally:
+            QApplication.restoreOverrideCursor()
+        return dst
 
     def _autoload(self):
         """Load capablanca.onnx sitting next to the program, if present, so a

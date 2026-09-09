@@ -91,6 +91,10 @@ def main():
     ap.add_argument("--value-weight", type=float, default=1.0)
     ap.add_argument("--teacher-batch", type=int, default=1024)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--fp32", action="store_true",
+                    help="Считать в fp32. По умолчанию BF16, как в train.py — "
+                         "в fp32 те же 8 эпох занимали ~12.9 ГБ видеопамяти "
+                         "против примерно вдвое меньшего с BF16.")
     a = ap.parse_args()
 
     dev = torch.device(a.device if torch.cuda.is_available() else "cpu")
@@ -122,7 +126,9 @@ def main():
     t_pol = torch.empty((n, K), dtype=torch.float16)
     t_wdl = torch.empty((n, 3), dtype=torch.float16)
     t0 = time.time()
-    with torch.inference_mode():
+    amp = torch.autocast("cuda", dtype=torch.bfloat16,
+                         enabled=(not a.fp32 and dev.type == "cuda"))
+    with torch.inference_mode(), amp:
         for i in range(0, n, a.teacher_batch):
             j = min(i + a.teacher_batch, n)
             xb = torch.from_numpy(np.asarray(boards[i:j])).to(dev).float().view(-1, PLANES, H, W)
@@ -148,10 +154,13 @@ def main():
             xb = torch.from_numpy(np.asarray(boards[sel])).to(dev).float().view(-1, PLANES, H, W)
             tp = t_pol[sel].to(dev).float()
             tw = t_wdl[sel].to(dev).float()
-            pl, wl, _, _ = student(xb)
-            logp = F.log_softmax(pl.index_select(1, idx), dim=1)
+            with amp:
+                pl, wl, _, _ = student(xb)
+            # Лоссы — в fp32: log_softmax по 2672 классам в bf16 теряет точность
+            # там, где она и нужна, на хвосте распределения.
+            logp = F.log_softmax(pl.float().index_select(1, idx), dim=1)
             p_loss = -(tp * logp).sum(dim=1).mean()
-            v_loss = -(tw * F.log_softmax(wl, dim=1)).sum(dim=1).mean()
+            v_loss = -(tw * F.log_softmax(wl.float(), dim=1)).sum(dim=1).mean()
             loss = p_loss + a.value_weight * v_loss
             opt.zero_grad(set_to_none=True)
             loss.backward()

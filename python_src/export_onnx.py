@@ -42,13 +42,11 @@ class _InferWrap(nn.Module):
         return F.softmax(policy, dim=1), q, d, m
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python export_onnx.py <checkpoint.pth> [output.onnx]")
-        sys.exit(1)
-    src = sys.argv[1]
-    dst = sys.argv[2] if len(sys.argv) > 2 else "capablanca.onnx"
+def export(src, dst, log=print):
+    """Convert one .pth checkpoint into a self-contained .onnx graph.
 
+    Split out of main() so the GUI can accept a .pth directly instead of
+    making the user run this script by hand first."""
     ckpt = torch.load(src, map_location="cpu", weights_only=False)
     raw = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
 
@@ -59,11 +57,11 @@ def main():
     # a wrong-architecture ONNX with no error.
     from model import build_net_from_state_dict, describe_arch
     net, sd = build_net_from_state_dict(raw)
-    print(f"Архитектура: {describe_arch(net)}")
+    log(f"Архитектура: {describe_arch(net)}")
     result = net.load_state_dict(sd, strict=False)
     if result.missing_keys:
-        print(f"⚠️  не заполнено ключей: {len(result.missing_keys)} "
-              f"(напр. {result.missing_keys[0]})")
+        log(f"⚠️  не заполнено ключей: {len(result.missing_keys)} "
+            f"(напр. {result.missing_keys[0]})")
     net.eval()
 
     wrap = _InferWrap(net).eval()
@@ -84,8 +82,8 @@ def main():
     try:
         torch.onnx.export(wrap, dummy, dst, **common)
     except Exception as e:
-        print(f"⚠️  dynamo экспорт не справился ({type(e).__name__}). "
-              f"Откат на legacy TorchScript exporter…")
+        log(f"⚠️  dynamo экспорт не справился ({type(e).__name__}). "
+            f"Откат на legacy TorchScript exporter…")
         torch.onnx.export(wrap, dummy, dst, dynamo=False, **common)
 
     # The modern exporter writes weights to a sidecar <name>.data file.
@@ -95,7 +93,15 @@ def main():
     sidecar = dst + ".data"
     if os.path.exists(sidecar):
         os.remove(sidecar)
-    print(f"✅ Сохранено (один файл): {dst}")
+    log(f"✅ Сохранено (один файл): {dst}")
+    return dst
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python export_onnx.py <checkpoint.pth> [output.onnx]")
+        sys.exit(1)
+    export(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "capablanca.onnx")
 
 
 if __name__ == "__main__":

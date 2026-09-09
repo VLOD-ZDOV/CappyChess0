@@ -127,8 +127,11 @@ def main():
         p_loss = max(0.0, min(1.0, (1.0 - q - d) / 2.0))
         keep = max(0, args.resign_consec - 1)
         state["p_loss"] = (state.get("p_loss", [])[-keep:] if keep else []) + [p_loss]
-        line = (f"сеть: {move_to_uci(mv)}   Q={q:+.3f} D={d:.2f} "
-                f"P(проигрыша)={p_loss:.0%}\n  топ-5 по визитам: {alts}")
+        # Q — оценка сети ЗА СЕБЯ, а не за того, кто ходит следующим. Без этой
+        # пометки знак читается наоборот: Q=+1.0 принимали за «выигрывает
+        # соперник» и делали ложный вывод о сломанной value-голове.
+        line = (f"сеть: {move_to_uci(mv)}   Q={q:+.3f} (за себя) D={d:.2f} "
+                f"P(проигрыша сети)={p_loss:.0%}\n  топ-5 по визитам: {alts}")
         if (args.resign > 0 and len(state["p_loss"]) >= args.resign_consec
                 and all(x > args.resign for x in state["p_loss"])):
             state["resigned"] = True
