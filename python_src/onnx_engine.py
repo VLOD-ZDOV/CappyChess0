@@ -49,9 +49,15 @@ class OnnxEngine:
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         # CUDA first, CPU as a graceful fallback when no NVIDIA GPU is present.
+        # Арена CUDA-провайдера по умолчанию расширяется степенями двойки и
+        # обратно память НЕ отдаёт: замерено 1.3 ГБ на батче 96, 11.6 ГБ на
+        # 1024, и после большого батча она такой и остаётся до конца работы.
+        # kSameAsRequested берёт ровно столько, сколько попросили.
+        cuda_opts = {"arena_extend_strategy": "kSameAsRequested"}
         self.session = ort.InferenceSession(
             onnx_path, sess_options=so,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+            providers=[("CUDAExecutionProvider", cuda_opts),
+                       "CPUExecutionProvider"])
 
         active = self.session.get_providers()
         self.gpu = "CUDAExecutionProvider" in active

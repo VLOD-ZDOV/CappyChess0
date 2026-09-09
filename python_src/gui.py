@@ -452,6 +452,12 @@ class SearchThread(QThread):
 
     def _emit(self, root, stm, total, child_nn, finished):
         payload = payload_from_node(root, stm, child_nn)
+        # Сигнал Qt доставляется в очереди: посылка, отправленная до хода,
+        # приходит уже после него. Без отметки о позиции получатель приписывал
+        # её текущему ходу и рисовал стрелки чужой позиции — «сходи с поля,
+        # где нет фигуры». Помечаем и проверяем на приёме.
+        payload["ply"] = len(self.move_history)
+        payload["root_hash"] = self.root_hash
         payload["sims"] = total
         payload["merges"] = self.tt_hits
         payload["reused"] = self.reused
@@ -1335,8 +1341,11 @@ class NibblerGUI(QMainWindow):
             # 7000-prob policy + scalars). The old default 600 000 could grow
             # to ~17 GB on long analysis sessions, which is what users see as
             # "RAM full and not released".
+            # 150 000 позиций × 28 КБ ≈ 4.2 ГБ ОЗУ — для настольной программы
+            # многовато; 64 000 (≈1.8 ГБ) хватает на переиспользование дерева
+            # внутри партии, а на попадания в кэш влияет слабо.
             self.mcts = OnnxEngine(path, c_puct=1.745, batch_size=96,
-                                   nn_cache=True, nn_cache_max=150_000)
+                                   nn_cache=True, nn_cache_max=64_000)
             self.net_path = path
             self.ttable.clear()          # old stats came from the previous net
             dev = "GPU · CUDA" if self.mcts.gpu else "CPU"
@@ -1427,6 +1436,10 @@ class NibblerGUI(QMainWindow):
         self.evals = {}
         self.snapshots = {}
         self.ttable.clear()
+        # Кэш сети держит по 28 КБ на позицию (7000 вероятностей политики).
+        # После партии это её позиции, новой они не нужны, а память держат.
+        if self.mcts is not None:
+            self.mcts.clear_nn_cache()
         self.refresh()
 
     def flip_board(self):
@@ -1677,6 +1690,8 @@ class NibblerGUI(QMainWindow):
     def on_update(self, payload):
         if payload.get("game_over"):
             return
+        if payload.get("ply") is not None and payload["ply"] != self.cursor:
+            return                       # опоздавшая посылка от прошлой позиции
         new_ply = self.cursor not in self.snapshots
         self.snapshots[self.cursor] = payload      # cache before any move
         self.apply_payload(payload, live=True)
