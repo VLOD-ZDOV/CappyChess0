@@ -492,69 +492,97 @@ def payload_from_node(root, stm, child_nn=None):
 
 
 class GameLogger:
-    """Записывает партию ход за ходом вместе с тем, что о позиции думала сеть.
+    """Пишет партию в два файла рядом: ходы и оценки.
 
-    Пишется в `games/<время>.json` после КАЖДОГО хода, а не в конце: партия,
-    брошенная на середине или прерванная падением, всё равно оставляет
-    пригодный для разбора файл. Запись атомарная — сначала во временный файл,
-    потом переименование, иначе можно поймать половину json."""
+        games/<время>.txt    список ходов, читается глазами
+        games/<время>.json   оценки поиска, читается разбором
+
+    Раздельно потому, что смотреть партию и разбирать её — разные задачи, а
+    один файл со всем сразу нечитаем в обеих ролях.
+
+    В каждой записи есть `legal` — сколько ходов было легально. Без него
+    единственный ход в списке сети выглядит как «позиция безнадёжна», хотя это
+    может быть обычный шах с одним отступлением; на этом уже ошиблись.
+
+    Оба файла переписываются после КАЖДОГО хода и атомарно: партия, брошенная
+    на середине, всё равно оставляет пригодные файлы."""
 
     DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games")
+    RESULTS = {"draw": "ничья", "white": "победа белых", "black": "победа чёрных"}
 
     def __init__(self, mode, network):
         os.makedirs(self.DIR, exist_ok=True)
-        self.path = os.path.join(self.DIR, time.strftime("game_%Y%m%d_%H%M%S.json"))
-        self.data = {
+        stem = os.path.join(self.DIR, time.strftime("game_%Y%m%d_%H%M%S"))
+        self.txt_path, self.path = stem + ".txt", stem + ".json"
+        self.head = {
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "mode": mode,
             "network": os.path.basename(network) if network else None,
             "result": None,
-            "plies": [],
         }
+        self.plies = []
         self._t = time.time()
 
-    def add(self, ply, by, m_int, snapshot):
+    def add(self, ply, by, m_int, snapshot, n_legal=None):
         now = time.time()
-        rec = {
-            "ply": ply,
-            "side": "white" if ply % 2 == 0 else "black",
-            "by": by,
-            "uci": move_to_uci(m_int),
-            "seconds": round(now - self._t, 1),
-        }
+        rec = {"ply": ply, "by": by[0], "uci": move_to_uci(m_int),
+               "sec": round(now - self._t, 1)}
         self._t = now
+        if n_legal is not None:
+            rec["legal"] = int(n_legal)
         if snapshot:
             tops = snapshot.get("moves") or []
-            rec["root_q"] = round(float(snapshot.get("root_q", 0.0)), 4)
-            rec["sims"] = int(snapshot.get("sims", 0))
-            rec["top"] = [{"uci": move_to_uci(d["move"]),
-                           "visits": d["visits"],
-                           "share": round(d.get("frac", 0.0), 4)}
-                          for d in tops[:5]]
-            # Место сыгранного хода в списке сети — самое полезное поле для
-            # разбора: для ходов человека это прямая мера расхождения с сетью,
-            # для ходов сети — проверка, что игралось действительно первое.
-            rec["rank"] = None
+            rec["q"] = round(float(snapshot.get("root_q", 0.0)), 3)
+            rec["n"] = int(snapshot.get("sims", 0))
+            rec["top"] = [[move_to_uci(d["move"]), round(d.get("frac", 0.0), 3)]
+                          for d in tops[:3]]
             for i, d in enumerate(tops):
                 if d["move"] == m_int:
                     rec["rank"] = i + 1
-                    rec["share_played"] = round(d.get("frac", 0.0), 4)
-                    rec["q_played"] = round(float(d.get("q", 0.0)), 4)
                     break
-        self.data["plies"].append(rec)
+        self.plies.append(rec)
         self.flush()
 
     def finish(self, r):
-        self.data["result"] = ("draw" if abs(r) < 1e-6
+        self.head["result"] = ("draw" if abs(r) < 1e-6
                                else ("white" if r > 0 else "black"))
-        self.data["result_value"] = round(float(r), 3)
         self.flush()
 
-    def flush(self):
-        tmp = self.path + ".tmp"
+    # ---- запись ----
+    @staticmethod
+    def _atomic(path, text):
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, self.path)
+            f.write(text)
+        os.replace(tmp, path)
+
+    def _as_text(self):
+        side = {"play_white": "белые", "play_black": "чёрные"}.get(self.head["mode"], "—")
+        out = [f"Capablanca — {self.head['started']}",
+               f"сеть: {self.head['network']}   ты: {side}   "
+               f"результат: {self.RESULTS.get(self.head['result'], 'не окончена')}",
+               ""]
+        line = []
+        for i, rec in enumerate(self.plies):
+            if i % 2 == 0:
+                line = [f"{i // 2 + 1:>3}. {rec['uci']:<6}"]
+            else:
+                line.append(f"{rec['uci']:<6}")
+                out.append("".join(line))
+                line = []
+        if line:
+            out.append("".join(line))
+        return "\n".join(out) + "\n"
+
+    def _as_json(self):
+        head = json.dumps(self.head, ensure_ascii=False)[1:-1]
+        rows = ",\n  ".join(json.dumps(r, ensure_ascii=False,
+                                       separators=(",", ":")) for r in self.plies)
+        return "{" + head + ",\n \"plies\": [\n  " + rows + "\n ]\n}\n"
+
+    def flush(self):
+        self._atomic(self.txt_path, self._as_text())
+        self._atomic(self.path, self._as_json())
 
 
 # ───────────────────────────── Eval bar ───────────────────────────────────
@@ -1443,7 +1471,11 @@ class NibblerGUI(QMainWindow):
         snapshot = self.snapshots.get(self.cursor)
         if getattr(self, "logger", None) is None:
             self.logger = GameLogger(self.mode, getattr(self, "net_path", None))
-        self.logger.add(self.cursor, by, m, snapshot)
+        try:
+            n_legal = len(self.board.engine.get_legal_moves_int())
+        except Exception:
+            n_legal = None
+        self.logger.add(self.cursor, by, m, snapshot, n_legal)
         del self.history[self.cursor:]
         self.history.append(m)
         self.cursor += 1
@@ -1507,7 +1539,8 @@ class NibblerGUI(QMainWindow):
             lg = getattr(self, "logger", None)
             if lg is not None and lg.data["result"] is None:
                 lg.finish(r)
-                msg += f"  ·  запись партии: games/{os.path.basename(lg.path)}"
+                msg += ("  ·  записано: games/"
+                        f"{os.path.basename(lg.txt_path)} и .json")
             self.statusBar().showMessage(f"Партия окончена — {msg}")
         elif snap is not None:
             self.apply_payload(snap, live=False)        # instant placeholder
