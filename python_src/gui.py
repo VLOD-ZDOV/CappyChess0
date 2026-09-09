@@ -21,6 +21,7 @@ English.
 import math
 import os
 import sys
+import json
 import time
 import traceback
 
@@ -484,6 +485,75 @@ def payload_from_node(root, stm, child_nn=None):
     return {"game_over": False, "moves": moves, "root_q": root.q(),
             "stm": stm, "sims": root.visits, "merges": 0,
             "reused": root.visits, "finished": True}
+
+
+# ──────────────────────────── Game logger ─────────────────────────────────
+
+
+class GameLogger:
+    """Записывает партию ход за ходом вместе с тем, что о позиции думала сеть.
+
+    Пишется в `games/<время>.json` после КАЖДОГО хода, а не в конце: партия,
+    брошенная на середине или прерванная падением, всё равно оставляет
+    пригодный для разбора файл. Запись атомарная — сначала во временный файл,
+    потом переименование, иначе можно поймать половину json."""
+
+    DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games")
+
+    def __init__(self, mode, network):
+        os.makedirs(self.DIR, exist_ok=True)
+        self.path = os.path.join(self.DIR, time.strftime("game_%Y%m%d_%H%M%S.json"))
+        self.data = {
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "mode": mode,
+            "network": os.path.basename(network) if network else None,
+            "result": None,
+            "plies": [],
+        }
+        self._t = time.time()
+
+    def add(self, ply, by, m_int, snapshot):
+        now = time.time()
+        rec = {
+            "ply": ply,
+            "side": "white" if ply % 2 == 0 else "black",
+            "by": by,
+            "uci": move_to_uci(m_int),
+            "seconds": round(now - self._t, 1),
+        }
+        self._t = now
+        if snapshot:
+            tops = snapshot.get("moves") or []
+            rec["root_q"] = round(float(snapshot.get("root_q", 0.0)), 4)
+            rec["sims"] = int(snapshot.get("sims", 0))
+            rec["top"] = [{"uci": move_to_uci(d["move"]),
+                           "visits": d["visits"],
+                           "share": round(d.get("frac", 0.0), 4)}
+                          for d in tops[:5]]
+            # Место сыгранного хода в списке сети — самое полезное поле для
+            # разбора: для ходов человека это прямая мера расхождения с сетью,
+            # для ходов сети — проверка, что игралось действительно первое.
+            rec["rank"] = None
+            for i, d in enumerate(tops):
+                if d["move"] == m_int:
+                    rec["rank"] = i + 1
+                    rec["share_played"] = round(d.get("frac", 0.0), 4)
+                    rec["q_played"] = round(float(d.get("q", 0.0)), 4)
+                    break
+        self.data["plies"].append(rec)
+        self.flush()
+
+    def finish(self, r):
+        self.data["result"] = ("draw" if abs(r) < 1e-6
+                               else ("white" if r > 0 else "black"))
+        self.data["result_value"] = round(float(r), 3)
+        self.flush()
+
+    def flush(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
 
 
 # ───────────────────────────── Eval bar ───────────────────────────────────
@@ -1221,6 +1291,7 @@ class NibblerGUI(QMainWindow):
             # "RAM full and not released".
             self.mcts = OnnxEngine(path, c_puct=1.745, batch_size=96,
                                    nn_cache=True, nn_cache_max=150_000)
+            self.net_path = path
             self.ttable.clear()          # old stats came from the previous net
             dev = "GPU · CUDA" if self.mcts.gpu else "CPU"
             self.statusBar().showMessage(
@@ -1292,6 +1363,7 @@ class NibblerGUI(QMainWindow):
             f"ttable prune: оставили {len(keep):,} узлов, выкинули {dropped:,}")
 
     def new_game(self):
+        self.logger = GameLogger(self.mode, getattr(self, "net_path", None))
         self.history = []
         self.cursor = 0
         self.evals = {}
@@ -1335,7 +1407,13 @@ class NibblerGUI(QMainWindow):
             return
         self.push_move(m)
 
-    def push_move(self, m):
+    def push_move(self, m, by="human"):
+        # Снимок берём ДО инкремента: он относится к позиции, из которой
+        # ход сделан, и ниже по функции всё, что впереди курсора, стирается.
+        snapshot = self.snapshots.get(self.cursor)
+        if getattr(self, "logger", None) is None:
+            self.logger = GameLogger(self.mode, getattr(self, "net_path", None))
+        self.logger.add(self.cursor, by, m, snapshot)
         del self.history[self.cursor:]
         self.history.append(m)
         self.cursor += 1
@@ -1396,6 +1474,10 @@ class NibblerGUI(QMainWindow):
             r = self.board.engine.game_result()
             msg = ("Ничья" if abs(r) < 1e-6
                    else ("Белые выиграли" if r > 0 else "Чёрные выиграли"))
+            lg = getattr(self, "logger", None)
+            if lg is not None and lg.data["result"] is None:
+                lg.finish(r)
+                msg += f"  ·  запись партии: games/{os.path.basename(lg.path)}"
             self.statusBar().showMessage(f"Партия окончена — {msg}")
         elif snap is not None:
             self.apply_payload(snap, live=False)        # instant placeholder
@@ -1507,7 +1589,7 @@ class NibblerGUI(QMainWindow):
         if (payload["finished"] and payload["moves"]
                 and self.cursor == len(self.history)
                 and self.engine_should_move()):
-            self.push_move(payload["moves"][0]["move"])
+            self.push_move(payload["moves"][0]["move"], by="engine")
 
     # ---- analyzed-positions table ----
     def _fill_table_row(self, row, ply):
