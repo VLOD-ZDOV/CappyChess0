@@ -1097,10 +1097,15 @@ class ReplayBuffer:
             self._val_arr[i] = float(self.data[i][2])
 
     def save_npz(self, path: str):
-        """Save the buffer as a numpy archive. ~5-10× faster than pickle on 1M
-        positions and produces a smaller file (float16 storage). The expensive
-        bit is the one-time np.stack across 1M boards; after that np.savez
-        writes contiguous blocks via a single OS write per array.
+        """Save the buffer as a numpy archive (float16 storage).
+
+        Boards are streamed into the archive in chunks rather than stacked in
+        one go. np.stack over the whole buffer cost a transient copy the size
+        of the buffer on every iteration — and more when fresh samples are
+        float32, since the stack is built before the float16 cast — and that
+        allocation once ended in a SIGSEGV inside libc. The file format is
+        unchanged: an uncompressed zip of .npy members, exactly what np.savez
+        writes, so load_npz and np.load read it as before.
 
         Layout: boards (N,planes,H,W) f16, sparse policy packed into a
         rectangular (N, K) pair of (indices, values) with -1 / 0 padding,
@@ -1109,10 +1114,8 @@ class ReplayBuffer:
         rename — a crash mid-write can't leave a half-written buffer."""
         if not self.data:
             return
+        import zipfile
         n = len(self.data)
-        # Stack boards in one shot; numpy iterates through the list internally
-        # — still O(N) but in C, ~10× faster than pickle on the same data.
-        boards = np.stack([s[0] for s in self.data]).astype(np.float16, copy=False)
         # Sparse policy is ragged (one entry per legal move). Pad to the max
         # length seen in this buffer so the result is a single dense array.
         pol_idxs = [s[1][0] for s in self.data]
@@ -1136,13 +1139,33 @@ class ReplayBuffer:
                             dtype=np.float16, count=n)
         meta = np.array([self._ptr, int(self._full)], dtype=np.int64)
 
-        # np.savez auto-appends `.npz` to the path it gets. Pass a base name
-        # without extension and rename the real file to the target path.
-        tmp_base = path + ".tmp"
-        np.savez(tmp_base, boards=boards,
-                 pol_idx=pol_idx_arr, pol_val=pol_val_arr,
-                 values=values, mlhs=mlhs, futures=futures, draws=draws, meta=meta)
-        os.replace(tmp_base + ".npz", path)
+        def member(zf, name, arr):
+            with zf.open(name + ".npy", "w", force_zip64=True) as f:
+                np.lib.format.write_array(f, np.asanyarray(arr), allow_pickle=False)
+
+        CHUNK = 4096          # ~180 MB peak at float32, whatever the buffer size
+        board_shape = np.shape(self.data[0][0])
+        tmp = path + ".tmp"
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED,
+                             allowZip64=True) as zf:
+            with zf.open("boards.npy", "w", force_zip64=True) as f:
+                np.lib.format.write_array_header_1_0(f, {
+                    "descr": np.lib.format.dtype_to_descr(np.dtype(np.float16)),
+                    "fortran_order": False,
+                    "shape": (n,) + tuple(board_shape),
+                })
+                for a in range(0, n, CHUNK):
+                    chunk = np.stack([np.asarray(s[0], dtype=np.float16)
+                                      for s in self.data[a:a + CHUNK]])
+                    f.write(chunk.tobytes())
+            member(zf, "pol_idx", pol_idx_arr)
+            member(zf, "pol_val", pol_val_arr)
+            member(zf, "values", values)
+            member(zf, "mlhs", mlhs)
+            member(zf, "futures", futures)
+            member(zf, "draws", draws)
+            member(zf, "meta", meta)
+        os.replace(tmp, path)
 
     def load_npz(self, path: str):
         """Reverse of save_npz — rebuilds the list-of-tuples representation."""
