@@ -37,5 +37,6 @@ nibbler/
 *.swp
 .DS_Store
 docs/
+experiments/
 python_src/bt5.txt
 
