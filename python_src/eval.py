@@ -85,10 +85,13 @@ def save_pgn(moves: list, result_str: str, pgn_path: str,
 def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str, str, str]:
     """
     Loads a checkpoint, automatically detecting the architecture.
+    `path:ema` loads the EMA shadow instead of the live weights.
     Supports old (scalar value, policy=6880) and new (WDL, policy=7000) formats.
     """
+    from model import split_weights, pick_state_dict
+    path, which = split_weights(path)
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    raw_sd = ckpt["model"] if (isinstance(ckpt, dict) and "model" in ckpt) else ckpt
+    raw_sd = pick_state_dict(ckpt, which)
 
     # Use the canonical helper from model.py — it knows about ALL architecture
     # knobs (channels, res blocks, transformer, heads, mlh, future, AND the
@@ -122,20 +125,29 @@ def load_model(path: str, device: torch.device) -> Tuple[CapablancaNet, str, str
     if "iter" in name:
         num = name.split("iter")[-1].lstrip("0") or "0"
         name = f"iter{num}"
+    if which == "ema":
+        name += "-ema"      # иначе живые и EMA одного чекпоинта неразличимы в таблице
 
     return net, name, arch_tag, describe_arch(net)
 
 
 def collect_checkpoints(paths: List[str], last: int = 0) -> List[str]:
     """Collects .pth files from a list of paths/directories."""
+    from model import split_weights
     result = []
     for p in paths:
-        if os.path.isdir(p):
+        # Суффикс `:ema` отделяем ДО проверки файла и возвращаем после: иначе
+        # `x.pth:ema` не проходит ни isfile, ни endswith(".pth") и молча
+        # выпадает из турнира. Для каталога суффикс применяется ко всем файлам.
+        base, _ = split_weights(p)
+        tag = p[len(base):]
+        if os.path.isdir(base):
             found = sorted(
-                [os.path.join(p, f) for f in os.listdir(p) if f.endswith(".pth")]
+                [os.path.join(base, f) + tag for f in os.listdir(base)
+                 if f.endswith(".pth")]
             )
             result.extend(found)
-        elif os.path.isfile(p) and p.endswith(".pth"):
+        elif os.path.isfile(base) and base.endswith(".pth"):
             result.append(p)
         else:
             print(f"⚠️  Пропускаю: {p}")

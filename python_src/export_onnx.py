@@ -47,8 +47,11 @@ def export(src, dst, log=print):
 
     Split out of main() so the GUI can accept a .pth directly instead of
     making the user run this script by hand first."""
+    from model import split_weights, pick_state_dict
+    src, which = split_weights(src)
     ckpt = torch.load(src, map_location="cpu", weights_only=False)
-    raw = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    raw = pick_state_dict(ckpt, which)
+    log(f"Веса: {which}")
 
     # Use the canonical helper — it recovers ALL architecture knobs including
     # the BT5 trim (qkv_bias / use_rmsnorm / piece_embed_dim). The inline
@@ -99,7 +102,7 @@ def export(src, dst, log=print):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python export_onnx.py <checkpoint.pth> [output.onnx]")
+        print("Usage: python export_onnx.py <checkpoint.pth[:ema]> [output.onnx]")
         sys.exit(1)
     export(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "capablanca.onnx")
 

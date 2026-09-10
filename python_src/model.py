@@ -948,3 +948,30 @@ def build_net_from_state_dict(raw_sd: dict):
             f"on shape/key mismatch — these stay default-initialised. "
             f"First few: {weighty[:5]}", stacklevel=2)
     return net, kept
+
+
+def split_weights(path):
+    """`ckpt.pth:ema` → (`ckpt.pth`, "ema"); без суффикса — живые веса.
+
+    Суффикс, а не флаг: так в одном матче можно свести живые и EMA-веса ОДНОГО
+    чекпоинта. Проверка через endswith, поэтому двоеточие в пути Windows
+    (`C:\\…`) не мешает."""
+    for which in ("ema", "model"):
+        if path.endswith(":" + which):
+            return path[: -len(which) - 1], which
+    return path, "model"
+
+
+def pick_state_dict(ckpt, which="model"):
+    """Словарь весов из чекпоинта: живые (`model`) или тень EMA (`ema`).
+
+    Все замеры и релиз 6.0 делались на живых весах, хотя self-play с iter10
+    играет EMA. Явный выбор нужен, чтобы сравнивать их, а не путать."""
+    if not isinstance(ckpt, dict) or ("model" not in ckpt and "ema" not in ckpt):
+        if which == "ema":
+            raise ValueError("в чекпоинте нет EMA — это голый state_dict")
+        return ckpt
+    if which not in ckpt:
+        raise ValueError(f"в чекпоинте нет ключа {which!r}; есть: "
+                         f"{[k for k in ('model', 'ema') if k in ckpt]}")
+    return ckpt[which]
