@@ -8,10 +8,21 @@
 Замер 2026-09-09 на прогоне v6 (он потерял 198 Elo за 30 итераций):
     старые 0.163 / свежие 0.891 — разрыв 5.5x
     configA, не видевшая ни одной позиции: 0.708 / 0.836 — разрыва нет
+
+Две ошибки первой версии, найденные 2026-09-10 — выводы по v7 из-за них
+недействительны:
+  * Буфер кольцевой. Когда он заполнен, новая позиция пишется поверх самой
+    старой по указателю, и физическая строка 0 уже не самая старая. Первая
+    версия брала первые и последние строки файла, то есть на заполненном
+    буфере сравнивала два произвольных куска. Порядок по возрасту теперь
+    восстанавливается из meta = [ptr, full]: самая старая строка — ptr.
+  * Веса брались `ema or model`, тогда как eval.py мерит живые. На v7 тень
+    почти не отличалась от стартовой сети, и «разрыв 1.0x» был гарантирован.
+    Теперь по умолчанию живые веса, тень — суффиксом `путь.pth:ema`.
 """
 import argparse, sys
 import numpy as np, torch, torch.nn.functional as F
-from model import build_net_from_state_dict, CapablancaNet
+from model import build_net_from_state_dict, CapablancaNet, split_weights, pick_state_dict
 from train import unpack_policy, value_draw_to_wdl
 
 
@@ -24,9 +35,23 @@ def slice_rows(d, rows):
     return torch.from_numpy(b), torch.from_numpy(pol), torch.from_numpy(wdl)
 
 
+def age_order(d):
+    """Индексы строк буфера от самой старой к самой свежей.
+
+    push() пишет в data[ptr] и сдвигает ptr; пока буфер не заполнен, это
+    обычное дописывание в конец. После заполнения data[ptr] — самая старая
+    позиция (следующая на перезапись), data[ptr-1] — самая свежая."""
+    n = d["values"].shape[0]
+    ptr, full = (int(x) for x in d["meta"][:2])
+    if not full:
+        return np.arange(n), "не заполнен, порядок естественный"
+    return np.roll(np.arange(n), -(ptr % n)), f"кольцо, старейшая строка {ptr % n:,}"
+
+
 def load(path, dev):
+    path, which = split_weights(path)
     raw = torch.load(path, map_location="cpu", weights_only=False)
-    w = raw.get("ema") or raw.get("model") or raw
+    w = pick_state_dict(raw, which)
     net, sd = build_net_from_state_dict(w)
     res = net.load_state_dict(sd, strict=False)
     if res.missing_keys or res.unexpected_keys:
@@ -60,17 +85,19 @@ def main():
     d = np.load(a.buffer)
     n = d["values"].shape[0]
     N = min(a.n, n // 3)
-    old = slice_rows(d, np.arange(N))
-    new = slice_rows(d, np.arange(n - N, n))
+    order, how = age_order(d)
+    old = slice_rows(d, order[:N])
+    new = slice_rows(d, order[-N:])
 
-    print(f"{n:,} позиций в буфере, по {N} с каждого края\n")
+    print(f"{n:,} позиций в буфере ({how}), по {N} самых старых и самых свежих\n")
     print(f"{'чекпоинт':<28} {'policy старые':>13} {'свежие':>8} "
           f"{'value старые':>13} {'свежие':>8} {'разрыв':>7}")
     for p in a.checkpoints:
         net = load(p, dev)
         po, vo = losses(net, old, dev)
         pn, vn = losses(net, new, dev)
-        print(f"{p.split('/')[-1]:<28} {po:>13.3f} {pn:>8.3f} "
+        label = p.split("/")[-1] + ("" if p.endswith(":ema") else ":live")
+        print(f"{label:<28} {po:>13.3f} {pn:>8.3f} "
               f"{vo:>13.3f} {vn:>8.3f} {vn / max(vo, 1e-6):>6.1f}x")
         del net
         torch.cuda.empty_cache()
