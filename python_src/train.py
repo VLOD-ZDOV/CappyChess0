@@ -769,7 +769,14 @@ class Config:
 
     # EMA of model weights (AlphaZero self-play stabilization)
     use_ema: bool = True
-    ema_decay: float = 0.9999  # per-step: window ~10K steps ≈ 10 iterations (LC0 selfplay)
+    # Распад EMA задаётся НА ШАГ обучения, а осмысленная величина — окно в
+    # ИТЕРАЦИЯХ. Фиксированный 0.9999 давал окно ~10 итераций только при
+    # ~1000 шагах на итерацию; при 40 шагах окно растягивалось до 250 итераций,
+    # и self-play 20 итераций подряд играла почти стартовая сеть (замерено на
+    # v7: к iter30 EMA ушла от старта на 7% того, куда ушли живые веса).
+    # 0 = вывести из ema_window_iters и числа шагов; >0 = задать явно.
+    ema_decay: float = 0.0
+    ema_window_iters: float = 10.0
     # EMA not applied to self-play before this iteration: early EMA weights = average of
     # random weights → worse than live NN. Always updated, only used from ema_start_iter.
     ema_start_iter: int = 10
@@ -1795,6 +1802,12 @@ def train(cfg: Config = None):
     if not torch.cuda.is_available():
         print("⚠️  CUDA не найдена, используется CPU — будет медленно")
 
+    if cfg.use_ema and cfg.ema_decay <= 0:
+        steps = max(cfg.min_train_steps, cfg.train_steps)
+        cfg.ema_decay = 1.0 - 1.0 / (cfg.ema_window_iters * steps)
+        print(f"   EMA: окно {cfg.ema_window_iters:g} итераций × {steps} шагов "
+              f"→ decay={cfg.ema_decay:.5f}")
+
     print(f"🚀 Тренировка на {device}")
     print(f"   Модель:        {cfg.num_channels}ch × {cfg.num_res_blocks} blocks")
     print(f"   Self-play:     {cfg.games_per_iter} игр/итер, {cfg.simulations} симуляций/ход")
@@ -2498,9 +2511,13 @@ if __name__ == "__main__":
     parser.add_argument("--collapse-threshold",  type=float, default=0.01)
     parser.add_argument("--no-ema",              dest="use_ema", action="store_false",
                         default=True, help="Отключить EMA для self-play (по умолчанию включён)")
-    parser.add_argument("--ema-decay",           type=float, default=0.9999,
-                        help="EMA decay coefficient (default: 0.9999, per-step). "
-                             "0.9999 = окно ~10K шагов ≈ 10 итераций (LC0 selfplay-style).")
+    parser.add_argument("--ema-decay",           type=float, default=0.0,
+                        help="Распад EMA на шаг. По умолчанию 0 — вывести из "
+                             "--ema-window-iters и --train-steps, чтобы окно не "
+                             "зависело от числа шагов на итерацию.")
+    parser.add_argument("--ema-window-iters",    type=float, default=10.0,
+                        help="Окно EMA в итерациях (default: 10). "
+                             "decay = 1 - 1/(окно × train_steps).")
     parser.add_argument("--ema-start-iter",      type=int,   default=10,
                         help="Не использовать EMA для self-play до этой итерации (default: 10)")
     parser.add_argument("--reset-ema",            action="store_true",
@@ -2649,6 +2666,7 @@ if __name__ == "__main__":
         collapse_threshold=args.collapse_threshold,
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,
+        ema_window_iters=args.ema_window_iters,
         ema_start_iter=args.ema_start_iter,
         contempt=args.contempt,
         fsf_path=args.fsf_path,
