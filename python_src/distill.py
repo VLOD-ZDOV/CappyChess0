@@ -114,8 +114,9 @@ def main():
         c, s = warm_start(student, tsd)
     print(f"тёплый старт: перенесено {c} тензоров, заново {s}")
 
-    z = np.load(a.buffer, mmap_mode="r")
-    boards = z["boards"]
+    # mmap_mode на .npz NumPy молча игнорирует — поле всегда читалось целиком.
+    import buffer_io
+    boards = buffer_io.read_field(a.buffer, "boards")
     n = len(boards) if a.positions <= 0 else min(a.positions, len(boards))
     print(f"позиций: {n:,} из {a.buffer}")
 

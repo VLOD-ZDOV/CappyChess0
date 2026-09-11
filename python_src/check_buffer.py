@@ -14,9 +14,9 @@ import numpy as np
 
 
 def load_values(path: str) -> np.ndarray:
-    if path.endswith(".npz"):
-        with np.load(path) as z:
-            return z["values"].astype(np.float32)
+    if not path.endswith(".pkl"):
+        import buffer_io
+        return buffer_io.read_field(path, "values").astype(np.float32)
     with open(path, "rb") as f:
         data, _ptr, _full = pickle.load(f)
     return np.array([s[2] for s in data], dtype=np.float32)
@@ -28,7 +28,10 @@ def main() -> None:
         legacy = path[:-4] + ".pkl"
         if os.path.exists(legacy):
             path = legacy
-    if not os.path.exists(path):
+    # После перевода на куски buffer.npz переименован — буфер тогда в
+    # соседнем buffer_chunks/, и это не «не найден».
+    chunks = os.path.join(os.path.dirname(path) or ".", "buffer_chunks")
+    if not os.path.exists(path) and not os.path.isdir(chunks):
         print(f"❌ Буфер не найден: {path}")
         sys.exit(1)
 

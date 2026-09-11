@@ -9,10 +9,13 @@
 # does not read argparse state.
 
 import os
+import shutil
 import time
 import pickle
 import subprocess
 import numpy as np
+
+import buffer_io
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1097,103 +1100,17 @@ class ReplayBuffer:
             self._val_arr[i] = float(self.data[i][2])
 
     def save_npz(self, path: str):
-        """Save the buffer as a numpy archive (float16 storage).
-
-        Boards are streamed into the archive in chunks rather than stacked in
-        one go. np.stack over the whole buffer cost a transient copy the size
-        of the buffer on every iteration — and more when fresh samples are
-        float32, since the stack is built before the float16 cast — and that
-        allocation once ended in a SIGSEGV inside libc. The file format is
-        unchanged: an uncompressed zip of .npy members, exactly what np.savez
-        writes, so load_npz and np.load read it as before.
-
-        Layout: boards (N,planes,H,W) f16, sparse policy packed into a
-        rectangular (N, K) pair of (indices, values) with -1 / 0 padding,
-        plus three scalar arrays for value / mlh / future_idx and a tiny
-        meta vector with [ptr, full]. Saved atomically via a .tmp file
-        rename — a crash mid-write can't leave a half-written buffer."""
-        if not self.data:
-            return
-        import zipfile
-        n = len(self.data)
-        # Sparse policy is ragged (one entry per legal move). Pad to the max
-        # length seen in this buffer so the result is a single dense array.
-        pol_idxs = [s[1][0] for s in self.data]
-        pol_vals = [s[1][1] for s in self.data]
-        max_k = max((len(x) for x in pol_idxs), default=0)
-        pol_idx_arr = np.full((n, max_k), -1, dtype=np.int16)
-        pol_val_arr = np.zeros((n, max_k), dtype=np.float16)
-        for i, (idxs, vals) in enumerate(zip(pol_idxs, pol_vals)):
-            k = len(idxs)
-            if k:
-                pol_idx_arr[i, :k] = idxs
-                pol_val_arr[i, :k] = vals
-        values  = np.fromiter((float(s[2]) for s in self.data),
-                              dtype=np.float16, count=n)
-        mlhs    = np.fromiter((float(s[3]) if len(s) > 3 else 0.0 for s in self.data),
-                              dtype=np.float16, count=n)
-        futures = np.fromiter((int(s[4]) if len(s) > 4 else -1 for s in self.data),
-                              dtype=np.int32, count=n)
-        # Full-WDL Q-blend draw target (-1 = none → reconstruct from value).
-        draws = np.fromiter((float(s[5]) if len(s) > 5 else -1.0 for s in self.data),
-                            dtype=np.float16, count=n)
-        meta = np.array([self._ptr, int(self._full)], dtype=np.int64)
-
-        def member(zf, name, arr):
-            with zf.open(name + ".npy", "w", force_zip64=True) as f:
-                np.lib.format.write_array(f, np.asanyarray(arr), allow_pickle=False)
-
-        CHUNK = 4096          # ~180 MB peak at float32, whatever the buffer size
-        board_shape = np.shape(self.data[0][0])
-        tmp = path + ".tmp"
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED,
-                             allowZip64=True) as zf:
-            with zf.open("boards.npy", "w", force_zip64=True) as f:
-                np.lib.format.write_array_header_1_0(f, {
-                    "descr": np.lib.format.dtype_to_descr(np.dtype(np.float16)),
-                    "fortran_order": False,
-                    "shape": (n,) + tuple(board_shape),
-                })
-                for a in range(0, n, CHUNK):
-                    chunk = np.stack([np.asarray(s[0], dtype=np.float16)
-                                      for s in self.data[a:a + CHUNK]])
-                    f.write(chunk.tobytes())
-            member(zf, "pol_idx", pol_idx_arr)
-            member(zf, "pol_val", pol_val_arr)
-            member(zf, "values", values)
-            member(zf, "mlhs", mlhs)
-            member(zf, "futures", futures)
-            member(zf, "draws", draws)
-            member(zf, "meta", meta)
-        os.replace(tmp, path)
+        """Whole buffer as one archive, ring in physical order with meta
+        [ptr, full]. Training writes per-iteration chunks instead (see
+        buffer_io); this stays for tools and one-off exports."""
+        buffer_io.write_samples(path, self.data, [self._ptr, int(self._full)])
 
     def load_npz(self, path: str):
         """Reverse of save_npz — rebuilds the list-of-tuples representation."""
-        z = np.load(path)
-        boards   = z["boards"]
-        pol_idx  = z["pol_idx"]
-        pol_val  = z["pol_val"]
-        values   = z["values"]
-        mlhs     = z["mlhs"]
-        futures  = z["futures"]
-        # draws: optional (added for full-WDL Q-blend). Old buffers lack it → -1.
-        draws    = z["draws"] if "draws" in z.files else None
-        meta     = z["meta"]
-        saved_ptr, saved_full = int(meta[0]), bool(meta[1])
-        n = boards.shape[0]
-        self.data = []
-        for i in range(n):
-            mask = pol_idx[i] >= 0
-            sp_idx = pol_idx[i][mask].astype(np.int16, copy=False)
-            sp_val = pol_val[i][mask].astype(np.float16, copy=False)
-            self.data.append((
-                boards[i],
-                (sp_idx, sp_val),
-                float(values[i]),
-                float(mlhs[i]),
-                int(futures[i]),
-                float(draws[i]) if draws is not None else -1.0,
-            ))
+        a = buffer_io.read_archive(path)
+        saved_ptr, saved_full = int(a["meta"][0]), bool(a["meta"][1])
+        n = a["boards"].shape[0]
+        self.data = buffer_io.arrays_to_samples(a)
         # Файл хранит кольцо в физическом порядке: у заполненного буфера самая
         # старая позиция — на сохранённом ptr. Разворачиваем в порядок по
         # возрасту и решаем, заполнен ли буфер, по ТЕКУЩЕМУ max_size, а не по
@@ -1207,6 +1124,11 @@ class ReplayBuffer:
         self._full = len(self.data) >= self.max_size
         self._ptr = len(self.data) % self.max_size
         self.rebuild_val_arr()
+
+    def load_chunks(self, d: str):
+        """Push every chunk oldest first; the ring keeps the newest max_size."""
+        for _, path in buffer_io.list_chunks(d):
+            self.push(buffer_io.arrays_to_samples(buffer_io.read_archive(path)))
 
     def sample(self, batch_size: int) -> List[Sample]:
         n = len(self.data)
@@ -1965,8 +1887,19 @@ def train(cfg: Config = None):
     # no npz exists. Old .pkl files are migrated implicitly on the next save.
     buffer_path     = os.path.join(cfg.checkpoint_dir, "buffer.npz")
     buffer_path_pkl = os.path.join(cfg.checkpoint_dir, "buffer.pkl")
+    chunks_dir = buffer_io.chunk_dir(cfg.checkpoint_dir)
     load_path = buffer_path if os.path.exists(buffer_path) else (
         buffer_path_pkl if os.path.exists(buffer_path_pkl) else None)
+    if buffer_io.list_chunks(chunks_dir):
+        t_load = time.time()
+        buffer.load_chunks(chunks_dir)
+        print(f"📦 Загружен буфер: {len(buffer):,} позиций "
+              f"({len(buffer_io.list_chunks(chunks_dir))} кусков, "
+              f"{time.time() - t_load:.1f}s)\n")
+        if load_path:
+            print(f"   ⚠️  рядом лежит {os.path.basename(load_path)} — не читается, "
+                  f"куски главнее\n")
+        load_path = None
     if load_path:
         try:
             t_load = time.time()
@@ -1992,6 +1925,16 @@ def train(cfg: Config = None):
             kind = "npz" if load_path.endswith(".npz") else "pkl (legacy)"
             print(f"📦 Загружен буфер: {len(buffer):,} позиций "
                   f"({kind}, {elapsed:.1f}s)\n")
+            # Перевод в куски: весь загруженный буфер (он уже в порядке по
+            # возрасту) — одним базовым куском, который сортируется раньше
+            # любой итерации, включая итерацию 0 прогона без чекпоинта.
+            # Старый архив переименовывается, а не удаляется: так его никто не
+            # прочитает как текущий буфер, но данные целы.
+            if buffer.data and buffer_io.write_chunk(chunks_dir, 0, list(buffer.data),
+                                                     base=True):
+                os.replace(load_path, load_path + ".migrated")
+                print(f"   → переведён в куски: {chunks_dir}/iter_000000_base.npz; "
+                      f"старый файл — {os.path.basename(load_path)}.migrated\n")
         except Exception as e:
             print(f"⚠️  Не удалось загрузить буфер: {e}\n")
 
@@ -2271,6 +2214,17 @@ def train(cfg: Config = None):
         if use_ema_now:
             (net._orig_mod if hasattr(net, '_orig_mod') else net).load_state_dict(saved_state, strict=False)
         buffer.push(samples)
+        # Только новые позиции итерации, ~145 МБ на ~6.5k позиций, — а не весь
+        # буфер: 4.5 ГБ на 200k и 22 ГБ на 1M каждую итерацию (так делает lc0).
+        try:
+            t_save = time.time()
+            if buffer_io.write_chunk(chunks_dir, iteration, samples):
+                gone = buffer_io.evict(chunks_dir, buffer.max_size)
+                print(f"  💾 Кусок буфера iter {iteration}: {len(samples):,} позиций, "
+                      f"{time.time() - t_save:.1f}s"
+                      + (f", удалено старых кусков: {gone}" if gone else ""))
+        except Exception as e:
+            print(f"  ⚠️  Не удалось записать кусок буфера: {e}")
 
         sp_time = time.time() - sp_start
         print(f"  ✅ {len(samples):,} позиций за {sp_time:.1f}s "
@@ -2369,18 +2323,6 @@ def train(cfg: Config = None):
                 torch.save(ckpt_data, path)
                 print(f"  💾 {os.path.basename(path)}")
 
-            try:
-                t_save = time.time()
-                buffer.save_npz(buffer_path)
-                # Drop the legacy pickle file if it's still around — saves disk
-                # and removes ambiguity on the next load.
-                if os.path.exists(buffer_path_pkl):
-                    try: os.remove(buffer_path_pkl)
-                    except OSError: pass
-                print(f"  💾 Буфер сохранён ({len(buffer):,} позиций, "
-                      f"{time.time() - t_save:.1f}s)\n")
-            except Exception as e:
-                print(f"  ⚠️  Не удалось сохранить буфер: {e}\n")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -2635,6 +2577,8 @@ if __name__ == "__main__":
             p = os.path.join(args.checkpoint_dir, fname)
             if os.path.exists(p):
                 os.remove(p)
+        # Иначе куски молча вернутся при следующем старте.
+        shutil.rmtree(buffer_io.chunk_dir(args.checkpoint_dir), ignore_errors=True)
         print("🗑️  Буфер сброшен\n")
 
     cfg = Config(

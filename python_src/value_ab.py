@@ -89,8 +89,8 @@ def main():
     dev = torch.device("cuda")
 
     t0 = time.time()
-    z = np.load(a.buffer)
-    D = {k: z[k] for k in z.files}          # один раз в память: NpzFile читает поле заново при каждом обращении
+    import buffer_io
+    D = buffer_io.load_arrays(a.buffer)     # файл или каталог кусков, поля уже в памяти
     order, how = age_order(D)
     hold, train_rows = order[-a.holdout:], order[:-a.holdout]
     rng = np.random.default_rng(a.seed)

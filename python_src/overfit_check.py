@@ -22,6 +22,7 @@
 """
 import argparse, sys
 import numpy as np, torch, torch.nn.functional as F
+import buffer_io
 from model import build_net_from_state_dict, CapablancaNet, split_weights, pick_state_dict
 from train import unpack_policy, value_draw_to_wdl
 
@@ -82,7 +83,7 @@ def main():
     a = ap.parse_args()
 
     dev = "cuda"
-    d = np.load(a.buffer)
+    d = buffer_io.load_arrays(a.buffer)   # файл или каталог кусков
     n = d["values"].shape[0]
     N = min(a.n, n // 3)
     order, how = age_order(d)
