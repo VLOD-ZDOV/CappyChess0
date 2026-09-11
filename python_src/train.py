@@ -1179,8 +1179,7 @@ class ReplayBuffer:
         # draws: optional (added for full-WDL Q-blend). Old buffers lack it → -1.
         draws    = z["draws"] if "draws" in z.files else None
         meta     = z["meta"]
-        self._ptr  = int(meta[0]) % self.max_size
-        self._full = bool(meta[1])
+        saved_ptr, saved_full = int(meta[0]), bool(meta[1])
         n = boards.shape[0]
         self.data = []
         for i in range(n):
@@ -1195,6 +1194,18 @@ class ReplayBuffer:
                 int(futures[i]),
                 float(draws[i]) if draws is not None else -1.0,
             ))
+        # Файл хранит кольцо в физическом порядке: у заполненного буфера самая
+        # старая позиция — на сохранённом ptr. Разворачиваем в порядок по
+        # возрасту и решаем, заполнен ли буфер, по ТЕКУЩЕМУ max_size, а не по
+        # флагу из файла. Раньше full и ptr брались из файла как есть, и
+        # продолжение заполненного буфера на 200k с --buffer-max побольше
+        # не росло, а перезаписывало старое по кругу и падало с IndexError,
+        # как только ptr доходил до конца списка (~7 итераций).
+        if saved_full and n:
+            k = saved_ptr % n
+            self.data = self.data[k:] + self.data[:k]
+        self._full = len(self.data) >= self.max_size
+        self._ptr = len(self.data) % self.max_size
         self.rebuild_val_arr()
 
     def sample(self, batch_size: int) -> List[Sample]:
