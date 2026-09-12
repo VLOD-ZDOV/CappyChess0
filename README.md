@@ -167,12 +167,29 @@ python -u train.py \
     --transformer-blocks 10 --transformer-heads 8 --ffn-mult 4 \
     --swiglu --qk-norm --rmsnorm --no-qkv-bias \
     --restricted-policy --abs-pos-embed --wide-value --no-future \
-    --games 256 --mcts-batch 128 --mcts-parallel-sims 8 \
+    --games 384 --mcts-batch 128 --mcts-parallel-sims 8 \
     --simulations 400 --fast-simulations 100 \
     --batch-size 512 --train-steps 40 \
-    --buffer-max 200000 --lr 2e-4 \
-    --save-every 5 --checkpoint-dir checkpoints
+    --buffer-max 1000000 --lr 2e-4 \
+    --value-q-weight 0.25 --no-value-balance \
+    --save-every 10 --latest-dir /tmp --checkpoint-dir checkpoints
 ```
+
+Three of those flags are what the strongest run here used, and each was measured
+on its own:
+
+- **`--value-q-weight 0.25`** mixes the search's own evaluation of a position
+  into its value target instead of using the game result alone. All ~28
+  positions of a game otherwise share one label, which the network memorises.
+- **`--no-value-balance`** samples the buffer uniformly, as Leela does. The
+  default rebalances to a third wins / a third draws / a third losses, which
+  shows a drawn position about ten times per buffer lifetime against roughly
+  twice for a decided one, and teaches the WDL head 33% draws where reality is
+  closer to 10%.
+- **`--latest-dir`** keeps `latest.pth` in a RAM directory. It is ~440 MB
+  rewritten every iteration — most of a run's disk traffic. Disk still gets the
+  numbered archives and a copy on Ctrl+C or `kill`, so a stopped run resumes
+  from exactly where it was.
 
 On Windows drop the backslashes and put it on one line, or use a backtick `` ` ``
 for line continuation.
@@ -186,10 +203,12 @@ Three settings wreck training *quietly* — no crash, just a weaker network:
   **Keep that ratio at 12 or above.**
 - **`--train-steps` against `--games`** — the ratio
   `train_steps × batch_size / new_positions_per_iteration` is how many times
-  the gradient walks over each position. Around **5 is healthy**; at 38 the
-  network memorises the replay buffer instead of learning chess, and loses
-  strength while its training loss falls towards zero. Leela keeps this
-  between 1 and 4.
+  the gradient walks over each position. Aim for **3 to 4**, where Leela keeps
+  it; at 38 the network memorises the replay buffer instead of learning chess,
+  and loses strength while its training loss falls towards zero. Watch the
+  ratio over a long run: as the network improves its games get shorter, so the
+  same `--games` yields fewer positions and the ratio creeps up — raise
+  `--games` to bring it back.
 - **Architecture flags must match exactly when resuming.** The network is
   rebuilt from the flags and weights are loaded with `strict=False`, so a
   mismatch does not raise — it silently drops tensors.
@@ -285,7 +304,8 @@ One training iteration is a closed loop:
    target*; the game result (mixed with bootstrap values) becomes the
    *value target*.
 2. **Replay buffer.** Positions from recent iterations are kept in a FIFO
-   buffer and sampled with win/draw/loss balancing.
+   buffer. Sampling rebalances wins, draws and losses to a third each by
+   default; `--no-value-balance` draws uniformly instead, the way Leela does.
 3. **Training.** The network is trained to predict the search policy, the game
    outcome, the moves-left estimate, and the future move — a multi-task loss.
 4. **Repeat.** The improved network feeds the next round of self-play.
