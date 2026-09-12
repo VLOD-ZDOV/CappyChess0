@@ -8,8 +8,10 @@
 # Everything the loop needs lives in `Config`; `train(cfg)` is importable and
 # does not read argparse state.
 
+import hashlib
 import os
 import shutil
+import signal
 import time
 import pickle
 import subprocess
@@ -756,6 +758,13 @@ class Config:
     # Needed for controlled experiments: two arms must do the SAME number of
     # iterations, not the same wall-clock time.
     max_iters: int = 0
+    # latest.pth (~440 MB a write, most of a run's disk traffic) can live only
+    # in a RAM directory such as /tmp. Disk then gets the numbered checkpoints
+    # (save_every) plus a copy of latest.pth on SIGTERM/SIGINT and at the end
+    # of the run. Resume takes whichever is newest: a crashed process leaves
+    # the RAM copy, a crashed machine loses at most save_every iterations.
+    # None = write latest.pth to checkpoint_dir every iteration.
+    latest_dir: Optional[str] = None
     # Seed for torch/numpy. -1 = leave both alone (previous behaviour). Set it
     # for ablations: otherwise arms differ by weight init and self-play RNG on
     # top of the thing you are actually measuring.
@@ -1742,6 +1751,28 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
+def _save_atomic(obj, path):
+    """torch.save through a temp file: a crash mid-write keeps the old file."""
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def _copy_atomic(src, dst, suffix=".tmp"):
+    tmp = dst + suffix
+    shutil.copyfile(src, tmp)
+    os.replace(tmp, dst)
+
+
+def _ram_latest_path(cfg):
+    """This run's latest.pth inside cfg.latest_dir. The directory is shared by
+    every run on the machine, so the name carries the checkpoint directory."""
+    ckdir = os.path.abspath(cfg.checkpoint_dir)
+    tag = hashlib.sha1(ckdir.encode()).hexdigest()[:8]
+    return os.path.join(cfg.latest_dir,
+                        f"{os.path.basename(ckdir)}-{tag}-latest.pth")
+
+
 def train(cfg: Config = None):
     if cfg is None:
         cfg = Config()
@@ -1938,11 +1969,44 @@ def train(cfg: Config = None):
         except Exception as e:
             print(f"⚠️  Не удалось загрузить буфер: {e}\n")
 
+    disk_latest = os.path.join(cfg.checkpoint_dir, "latest.pth")
+    ram_latest = None
+    if cfg.latest_dir:
+        os.makedirs(cfg.latest_dir, exist_ok=True)
+        ram_latest = _ram_latest_path(cfg)
+        main_pid = os.getpid()
+
+        def _flush_latest_and_exit(signum, frame):
+            # Forked helpers inherit the handler; only the trainer copies.
+            if os.getpid() == main_pid and os.path.exists(ram_latest):
+                _copy_atomic(ram_latest, disk_latest, ".signal.tmp")
+                print(f"\n  💾 {signal.Signals(signum).name}: latest.pth "
+                      f"перенесён на диск", flush=True)
+            os._exit(128 + signum)
+        signal.signal(signal.SIGTERM, _flush_latest_and_exit)
+        signal.signal(signal.SIGINT, _flush_latest_and_exit)
+
     start_iter = 0
     ckpts = sorted([f for f in os.listdir(cfg.checkpoint_dir) if f.endswith(".pth")])
     # Prefer latest.pth (saved every iteration)
-    _latest = os.path.join(cfg.checkpoint_dir, "latest.pth")
+    _latest = disk_latest
     ckpts = [f for f in ckpts if not f.startswith("latest")]
+    if ram_latest:
+        # latest.pth lives in RAM and reaches disk only on a clean stop, so
+        # take whatever was written last: the RAM copy, the disk copy, or the
+        # newest numbered checkpoint. A RAM copy with nothing on disk belongs
+        # to a run whose directory has since been deleted — ignore it.
+        archives = [f for f in ckpts if f.startswith("model_iter")]
+        found = [p for p in [disk_latest] + [os.path.join(cfg.checkpoint_dir, f)
+                                             for f in archives[-1:]]
+                 if os.path.exists(p)]
+        if found and os.path.exists(ram_latest):
+            found.append(ram_latest)
+        elif os.path.exists(ram_latest):
+            print(f"⚠️  {ram_latest} есть, но в {cfg.checkpoint_dir} нет ни одного "
+                  f"чекпоинта — считаю его чужим и начинаю с нуля\n")
+        if found:
+            _latest = max(found, key=os.path.getmtime)
     if os.path.exists(_latest) or ckpts:
         path = _latest if os.path.exists(_latest) else os.path.join(cfg.checkpoint_dir, ckpts[-1])
         ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -2012,6 +2076,12 @@ def train(cfg: Config = None):
                     print("✅ EMA загружен")
                 except Exception as e:
                     print(f"⚠️  EMA не загружен: {e}")
+        elif ema is not None:
+            # No shadow in the checkpoint. ModelEMA was built before the weights
+            # were loaded, so it still holds the random init — and self-play
+            # plays with the shadow.
+            ema = ModelEMA(net, decay=cfg.ema_decay)
+            print("🔄 В чекпоинте нет EMA — тень взята с загруженных весов")
         start_iter = ckpt.get("iteration", 0) + 1
         print(f"📂 Загружен чекпоинт: {path} (итерация {start_iter})")
         if cfg.curriculum_mode:
@@ -2311,17 +2381,20 @@ def train(cfg: Config = None):
             }
             if ema is not None:
                 ckpt_data["ema"] = ema.state_dict()
-            # latest.pth — overwritten each iteration
-            # On crash/stop there is always the latest state
-            latest_path = os.path.join(cfg.checkpoint_dir, "latest.pth")
-            torch.save(ckpt_data, latest_path)
-            print(f"  💾 latest.pth (iter {iteration})")
+            # latest.pth — the resume point, overwritten each iteration.
+            _save_atomic(ckpt_data, ram_latest or disk_latest)
+            print(f"  💾 latest.pth (iter {iteration})"
+                  + (f" → {cfg.latest_dir}" if ram_latest else ""))
 
             # Numbered archive checkpoint every save_every iterations
             if iteration % cfg.save_every == 0:
                 path = os.path.join(cfg.checkpoint_dir, f"model_iter{iteration:05d}.pth")
-                torch.save(ckpt_data, path)
+                _save_atomic(ckpt_data, path)
                 print(f"  💾 {os.path.basename(path)}")
+
+    if ram_latest and os.path.exists(ram_latest):
+        _copy_atomic(ram_latest, disk_latest)
+        print(f"  💾 latest.pth перенесён на диск (конец прогона)")
 
 
 
@@ -2443,6 +2516,10 @@ if __name__ == "__main__":
     parser.add_argument("--device",              type=str,   default="cuda")
     parser.add_argument("--checkpoint-dir",      type=str,   default="checkpoints")
     parser.add_argument("--save-every",          type=int,   default=5)
+    parser.add_argument("--latest-dir",          type=str,   default=None,
+                        help="Каталог в памяти (например /tmp) для latest.pth: на диск "
+                             "идут только чекпоинты --save-every и копия latest.pth "
+                             "при остановке (SIGTERM/Ctrl+C) и в конце прогона")
     parser.add_argument("--seed",                type=int,   default=-1,
                         help="Сид torch/numpy (-1 = не трогать). Нужен для абляций.")
     parser.add_argument("--max-iters",           type=int,   default=0,
@@ -2610,6 +2687,7 @@ if __name__ == "__main__":
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
         save_every=args.save_every,
+        latest_dir=args.latest_dir,
         log_every=args.log_every,
         max_iters=args.max_iters,
         seed=args.seed,
