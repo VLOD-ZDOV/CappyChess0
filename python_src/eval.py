@@ -207,6 +207,12 @@ def play_batch(
     tree_w = mcts_w.new_tree(engines)
     tree_b = mcts_b.new_tree(engines)
 
+    # Progress on the same line as the block header: a match is minutes long and
+    # the games run in lockstep, so without this there is nothing between "N
+    # партий..." and the final score.
+    report_step = max(1, num_games // 10)
+    reported = 0
+
     while active:
         # All games advance one ply per pass, so they stay in lockstep and the
         # side to move is the same for every active game.
@@ -252,6 +258,10 @@ def play_batch(
             if pgn_path is not None:
                 res_str = "1-0" if r > 0.5 else ("0-1" if r < -0.5 else "1/2-1/2")
                 save_pgn(histories[gi], res_str, pgn_path, white_name, black_name)
+        done = num_games - len(new_active)
+        if done - reported >= report_step or (not new_active and done > reported):
+            reported = done
+            print(f" {done * 100 // num_games}%", end="", flush=True)
         active = new_active
 
     return results
