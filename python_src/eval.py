@@ -176,6 +176,8 @@ def play_batch(
     kld_threshold: float = 0.0,
     parallel_sims: int = None,
     parallel_sims_black: int = None,
+    c_puct_white: float = None,
+    c_puct_black: float = None,
 ) -> List[float]:
     """
     Plays num_games games: net_white as white, net_black as black.
@@ -185,13 +187,16 @@ def play_batch(
     mcts_w = UltraFastMCTS(net_white, device, c_puct=1.25,
                             batch_size=mcts_batch, add_dirichlet=False,
                             compile_mode=compile_mode, kld_threshold=kld_threshold,
-                            parallel_sims=parallel_sims)
+                            parallel_sims=parallel_sims,
+                            rust_c_puct=c_puct_white)
     mcts_b = UltraFastMCTS(net_black, device, c_puct=1.25,
                             batch_size=mcts_batch, add_dirichlet=False,
                             compile_mode=compile_mode, kld_threshold=kld_threshold,
                             parallel_sims=(parallel_sims_black
                                            if parallel_sims_black is not None
-                                           else parallel_sims))
+                                           else parallel_sims),
+                            rust_c_puct=(c_puct_black if c_puct_black is not None
+                                         else c_puct_white))
 
     engines = [CapablancaEngine() for _ in range(num_games)]
     active  = list(range(num_games))
@@ -312,6 +317,8 @@ def run_match(
     kld_threshold: float = 0.0,
     parallel_sims: int = None,
     parallel_sims_b: int = None,
+    c_puct: float = None,
+    c_puct_b: float = None,
 ) -> Dict:
     """
     Plays `games` games between A and B (half with A as white, half with B as white).
@@ -338,7 +345,9 @@ def run_match(
                       white_name=name_a, black_name=name_b,
                       timeout_as_draw=timeout_as_draw,
                       compile_mode=compile_mode, kld_threshold=kld_threshold,
-                      parallel_sims=parallel_sims)
+                      parallel_sims=parallel_sims,
+                      parallel_sims_black=parallel_sims_b,
+                      c_puct_white=c_puct, c_puct_black=c_puct_b)
     for r in res1:
         if r > 0:   wins_a += 1
         elif r < 0: wins_b += 1
@@ -358,7 +367,10 @@ def run_match(
                       white_name=name_b, black_name=name_a,
                       timeout_as_draw=timeout_as_draw,
                       compile_mode=compile_mode, kld_threshold=kld_threshold,
-                      parallel_sims=parallel_sims)
+                      parallel_sims=(parallel_sims_b if parallel_sims_b is not None
+                                     else parallel_sims),
+                      parallel_sims_black=parallel_sims,
+                      c_puct_white=c_puct_b, c_puct_black=c_puct)
     for r in res2:
         # r — result for white (= B), convert to result for A
         r_a = -r
@@ -512,6 +524,11 @@ def main():
                              "последовательных раундов PUCT; ниже ~12 раундов "
                              "поиск вырождается в равномерный "
                              "(см. docs/experiments/policy_target_collapse.md)")
+    parser.add_argument("--c-puct", type=float, default=None,
+                        help="База CPuct для поиска в Rust (по умолчанию 1.745 — "
+                             "значение lc0 для доски 8x8). Задаёт первую сеть")
+    parser.add_argument("--c-puct-b", type=float, default=None,
+                        help="То же для второй сети — так меряется A/B по c_puct")
     parser.add_argument("--mcts-parallel-sims-b", type=int, default=None,
                         help="parallel_sims для ВТОРОЙ модели. Позволяет столкнуть "
                              "одни и те же веса с разными настройками поиска — "
@@ -577,6 +594,8 @@ def main():
             mcts_batch=args.mcts_batch,
             parallel_sims=args.mcts_parallel_sims,
             parallel_sims_b=args.mcts_parallel_sims_b,
+            c_puct=args.c_puct,
+            c_puct_b=args.c_puct_b,
             verbose=args.verbose,
             pgn_dir=args.pgn_dir,
             timeout_as_draw=args.timeout_as_draw,

@@ -1003,6 +1003,40 @@ mod tests {
     }
 
     #[test]
+    fn test_bounds_survive_root_shift() {
+        // After a root shift the old code erased every bounds-proven terminal and
+        // never re-derived it, so the search forgot proven mates once per move.
+        // Here the root is proven winning because its only child is a natural
+        // terminal that loses; revalidate must hand those bounds back.
+        let mut mcts = SingleMcts::new(Board::start());
+        let root = mcts.root;
+        let mate = mcts.arena.add(MctsNode::new(1 << 10, 1.0, 1, Some(root)));
+        {
+            let c = mcts.arena.get_mut(mate);
+            c.is_terminal = true;
+            c.terminal_kind = TERMINAL_KIND_NATURAL;
+            c.lower = -1;              // child is lost for the side to move there
+            c.upper = -1;
+            c.visits = 1;
+        }
+        {
+            let r = mcts.arena.get_mut(root);
+            r.children = vec![mate];
+            r.is_expanded = true;
+            r.visits = 2;
+            r.is_terminal = true;      // proven via bounds propagation
+            r.terminal_kind = TERMINAL_KIND_NONE;
+            r.lower = 1;
+            r.upper = 1;
+        }
+        mcts.revalidate_after_root_shift();
+        let r = mcts.arena.get(root);
+        assert_eq!((r.lower, r.upper), (1, 1),
+                   "proven bounds must be re-derived after a root shift");
+        assert!(r.is_terminal, "the root is still a proven win");
+    }
+
+    #[test]
     fn test_select_considers_low_prior_proven_child() {
         // A proven-winning child (c.upper == -1 → child is losing → parent wins,
         // gets the +100 StickyEndgames boost) with a LOW prior sits AFTER higher-prior
@@ -1392,6 +1426,10 @@ struct SingleMcts {
     // < 0 = accept draws. Applied only inside `select`, never to backup/bounds —
     // statistics remain valid if contempt changes between moves.
     contempt: f32,
+    // Base CPuct for the lc0 selection formula. Its tuned default (1.745) was
+    // fitted on 8x8 chess with ~35 legal moves; this board has ~45, so the
+    // right amount of exploration is an open question — hence a setter.
+    c_puct: f32,
     // Dirichlet noise on root priors (Lc0 self-play exploration). True for
     // training; flipped off for eval / FSF / lagged play where we want a
     // deterministic measurement of the network's actual choice.
@@ -1459,6 +1497,7 @@ impl SingleMcts {
             kld_prev_snapshot: None,
             move_start_visits: 0,
             contempt: 0.0,
+            c_puct: C_PUCT_V,
             add_dirichlet: true,
             rep_search_perslot: false,
             finished: false,
@@ -1651,7 +1690,7 @@ impl SingleMcts {
             //   cpuct = CPuct + CPuctFactor * ln((N + CPuctBase) / CPuctBase)
             // Tuned values: CPuct=1.745, CPuctFactor=3.894, CPuctBase=38739
             // At N=0: cpuct ≈ 1.745, at N=10K: ≈ 2.7, at N=100K: ≈ 4.0
-            let cpuct = C_PUCT_V
+            let cpuct = self.c_puct
                 + C_PUCT_FACTOR * ((parent_visits as f32 + C_PUCT_BASE) / C_PUCT_BASE).ln();
 
             // FPU ("first play urgency") — the value an UNVISITED child is scored
@@ -2271,6 +2310,16 @@ impl SingleMcts {
                 n.upper = 1;
             }
         }
+        // The loop above only ERASES bounds. Without re-deriving them the search
+        // forgets every mate it has already proven on each root shift and has to
+        // prove it again from scratch. Walk up from every surviving proven
+        // terminal so the parents get their bounds back (StickyEndgames).
+        for idx in 0..n_nodes {
+            let n = self.arena.get(idx);
+            if n.is_terminal && n.terminal_kind != TERMINAL_KIND_NONE {
+                self.propagate_bounds_from(idx);
+            }
+        }
     }
 
     /// Re-applies Dirichlet noise to priors of current root's children.
@@ -2335,6 +2384,13 @@ impl RustMCTS {
     /// Takes effect on the next selection — accumulated wl/d stay valid.
     pub fn set_contempt(&mut self, contempt: f32) {
         for g in self.games.iter_mut() { g.contempt = contempt; }
+    }
+
+    /// Set the base CPuct on every per-game MCTS (default 1.745, lc0's tuned
+    /// value for 8x8 chess). The logarithmic growth term is left alone.
+    /// Takes effect on the next selection; accumulated statistics stay valid.
+    pub fn set_c_puct(&mut self, c_puct: f32) {
+        for g in self.games.iter_mut() { g.c_puct = c_puct; }
     }
 
     /// Toggle root Dirichlet noise across all per-game trees. False = pure

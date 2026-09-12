@@ -116,7 +116,8 @@ class UltraFastMCTS:
                  compile_mode: str = None, bf16_weights: bool = True,
                  kld_threshold: float = 0.0, kld_check_every: int = 4,
                  kld_min_sims_frac: float = 0.25,
-                 contempt: float = 0.0, rep_search_perslot: bool = False):
+                 contempt: float = 0.0, rep_search_perslot: bool = False,
+                 rust_c_puct: float = None):
         # compile_mode: None (no compile), 'default', 'reduce-overhead', 'max-autotune'.
         # 'default' — safest, ~15-25% speedup, minimal warmup.
         # 'reduce-overhead' — uses CUDA graphs, up to 50% speedup, but recompiles on shape change.
@@ -143,6 +144,10 @@ class UltraFastMCTS:
         self.contempt = float(contempt)
         # Per-slot repetition planes during search (match training encoding).
         self._rep_search_perslot = bool(rep_search_perslot)
+        # Base CPuct for the Rust selection. None = leave the engine's own
+        # default (lc0's 1.745). `self.c_puct` above is a different thing — it
+        # belongs to the Python-side search the GUI uses, and never reached Rust.
+        self._rust_c_puct = None if rust_c_puct is None else float(rust_c_puct)
         self._parallel_sims = parallel_sims if parallel_sims is not None else PARALLEL_SIMS
         if self._parallel_sims > 64:
             print(f"⚠️  parallel_sims={self._parallel_sims} > 64: PUCT exploration "
@@ -403,6 +408,8 @@ class UltraFastMCTS:
             rust_mcts.set_add_dirichlet(False)
         if self._rep_search_perslot:
             rust_mcts.set_rep_search_perslot(True)
+        if self._rust_c_puct is not None:
+            rust_mcts.set_c_puct(self._rust_c_puct)
         return rust_mcts
 
     def run_search(self, rust_mcts, simulations: int) -> None:
