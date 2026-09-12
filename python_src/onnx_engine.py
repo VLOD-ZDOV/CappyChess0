@@ -48,6 +48,12 @@ class OnnxEngine:
                  nn_cache=True, nn_cache_max=600_000):
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # GUI запускает каждый поиск на новом потоке, а memory-pattern ORT
+        # заводит свой набор буферов на каждый поток и не отдаёт их: замерено
+        # 1 → 15 ГБ видеопамяти за 60 поисков даже при постоянном батче 96.
+        # Без него — ровно 1 ГБ, скорость та же
+        # (experiments/perf/diag_gui_vram.py).
+        so.enable_mem_pattern = False
         # CUDA first, CPU as a graceful fallback when no NVIDIA GPU is present.
         # Арена CUDA-провайдера по умолчанию расширяется степенями двойки и
         # обратно память НЕ отдаёт: замерено 1.3 ГБ на батче 96, 11.6 ГБ на
