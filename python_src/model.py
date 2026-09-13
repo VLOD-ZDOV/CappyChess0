@@ -88,6 +88,42 @@ class RelativePositionBias(nn.Module):
         return self.bias_table[:, self.relative_indices]
 
 
+class Smolgen(nn.Module):
+    """Position-dependent attention bias (lc0 BT2+).
+
+    RPB adds the same bias for a given square offset no matter what stands on
+    the board. Smolgen squeezes the whole position into a short vector and
+    generates per-head biases from it, so an open position and a closed one can
+    attend differently. lc0 reports it plays "as if 50% larger" for ~10% of the
+    throughput.
+
+    The expensive part — the projection to all n_sq² square pairs — is SHARED
+    between blocks (one weight for the whole net); only the small compress/dense
+    stack is per block. Zero-init on the shared weight means the net starts out
+    behaving exactly as if smolgen were absent, and learns its way in.
+    """
+
+    def __init__(self, d_model: int, heads: int, n_sq: int, shared: nn.Module,
+                 gen: int = 128, compress: int = 16, use_rmsnorm: bool = False):
+        super().__init__()
+        self.heads, self.n_sq, self.gen = heads, n_sq, gen
+        self.compress = nn.Linear(d_model, compress, bias=False)
+        self.dense1 = nn.Linear(n_sq * compress, gen * 2, bias=False)
+        self.ln1 = _make_norm(gen * 2, use_rmsnorm)
+        self.dense2 = nn.Linear(gen * 2, heads * gen, bias=False)
+        self.ln2 = _make_norm(heads * gen, use_rmsnorm)
+        self.shared = shared          # nn.Linear(gen, n_sq*n_sq), общая на все блоки
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, S, D) — только клетки доски (регистры сюда не попадают).
+        B = x.shape[0]
+        y = self.compress(x[:, -self.n_sq:]).flatten(1)     # (B, n_sq*compress)
+        y = F.silu(self.ln1(self.dense1(y)))
+        y = F.silu(self.ln2(self.dense2(y)))                # (B, heads*gen)
+        y = self.shared(y.view(B * self.heads, self.gen))   # (B*h, n_sq²)
+        return y.view(B, self.heads, self.n_sq, self.n_sq)
+
+
 class MultiHeadAttentionRPB(nn.Module):
     """MHA with Relative Position Bias (no Smolgen). Pre-LN style.
 
@@ -105,7 +141,7 @@ class MultiHeadAttentionRPB(nn.Module):
     def __init__(self, d_model: int, heads: int = 8,
                  board_h: int = 8, board_w: int = 10,
                  qkv_bias: bool = True, qk_norm: bool = False,
-                 value_residual: bool = False):
+                 value_residual: bool = False, smolgen: nn.Module = None):
         super().__init__()
         assert d_model % heads == 0, f"d_model={d_model} must be divisible by heads={heads}"
         self.heads = heads
@@ -116,6 +152,7 @@ class MultiHeadAttentionRPB(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=qkv_bias)
         self.out_proj = nn.Linear(d_model, d_model)
         self.rpb = RelativePositionBias(heads, board_h, board_w)
+        self.smolgen = smolgen
         if qk_norm:
             self.q_norm = _make_norm(self.head_dim, use_rmsnorm=True)
             self.k_norm = _make_norm(self.head_dim, use_rmsnorm=True)
@@ -161,6 +198,14 @@ class MultiHeadAttentionRPB(nn.Module):
             # the bottom-right corner.
             pad = S - bias.shape[-1]
             bias = F.pad(bias, (pad, 0, pad, 0))
+        if self.smolgen is not None:
+            # (B, h, 80, 80) поверх геометрического (1, h, 80, 80): одно и то же
+            # смещение для всех позиций пачки плюс своё для каждой.
+            sm = self.smolgen(x)
+            if sm.shape[-1] != S:
+                pad = S - sm.shape[-1]
+                sm = F.pad(sm, (pad, 0, pad, 0))
+            bias = bias + sm
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         # flatten(2) collapses the (h, hd) tail into a single D dim. The dynamo
         # ONNX exporter lowers it to an explicit Flatten/Reshape op (unlike
@@ -282,7 +327,8 @@ class TransformerBlock(nn.Module):
                  board_h: int = 8, board_w: int = 10,
                  qkv_bias: bool = True, use_rmsnorm: bool = False,
                  qk_norm: bool = False, swiglu: bool = False,
-                 value_residual: bool = False, hyper_streams: int = 0):
+                 value_residual: bool = False, hyper_streams: int = 0,
+                 smolgen: nn.Module = None):
         super().__init__()
         # 0 = a plain residual; >0 = mHC with that many parallel streams.
         self.hyper_streams = hyper_streams
@@ -292,7 +338,8 @@ class TransformerBlock(nn.Module):
         self.ln1 = _make_norm(d_model, use_rmsnorm)
         self.attn = MultiHeadAttentionRPB(d_model, heads, board_h, board_w,
                                           qkv_bias=qkv_bias, qk_norm=qk_norm,
-                                          value_residual=value_residual)
+                                          value_residual=value_residual,
+                                          smolgen=smolgen)
         self.ln2 = _make_norm(d_model, use_rmsnorm)
         self.ffn = SwiGLU(d_model, ffn_mult) if swiglu else nn.Sequential(
             nn.Linear(d_model, d_model * ffn_mult),
@@ -521,7 +568,8 @@ class CapablancaNet(nn.Module):
                  restricted_policy: bool = False,
                  abs_pos_embed: bool = False,
                  wide_value: bool = False,
-                 ffn_mult: int = 2):
+                 ffn_mult: int = 2,
+                 smolgen_dim: int = 0):
         super().__init__()
         self.num_channels = num_channels
         self.num_res_blocks = num_res_blocks
@@ -539,6 +587,7 @@ class CapablancaNet(nn.Module):
         self.value_residual = value_residual
         self.hyper_streams = hyper_streams
         self.restricted_policy = restricted_policy
+        self.smolgen_dim = smolgen_dim
         self.abs_pos_embed = abs_pos_embed
         self.wide_value = wide_value
         self.ffn_mult = ffn_mult
@@ -576,13 +625,26 @@ class CapablancaNet(nn.Module):
         if num_transformer_blocks > 0:
             assert num_channels % transformer_heads == 0, \
                 f"num_channels={num_channels} must be divisible by transformer_heads={transformer_heads}"
+            # Общая на весь ствол проекция smolgen: она и есть дорогая часть
+            # (gen → 80×80), поэтому один экземпляр на все блоки. Нулевая
+            # инициализация — старт байт-в-байт как без smolgen.
+            if smolgen_dim > 0:
+                n_sq = self.BOARD_H * self.BOARD_W
+                self.smolgen_shared = nn.Linear(smolgen_dim, n_sq * n_sq, bias=False)
+                nn.init.zeros_(self.smolgen_shared.weight)
             self.transformer_blocks = nn.ModuleList([
                 TransformerBlock(num_channels, heads=transformer_heads, ffn_mult=ffn_mult,
                                  board_h=self.BOARD_H, board_w=self.BOARD_W,
                                  qkv_bias=qkv_bias, use_rmsnorm=use_rmsnorm,
                                  qk_norm=qk_norm, swiglu=swiglu,
                                  value_residual=value_residual,
-                                 hyper_streams=hyper_streams)
+                                 hyper_streams=hyper_streams,
+                                 smolgen=(Smolgen(num_channels, transformer_heads,
+                                                  self.BOARD_H * self.BOARD_W,
+                                                  self.smolgen_shared,
+                                                  gen=smolgen_dim,
+                                                  use_rmsnorm=use_rmsnorm)
+                                          if smolgen_dim > 0 else None))
                 for _ in range(num_transformer_blocks)
             ])
             if hyper_streams > 0:
@@ -841,6 +903,7 @@ def describe_arch(net) -> str:
     opts = []
     for name, attr, default in (
         ("attn-policy", "attn_policy", False),
+        ("smolgen", "smolgen_dim", 0),
         ("qk-norm", "qk_norm", False),
         ("swiglu", "swiglu", False),
         ("value-residual", "value_residual", False),
@@ -915,13 +978,16 @@ def build_net_from_state_dict(raw_sd: dict):
     hc = sd.get("transformer_blocks.0.hc_attn.pre")
     hyper_streams = hc.shape[0] if hc is not None else 0
     restricted_policy = "policy_head.fc.weight" in sd
+    sg = sd.get("smolgen_shared.weight")
+    smolgen_dim = sg.shape[1] if sg is not None else 0
     abs_pos_embed = "pos_embed" in sd
     vw = sd.get("value_head.4.weight")
     wide_value = vw is not None and vw.shape[0] == 512
     fw = sd.get("transformer_blocks.0.ffn.w_in.weight")
     # SwiGLU: w_in = (2*hidden, d), hidden = d*mult*2/3
     ffn_mult = max(1, round(fw.shape[0] / 2 * 3 / (2 * ch))) if fw is not None else 2
-    net = CapablancaNet(num_channels=ch, num_res_blocks=bl,
+    net = CapablancaNet(smolgen_dim=smolgen_dim,
+                        num_channels=ch, num_res_blocks=bl,
                         num_transformer_blocks=tb, transformer_heads=heads,
                         enable_mlh=enable_mlh, enable_future=enable_future,
                         qkv_bias=qkv_bias, use_rmsnorm=use_rmsnorm,

@@ -458,6 +458,7 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
         qk_norm=cfg.qk_norm,
         swiglu=cfg.swiglu,
         attn_policy=cfg.attn_policy,
+        smolgen_dim=cfg.smolgen_dim,
         ffn_mult=cfg.ffn_mult,
         restricted_policy=cfg.restricted_policy,
         abs_pos_embed=cfg.abs_pos_embed,
@@ -622,6 +623,7 @@ class Config:
     # only make sense for a fresh run or a distillation into a new net.
     qk_norm: bool = False        # RMSNorm on Q and K before the dot product
     swiglu: bool = False         # gated FFN instead of Linear→Mish→Linear
+    smolgen_dim: int = 0         # >0 → Smolgen с вектором такого размера
     attn_policy: bool = False    # bilinear from→to policy head instead of Linear(C*80, 7000)
     ffn_mult: int = 2                # FFN multiplier in transformer blocks
     restricted_policy: bool = False  # policy head only on the 2672 reachable indices
@@ -1817,6 +1819,7 @@ def train(cfg: Config = None):
         qk_norm=cfg.qk_norm,
         swiglu=cfg.swiglu,
         attn_policy=cfg.attn_policy,
+        smolgen_dim=cfg.smolgen_dim,
         ffn_mult=cfg.ffn_mult,
         restricted_policy=cfg.restricted_policy,
         abs_pos_embed=cfg.abs_pos_embed,
@@ -2449,6 +2452,10 @@ if __name__ == "__main__":
                         help="Value-голова 32ch→512 вместо 8ch→256. 0.17M на "
                              "сети в 28M — узкое место, и именно value ломалась "
                              "при прошлых дистилляциях.")
+    parser.add_argument("--smolgen", type=int, default=0, metavar="N",
+                        help="Smolgen (lc0 BT2+): смещения внимания, зависящие от "
+                             "позиции; N — размер порождающего вектора (128 разумно). "
+                             "0 = выключен. Офлайн-замер 13.09 выигрыша не показал")
     parser.add_argument("--attn-policy", action="store_true",
                         help="Билинейная policy-голова from→to вместо Linear(C*80, 7000). "
                              "17.9M → 0.18M параметров на голову (и столько же на future).")
@@ -2709,6 +2716,7 @@ if __name__ == "__main__":
         qk_norm=args.qk_norm,
         swiglu=args.swiglu,
         attn_policy=args.attn_policy,
+        smolgen_dim=args.smolgen,
         ffn_mult=args.ffn_mult,
         restricted_policy=args.restricted_policy,
         abs_pos_embed=args.abs_pos_embed,
