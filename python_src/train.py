@@ -371,7 +371,7 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
                     # Mix FSF's dense positional eval with the game result.
                     z = fsf_value_alpha * fsf_eval + (1.0 - fsf_value_alpha) * z
                 v, draw_target = _blend_value(cfg, z, root_q, root_d, result)
-                remaining = max(0, total_plies - 1 - ply)
+                remaining = max(0, total_plies - ply)
                 mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
                 all_samples.append(pack_sample_sparse(
                     board_np, pol_sparse, float(v), float(mlh_norm),
@@ -557,7 +557,7 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
             for board_np, pol_sparse, side, ply, root_q, root_d in positions[g]:
                 z = result if side == 0 else -result
                 v, draw_target = _blend_value(cfg, z, root_q, root_d, result)
-                remaining = max(0, total_plies - 1 - ply)
+                remaining = max(0, total_plies - ply)
                 mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
                 all_samples.append(pack_sample_sparse(
                     board_np, pol_sparse, float(v), float(mlh_norm),
@@ -1497,9 +1497,11 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                             z_is_draw = 1.0 if abs(result) < 1e-6 else 0.0
                             draw_target = (1.0 - w) * z_is_draw + w * float(root_d)
                 # MLH target: how many half-moves REMAIN from this position to game end.
-                # Normalized to [0, 1] by dividing by MLH_PLY_NORM.
+                # Normalized to [0, 1] by dividing by MLH_PLY_NORM. Counted the way
+                # the search counts it: a terminal position is 0 and every ply before
+                # it adds one, so the position before the mating move is 1, not 0.
                 # (On timeout the final position is unknown → use the game "tail" as-is.)
-                remaining = max(0, total_plies - 1 - k)
+                remaining = max(0, total_plies - k)
                 mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
                 # Future move target: move at k+2 (our next move — same side,
                 # same canonical policy-index orientation). -1 if game ended.
