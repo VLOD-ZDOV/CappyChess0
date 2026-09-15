@@ -52,6 +52,9 @@ promotion adds a suffix — `q r b n` as usual, plus **`a`** archbishop and
 - **Rust** — [rustup.rs](https://rustup.rs). The search engine is a compiled
   Rust module; there is no pure-Python fallback.
 - **NVIDIA GPU with CUDA** for training. Playing works on CPU, just slower.
+  Self-play sits at about **3 GB of VRAM**, but the training phase of each
+  iteration spikes to **10–11 GB** — a 12 GB card will be tight, and anything
+  else running on it (a browser, a chat client) can push the run into CUDA OOM.
 
 ### 2. Create the environment
 
