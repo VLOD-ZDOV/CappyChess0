@@ -1256,7 +1256,8 @@ mod tests {
 const POLICY_SIZE_MCTS: usize = 7000;
 const VIRTUAL_LOSS_V: i32 = 3;
 // MCTS parameters from lc0 params.cc — tuned over millions of games.
-const C_PUCT_V: f32 = 1.745;        // CPuct (lc0)
+const C_PUCT_V: f32 = 1.745;
+const FPU_REDUCTION_V: f32 = 0.330;        // насколько пессимистичен непосещённый ход (lc0)
 const C_PUCT_FACTOR: f32 = 3.894;   // CPuctFactor — multiplier for logarithmic growth
 const C_PUCT_BASE: f32 = 38739.0;   // CPuctBase — inflection point
 // Dirichlet alpha computed dynamically: max(10/n_children, 0.1). See expand().
@@ -1430,6 +1431,7 @@ struct SingleMcts {
     // fitted on 8x8 chess with ~35 legal moves; this board has ~45, so the
     // right amount of exploration is an open question — hence a setter.
     c_puct: f32,
+    fpu_reduction: f32,
     // Dirichlet noise on root priors (Lc0 self-play exploration). True for
     // training; flipped off for eval / FSF / lagged play where we want a
     // deterministic measurement of the network's actual choice.
@@ -1498,6 +1500,7 @@ impl SingleMcts {
             move_start_visits: 0,
             contempt: 0.0,
             c_puct: C_PUCT_V,
+            fpu_reduction: FPU_REDUCTION_V,
             add_dirichlet: true,
             rep_search_perslot: false,
             finished: false,
@@ -1718,14 +1721,14 @@ impl SingleMcts {
             let parent_q = self.arena.get(idx).q();
             let n_ch = self.arena.get(idx).children.len();
             let fpu = {
-                const FPU_REDUCTION: f32 = 0.330;
+                let fpu_reduction = self.fpu_reduction;
                 let mut visited_pol = 0.0f32;
                 for ci_pos in 0..n_ch {
                     let ci = self.arena.get(idx).children[ci_pos];
                     let c = self.arena.get(ci);
                     if c.visits > 0 || c.virtual_loss > 0 { visited_pol += c.prior; }
                 }
-                (parent_q - FPU_REDUCTION * visited_pol.sqrt()).max(-1.0)
+                (parent_q - fpu_reduction * visited_pol.sqrt()).max(-1.0)
             };
 
             let mut best = f32::NEG_INFINITY;
@@ -2393,6 +2396,17 @@ impl RustMCTS {
         for g in self.games.iter_mut() { g.c_puct = c_puct; }
     }
 
+    /// How pessimistically an UNVISITED child is scored: fpu = parent_q -
+    /// reduction * sqrt(policy already visited). Low values make the search try
+    /// every move (visits spread thin), high values make it trust the policy.
+    /// Measured 2026-09-15: at the default 0.33 the root distribution is nearly
+    /// flat — after 400 simulations the top move holds 14% of 28 — and search
+    /// drifts away from moves the policy (which correlates +0.71 with a deep
+    /// engine eval) prefers. Exposed so the trade-off can be matched, not guessed.
+    pub fn set_fpu_reduction(&mut self, fpu: f32) {
+        for g in self.games.iter_mut() { g.fpu_reduction = fpu; }
+    }
+
     /// Toggle root Dirichlet noise across all per-game trees. False = pure
     /// deterministic policy (eval, FSF, lagged play). Default true (self-play).
     /// Existing root noise is not retracted — change applies to future root
@@ -2419,6 +2433,35 @@ impl RustMCTS {
             self.games[game_idx].finished = true;
             self.drain_pending_vloss(game_idx, game_idx + 1);
         }
+    }
+
+    /// Restart one slot on a different game, keeping every other slot's tree.
+    ///
+    /// Self-play plays a batch of games in lockstep, so the batch lives as long
+    /// as its longest game while the other slots stand empty. Freeing a slot for
+    /// another game needs its tree thrown away and rebuilt from that game's
+    /// position — rebuilding the whole `RustMCTS` instead would destroy the
+    /// tree reuse of every other slot, which is worth 2-3x search quality.
+    ///
+    /// Per-game settings (contempt, c_puct, FPU, Dirichlet, repetition encoding)
+    /// are carried over from the slot's previous occupant: they are properties of
+    /// the run, not of the game.
+    pub fn reset_game(&mut self, game_idx: usize, engine: PyRef<CapablancaEngine>) {
+        if game_idx >= self.games.len() { return; }
+        let old = &self.games[game_idx];
+        let (contempt, c_puct, fpu, dirichlet, perslot) =
+            (old.contempt, old.c_puct, old.fpu_reduction, old.add_dirichlet,
+             old.rep_search_perslot);
+        let mut fresh = SingleMcts::new_with_history(
+            engine.board.clone(), engine.board_history.clone(),
+            engine.position_history.clone());
+        fresh.contempt = contempt;
+        fresh.c_puct = c_puct;
+        fresh.fpu_reduction = fpu;
+        fresh.add_dirichlet = dirichlet;
+        fresh.rep_search_perslot = perslot;
+        self.games[game_idx] = fresh;
+        if game_idx < self.leaf_counts.len() { self.leaf_counts[game_idx] = 0; }
     }
 
     /// Collects leaves for inference.
@@ -2633,6 +2676,10 @@ impl RustMCTS {
         let mut max_kl = 0.0_f32;
         let mut has_prev = true;
         for g in &mut self.games {
+            // Доигранные слоты пропускаем. Их корень терминален или без визитов,
+            // а `kld_compute_gain` на таком возвращает бесконечность — и одна
+            // законченная партия отключала ранний выход всей пачке до конца.
+            if g.finished || g.is_over() { continue; }
             let kl = g.kld_compute_gain();
             if kl.is_infinite() {
                 has_prev = false;
