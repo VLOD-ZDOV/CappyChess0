@@ -68,7 +68,9 @@ def losses(net, data, dev):
     b, pol, wdl = data
     ps, vs = [], []
     for i in range(0, b.shape[0], 256):
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        # На CPU bf16-автокаст только замедляет, да и точность там не жмёт.
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                enabled=(str(dev) != "cpu")):
             logits, wdl_logits, _, _ = net(b[i:i + 256].to(dev))
         ps.append(-(pol[i:i + 256].to(dev) * F.log_softmax(logits.float(), 1)).sum(1))
         vs.append(-(wdl[i:i + 256].to(dev) * F.log_softmax(wdl_logits.float(), 1)).sum(1))
@@ -80,9 +82,12 @@ def main():
     ap.add_argument("buffer")
     ap.add_argument("checkpoints", nargs="+")
     ap.add_argument("--n", type=int, default=3072)
+    # Прогон на 384 канала занимает карту целиком, поэтому проверка идёт на CPU:
+    # рядом с обучением она иначе падает с CUDA OOM.
+    ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
 
-    dev = "cuda"
+    dev = a.device if (a.device != "cuda" or torch.cuda.is_available()) else "cpu"
     d = buffer_io.load_arrays(a.buffer)   # файл или каталог кусков
     n = d["values"].shape[0]
     N = min(a.n, n // 3)

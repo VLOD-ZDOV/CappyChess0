@@ -178,6 +178,12 @@ def play_batch(
     parallel_sims_black: int = None,
     c_puct_white: float = None,
     c_puct_black: float = None,
+    fpu_white: float = None,
+    fpu_black: float = None,
+    ptemp_white: float = 1.0,
+    ptemp_black: float = None,
+    policy_only_after_white: int = None,
+    policy_only_after_black: int = None,
 ) -> List[float]:
     """
     Plays num_games games: net_white as white, net_black as black.
@@ -188,7 +194,8 @@ def play_batch(
                             batch_size=mcts_batch, add_dirichlet=False,
                             compile_mode=compile_mode, kld_threshold=kld_threshold,
                             parallel_sims=parallel_sims,
-                            rust_c_puct=c_puct_white)
+                            rust_c_puct=c_puct_white,
+                            rust_fpu=fpu_white, policy_temp=ptemp_white)
     mcts_b = UltraFastMCTS(net_black, device, c_puct=1.25,
                             batch_size=mcts_batch, add_dirichlet=False,
                             compile_mode=compile_mode, kld_threshold=kld_threshold,
@@ -196,7 +203,10 @@ def play_batch(
                                            if parallel_sims_black is not None
                                            else parallel_sims),
                             rust_c_puct=(c_puct_black if c_puct_black is not None
-                                         else c_puct_white))
+                                         else c_puct_white),
+                            rust_fpu=(fpu_black if fpu_black is not None else fpu_white),
+                            policy_temp=(ptemp_black if ptemp_black is not None
+                                         else ptemp_white))
 
     engines = [CapablancaEngine() for _ in range(num_games)]
     active  = list(range(num_games))
@@ -223,14 +233,30 @@ def play_batch(
         # side to move is the same for every active game.
         side = engines[active[0]].side_to_move()
         searcher, tree = (mcts_w, tree_w) if side == 0 else (mcts_b, tree_b)
-        searcher.run_search(tree, simulations)
-        # Sparse root policy: one entry per visited legal move instead of a dense
-        # 7000-float vector per game per ply.
-        sparse_pols = tree.get_policies_sparse()
+        cut = policy_only_after_white if side == 0 else policy_only_after_black
+        # Сторона с заданным порогом после него ходит ГОЛОЙ политикой, без
+        # поиска. Так меряется вклад поиска именно в середине партии: до порога
+        # обе стороны играют одинаково, значит дебютный эффект в замер не лезет.
+        bare = cut is not None and move_counts[active[0]] >= cut
+        if bare:
+            raw = searcher.raw_policies([engines[gi] for gi in active])
+            raw_by_game = {gi: raw[k] for k, gi in enumerate(active)}
+        else:
+            searcher.run_search(tree, simulations)
+            # Sparse root policy: one entry per visited legal move instead of a dense
+            # 7000-float vector per game per ply.
+            sparse_pols = tree.get_policies_sparse()
 
         for gi in active:
-            pol_idx, pol_val = sparse_pols[gi]
-            lookup = {int(i): float(v) for i, v in zip(pol_idx, pol_val)}
+            if bare:
+                dense = raw_by_game[gi]
+                lookup = {int(i): float(dense[i])
+                          for i in (engines[gi].move_int_to_policy_idx(m)
+                                    for m in engines[gi].get_legal_moves_int())
+                          if i is not None}
+            else:
+                pol_idx, pol_val = sparse_pols[gi]
+                lookup = {int(i): float(v) for i, v in zip(pol_idx, pol_val)}
             m = _apply_policy_move(engines[gi], lookup,
                                    move_counts[gi], temperature_moves)
             if m is not None:
@@ -319,6 +345,12 @@ def run_match(
     parallel_sims_b: int = None,
     c_puct: float = None,
     c_puct_b: float = None,
+    fpu: float = None,
+    fpu_b: float = None,
+    ptemp: float = 1.0,
+    ptemp_b: float = None,
+    policy_only_after: int = None,
+    policy_only_after_b: int = None,
 ) -> Dict:
     """
     Plays `games` games between A and B (half with A as white, half with B as white).
@@ -347,7 +379,11 @@ def run_match(
                       compile_mode=compile_mode, kld_threshold=kld_threshold,
                       parallel_sims=parallel_sims,
                       parallel_sims_black=parallel_sims_b,
-                      c_puct_white=c_puct, c_puct_black=c_puct_b)
+                      c_puct_white=c_puct, c_puct_black=c_puct_b,
+                      fpu_white=fpu, fpu_black=fpu_b,
+                      ptemp_white=ptemp, ptemp_black=ptemp_b,
+                      policy_only_after_white=policy_only_after,
+                      policy_only_after_black=policy_only_after_b)
     for r in res1:
         if r > 0:   wins_a += 1
         elif r < 0: wins_b += 1
@@ -529,6 +565,24 @@ def main():
                              "значение lc0 для доски 8x8). Задаёт первую сеть")
     parser.add_argument("--c-puct-b", type=float, default=None,
                         help="То же для второй сети — так меряется A/B по c_puct")
+    parser.add_argument("--policy-only-after", type=int, default=None,
+                        help="С этого полухода ПЕРВАЯ сеть ходит голой политикой "
+                             "без поиска. Так меряется вклад поиска в середине "
+                             "партии: до порога обе стороны играют одинаково")
+    parser.add_argument("--policy-only-after-b", type=int, default=None,
+                        help="То же для второй сети")
+    parser.add_argument("--fpu", type=float, default=None,
+                        help="Насколько пессимистичен непосещённый ход: "
+                             "fpu = q_родителя − значение × sqrt(уже просмотренной "
+                             "политики). Умолчание движка 0.33 размазывает посещения; "
+                             "больше — поиск сильнее доверяет политике")
+    parser.add_argument("--fpu-b", type=float, default=None,
+                        help="То же для второй сети — так меряется A/B по FPU")
+    parser.add_argument("--policy-temp", type=float, default=1.0,
+                        help="Температура приоритета перед подачей в дерево. "
+                             "Меньше 1 — заострить политику, больше — размыть")
+    parser.add_argument("--policy-temp-b", type=float, default=None,
+                        help="То же для второй сети")
     parser.add_argument("--mcts-parallel-sims-b", type=int, default=None,
                         help="parallel_sims для ВТОРОЙ модели. Позволяет столкнуть "
                              "одни и те же веса с разными настройками поиска — "
@@ -596,6 +650,12 @@ def main():
             parallel_sims_b=args.mcts_parallel_sims_b,
             c_puct=args.c_puct,
             c_puct_b=args.c_puct_b,
+            fpu=args.fpu,
+            fpu_b=args.fpu_b,
+            policy_only_after=args.policy_only_after,
+            policy_only_after_b=args.policy_only_after_b,
+            ptemp=args.policy_temp,
+            ptemp_b=args.policy_temp_b,
             verbose=args.verbose,
             pgn_dir=args.pgn_dir,
             timeout_as_draw=args.timeout_as_draw,

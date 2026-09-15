@@ -4,6 +4,7 @@
 # feeds it batched GPU inference (BF16 weights, pinned staging buffer,
 # optional transposition cache) and owns the KLD early-exit bookkeeping.
 
+import time
 import numpy as np
 import torch
 from collections import OrderedDict
@@ -117,7 +118,8 @@ class UltraFastMCTS:
                  kld_threshold: float = 0.0, kld_check_every: int = 4,
                  kld_min_sims_frac: float = 0.25,
                  contempt: float = 0.0, rep_search_perslot: bool = False,
-                 rust_c_puct: float = None):
+                 rust_c_puct: float = None, trt_inference: bool = False,
+                 rust_fpu: float = None, policy_temp: float = 1.0):
         # compile_mode: None (no compile), 'default', 'reduce-overhead', 'max-autotune'.
         # 'default' — safest, ~15-25% speedup, minimal warmup.
         # 'reduce-overhead' — uses CUDA graphs, up to 50% speedup, but recompiles on shape change.
@@ -126,7 +128,12 @@ class UltraFastMCTS:
         # bf16_weights: True → creates BF16 copy of weights for inference. Training net stays FP32.
         # ~1.5-2x speedup vs autocast(bf16) — no FP32→BF16 cast on every weight read.
         # VRAM: extra BF16 copy (~½ of FP32 size; for 128ch×10 this is ~6 MB).
-        self._bf16_weights = bf16_weights and torch.cuda.is_available()
+        # trt_inference: инференс через TensorRT вместо torch.compile. Замер
+        # 14.09 на 47M/384ch — 1.40x на батче 96, лучший ход совпадает в 100%
+        # позиций, оценка расходится на 0.0008. Движок собирается под свежие
+        # веса здесь же, потому что generate_games создаёт MCTS каждую итерацию.
+        self._trt = bool(trt_inference) and torch.cuda.is_available()
+        self._bf16_weights = bf16_weights and torch.cuda.is_available() and not self._trt
         if self._bf16_weights:
             import copy as _copy
             # Unwrap _orig_mod if net is already under torch.compile.
@@ -148,6 +155,15 @@ class UltraFastMCTS:
         # default (lc0's 1.745). `self.c_puct` above is a different thing — it
         # belongs to the Python-side search the GUI uses, and never reached Rust.
         self._rust_c_puct = None if rust_c_puct is None else float(rust_c_puct)
+        # Насколько поиск пессимистичен к непосещённым ходам. Умолчание движка
+        # 0.33 размазывает посещения: замер 15.09 — после 400 симуляций верхний
+        # ход держит 14% из 28, и поиск уходит от ходов, которые политика
+        # (корреляция +0.71 с глубокой оценкой движка) считает лучшими.
+        self._rust_fpu = None if rust_fpu is None else float(rust_fpu)
+        # Температура приоритета перед подачей в дерево. У lc0 её поднимают,
+        # чтобы РАЗМЫТЬ слишком резкую политику; у нас случай обратный —
+        # политика размазана, значит нужна температура МЕНЬШЕ единицы.
+        self._policy_temp = float(policy_temp)
         self._parallel_sims = parallel_sims if parallel_sims is not None else PARALLEL_SIMS
         if self._parallel_sims > 64:
             print(f"⚠️  parallel_sims={self._parallel_sims} > 64: PUCT exploration "
@@ -156,12 +172,14 @@ class UltraFastMCTS:
         # torch.compile: compiles forward into an optimized CUDA graph.
         # On Blackwell with BF16 gives +15-50% raw inference speedup. Applied on top of
         # BF16 copy (if bf16_weights=True) or the original net.
-        self._compile_mode = compile_mode
-        if compile_mode is not None and hasattr(torch, 'compile'):
+        self._compile_mode = None if self._trt else compile_mode
+        # При TensorRT компиляция бессмысленна: граф всё равно будет заменён
+        # готовым движком, а прогрев торча стоит минуту на итерацию.
+        if self._compile_mode is not None and hasattr(torch, 'compile'):
             try:
                 # dynamic=False: shapes are bucketed, so compile sees a bounded
                 # set of static shapes and can optimize them aggressively.
-                self.net = torch.compile(self.net, mode=compile_mode, dynamic=False)
+                self.net = torch.compile(self.net, mode=self._compile_mode, dynamic=False)
                 print(f"🔥 torch.compile(mode={compile_mode!r}) — первый inference будет медленнее (warmup).")
             except Exception as e:
                 print(f"⚠️  torch.compile failed: {e}. Откат на eager mode.")
@@ -181,7 +199,8 @@ class UltraFastMCTS:
             # instead of a strided layout-convert (measured 1.1-1.3x faster H2D).
             self.pinned_buf = torch.empty(
                 (MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W),
-                pin_memory=True, dtype=torch.bfloat16)
+                pin_memory=True,
+                dtype=torch.float16 if self._trt else torch.bfloat16)
         else:
             self.pinned_buf = torch.empty(
                 (MAX_LEAVES, INPUT_PLANES, BOARD_H, BOARD_W),
@@ -189,6 +208,14 @@ class UltraFastMCTS:
             print("⚠️  CUDA не найдена — inference на CPU. Очень медленно, "
                   "training/eval скорее иллюстративные. Установите GPU + драйвер.")
         self.pinned_size = MAX_LEAVES
+        if self._trt:
+            from trt_engine import TRTNet
+            # Потолок движка — по РЕАЛЬНОМУ верхнему пределу батча (игры в
+            # пачке × параллельных симуляций, с запасом), а не по размеру
+            # закреплённого буфера: тот берётся с большим избытком (8192), и
+            # профиль на такую ширину TensorRT собрать не может.
+            trt_max = min(MAX_LEAVES, batch_size * self._parallel_sims * 2)
+            self.net = TRTNet(self.net, self.device, max_batch=trt_max)
         self.net.eval()
 
         # NN transposition cache. Enabled ONLY for inference (gui/play),
@@ -341,13 +368,17 @@ class UltraFastMCTS:
             if n_pad > 0:
                 pad_idx = np.arange(n_pad) % n
                 arr = np.concatenate([arr, arr[pad_idx]], axis=0)
-            target_dtype = torch.bfloat16 if self._has_cuda else torch.float32
+            target_dtype = (torch.float16 if self._trt else
+                            torch.bfloat16) if self._has_cuda else torch.float32
             cpu_t = torch.from_numpy(arr).to(target_dtype)
             x = cpu_t.to(self.device, non_blocking=True)
 
         # NCHW throughout — the net runs NCHW (channels_last is slower here), so
         # no layout conversion; x stays contiguous from the pinned buffer.
-        if self._bf16_weights:
+        if self._trt:
+            # Готовый движок: и вход, и веса в FP16, автокаст не нужен.
+            out = self.net(x)
+        elif self._bf16_weights:
             # Both weights and input in BF16 — no autocast needed.
             out = self.net(x)
         elif self._has_cuda:
@@ -378,6 +409,11 @@ class UltraFastMCTS:
         logits_f = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
         values_f = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
+        if self._policy_temp != 1.0:
+            # Заострение (T<1) или размывание (T>1) приоритета. Делается на
+            # логитах до softmax — это и есть температура, а не возведение
+            # вероятностей в степень с последующей нормировкой.
+            logits_f = logits_f / self._policy_temp
         policies = torch.softmax(logits_f, dim=1).cpu().numpy()
 
         if values_f.shape[-1] == 3:
@@ -397,6 +433,19 @@ class UltraFastMCTS:
 
         return policies[:n], q_values[:n], d_values[:n], m_values[:n]
 
+    def raw_policies(self, engines: List) -> np.ndarray:
+        """Политика сети БЕЗ поиска — один прогон на позицию.
+
+        Нужна, чтобы столкнуть «ход интуиции» с «ходом поиска» в матче: вопрос
+        «улучшает ли поиск политику в середине партии» нельзя решить внешним
+        арбитром (у движка в этом варианте классическая оценка, слабая как раз
+        в тихих позициях), зато его можно решить очками."""
+        arr = np.ascontiguousarray(
+            np.stack([np.asarray(e.get_board_tensor(), dtype=np.float32)
+                      for e in engines]))
+        policies, _, _, _ = self._infer(arr)
+        return policies
+
     def new_tree(self, engines: List):
         """Fresh RustMCTS over `engines`, configured from this instance's flags."""
         rust_mcts = _RustMCTS(engines, self._parallel_sims)
@@ -410,9 +459,11 @@ class UltraFastMCTS:
             rust_mcts.set_rep_search_perslot(True)
         if self._rust_c_puct is not None:
             rust_mcts.set_c_puct(self._rust_c_puct)
+        if self._rust_fpu is not None:
+            rust_mcts.set_fpu_reduction(self._rust_fpu)
         return rust_mcts
 
-    def run_search(self, rust_mcts, simulations: int) -> None:
+    def run_search(self, rust_mcts, simulations: int, deadline: float = None) -> None:
         """Run one search on an existing tree: collect → infer → apply, with
         Lc0-style KLD early exit. Leaves the tree in place, so callers doing
         tree reuse (self-play, game_stats) drive the same loop as one-shot
@@ -427,15 +478,24 @@ class UltraFastMCTS:
         steps = max(1, (simulations + parallel - 1) // parallel)
         kld_enabled = self.kld_threshold > 0.0
         kld_min_steps = int(np.ceil(steps * self.kld_min_sims_frac))
+        # Сколько симуляций реально сделано: заказ не равен факту, если сработал
+        # срок или ранний выход по сходимости. Нужно для честного протокола партии.
+        self.last_sims_done = 0
         if kld_enabled:
             rust_mcts.kld_reset_all()
         self._kld_total_calls += 1
         self._kld_sims_requested += simulations
 
         for step in range(steps):
+            # Жёсткий срок для игры по часам: судья выдаёт бюджет на ход, поиск
+            # обязан уложиться. Проверяем между пачками — прерывать пачку на
+            # полпути нельзя, Rust ждёт выводы сети обратно на свои листья.
+            if deadline is not None and step > 0 and time.perf_counter() >= deadline:
+                break
             leaf_matrix = rust_mcts.collect_leaves(simulations)
             if leaf_matrix.shape[0] == 0:
                 break
+            self.last_sims_done += int(leaf_matrix.shape[0])
             curr_counts = rust_mcts.get_current_batch_counts()
             curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
             p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
@@ -458,17 +518,19 @@ class UltraFastMCTS:
                         self._kld_sims_saved += (steps - step - 1) * parallel
                         break
 
-    def search_games(self, engines: List, simulations: int = 80) -> List[np.ndarray]:
-        return self.search_games_with_values(engines, simulations)[0]
+    def search_games(self, engines: List, simulations: int = 80,
+                     deadline: float = None) -> List[np.ndarray]:
+        return self.search_games_with_values(engines, simulations, deadline)[0]
 
-    def search_games_with_values(self, engines: List, simulations: int = 80):
+    def search_games_with_values(self, engines: List, simulations: int = 80,
+                                 deadline: float = None):
         """Returns (policies, values). values are needed for resign logic.
 
         If self.kld_threshold > 0, MCTS may stop early when the
         visit distribution stops changing (Lc0 smart pruning).
         """
         rust_mcts = self.new_tree(engines)
-        self.run_search(rust_mcts, simulations)
+        self.run_search(rust_mcts, simulations, deadline)
         raw_policies = rust_mcts.get_policies()
         raw_values   = rust_mcts.get_values()
         policies = [np.array(p, dtype=np.float32) for p in raw_policies]
