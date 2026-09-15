@@ -19,6 +19,7 @@ English.
 """
 
 import math
+import re
 import os
 import subprocess
 import sys
@@ -1140,6 +1141,10 @@ class NibblerGUI(QMainWindow):
         btn_load = QPushButton("📂 Загрузить веса")
         btn_load.clicked.connect(self.load_weights)
         lay.addWidget(btn_load)
+
+        btn_game = QPushButton("♟ Открыть партию")
+        btn_game.clicked.connect(self.load_game)
+        lay.addWidget(btn_game)
         lay.addWidget(self._vline())
 
         lay.addWidget(QLabel("Режим:"))
@@ -1280,6 +1285,60 @@ class NibblerGUI(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_F), self, self.flip_board)
         QShortcut(QKeySequence(Qt.Key_Space), self, self._toggle_analysis)
 
+    # ---- game loading ----
+    def load_game(self):
+        """Открыть сыгранную партию и листать её стрелками.
+
+        Формат нарочно нетребовательный: берутся любые ходы вида e2e4 (с буквой
+        превращения, если есть), а номера, заголовки PGN и комментарии
+        пропускаются. Так читается и наш собственный протокол, и PGN, который
+        пишет play_fsf.py."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Открыть партию", "",
+            "Партия (*.pgn *.txt *.uci);;Все файлы (*)")
+        if not path:
+            return
+        try:
+            text = open(path, encoding="utf-8", errors="ignore").read()
+        except OSError as e:
+            QMessageBox.warning(self, "Не открылось", str(e))
+            return
+
+        tokens = re.findall(r"\b[a-j](?:10|[1-9])[a-j](?:10|[1-9])[qrbnacQRBNAC]?\b", text)
+        if not tokens:
+            QMessageBox.warning(self, "Пусто",
+                                "В файле не нашлось ходов вида e2e4.")
+            return
+
+        eng = CapablancaEngine()
+        moves = []
+        for i, uci in enumerate(tokens):
+            found = None
+            for m in eng.get_legal_moves_int():
+                if move_to_uci(m) == uci:
+                    found = m
+                    break
+            if found is None:
+                QMessageBox.warning(
+                    self, "Ход не по правилам",
+                    f"Полуход {i + 1} ({uci}) не находится среди возможных.\n"
+                    f"Загружено {len(moves)} полуходов до него.")
+                break
+            eng.make_move_int(found)
+            moves.append(found)
+            if eng.is_game_over():
+                break
+
+        if not moves:
+            return
+        self.stop_search()
+        self.history = moves
+        self.cursor = 0
+        self.refresh()
+        self.statusBar().showMessage(
+            f"Загружена партия: {len(moves)} полуходов. "
+            f"Стрелки — вперёд и назад, Home и End — в начало и конец.")
+
     # ---- model loading ----
     def load_weights(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1324,9 +1383,16 @@ class NibblerGUI(QMainWindow):
 
     def _autoload(self):
         """Load capablanca.onnx sitting next to the program, if present, so a
-        packaged build opens ready to analyse without touching a dialog."""
-        cand = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "capablanca.onnx")
+        packaged build opens ready to analyse without touching a dialog.
+
+        In a PyInstaller build `__file__` points inside the bundle, which is a
+        temporary directory the user never sees — the net has to be looked for
+        next to the executable instead."""
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        cand = os.path.join(base, "capablanca.onnx")
         if os.path.exists(cand):
             self._load_onnx(cand)
 
