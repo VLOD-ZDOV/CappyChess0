@@ -656,6 +656,14 @@ class Config:
     temperature_late: float = 0.0     # tau after temperature_moves: 0.0 = hard argmax (better mating)
     games_per_iter: int = 128
     max_game_length: int = 300  # ply (LC0=450 for chess, Capablanca ~1.5x longer but be careful)
+    # Партию, отыгравшую столько полуходов подряд, снять с пула и отложить в
+    # очередь: она доигрывается позже, а слот тем временем занимает другая.
+    # 0 = выключено. Замер 15.09: порог 150 даёт ~6% скорости сам по себе,
+    # а вместе с доливом слотов — до потолка в 19%.
+    park_after_plies: int = 0
+    # Отложить остаток пула, когда новых партий в итерации уже нет, а живых
+    # слотов осталось меньше половины: в этом режиме лист стоит вдвое дороже.
+    park_tail: bool = False
     mcts_batch: int = 128
     mcts_parallel_sims: int = 32  # leaves per MCTS step (more = fewer round-trips Python↔GPU)
     # torch.compile mode for inference net: None / 'default' / 'reduce-overhead' / 'max-autotune'.
@@ -726,6 +734,17 @@ class Config:
     pretrain_only: bool = False  # exit immediately after distillation (skip self-play loop)
 
     # Buffer
+    # Инференс self-play через TensorRT вместо torch.compile: 1.40x на замере
+    # 14.09, лучший ход совпадает в 100% позиций. Движок пересобирается каждую
+    # итерацию под свежие веса (экспорт + сборка — десятки секунд).
+    trt_inference: bool = False
+    # Пессимизм поиска к непосещённым ходам. None = умолчание движка (0.33).
+    # В ИГРЕ высокое значение доказано матчем (15.09: 1.0 против 0.33 — 60.2%,
+    # около +72 Elo). В SELF-PLAY это НЕ то же самое: цель для политики — само
+    # распределение посещений, и делая его резче, мы приближаем цель к тому, что
+    # сеть и так думает. Менять только после отдельного замера.
+    fpu: float = None
+    policy_temp: float = 1.0
     buffer_max: int = 1_000_000
     buffer_min_to_train: int = 10_000
 
@@ -1243,7 +1262,31 @@ def print_diversity(stats: dict, prefix: str = "  Diversity"):
 
 # ── Self-play ─────────────────────────────────────────────────────────────────
 
+# Партии, снятые с пачки на пороге длины и ждущие доигрывания. Живут между
+# итерациями: слот освобождается сразу, а партия доигрывается там, где для неё
+# найдётся место. Содержимое — состояние слота, см. _park ниже.
+_PARKED_GAMES: List[dict] = []
+
+
 def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration: int = 0) -> List[Sample]:
+    """Самоигра пулом слотов.
+
+    Партии идут синхронно: пока в пачке жива хоть одна, сеть зовут на каждом её
+    полуходе. К концу пачки живых остаётся две-три из 32, и вызов на 16 листьев
+    стоит вдвое дороже за лист, чем полный (замер 15.09: 290 против 143 мкс) —
+    карта упирается в запуск ядер, а не в счёт. Поэтому слот не простаивает:
+    как только партия кончилась, в него садится следующая.
+
+    Долив НОВОЙ партией был бы ловушкой, будь счётчик ходов общим на пачку:
+    температура падает до argmax после `--temperature-moves`, и новая партия в
+    старом слоте пошла бы без разнообразия с первого хода. Счётчик здесь свой у
+    каждой партии (`ply`), поэтому долив безопасен.
+
+    `--park-after-plies N` (0 = выключено) снимает с пачки партию, отыгравшую N
+    полуходов подряд, и откладывает её в общую очередь. Данные от этого не
+    меняются: партия доигрывается тем же поиском, просто позже и в полной пачке.
+    Плата — её позиции попадут в буфер на итерацию-другую позже.
+    """
     kld_thr = cfg.kld_threshold if cfg.kld_enabled else 0.0
     mcts = UltraFastMCTS(net, device, cfg.c_puct, batch_size=cfg.mcts_batch,
                          parallel_sims=cfg.mcts_parallel_sims,
@@ -1251,283 +1294,376 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                          kld_threshold=kld_thr,
                          kld_check_every=cfg.kld_check_every,
                          kld_min_sims_frac=cfg.kld_min_sims_frac,
-                         contempt=cfg.contempt)
+                         contempt=cfg.contempt,
+                         trt_inference=cfg.trt_inference,
+                         rust_fpu=cfg.fpu, policy_temp=cfg.policy_temp)
     all_samples: List[Sample] = []
 
-    batch_sz = cfg.mcts_batch
-    num_batches = (cfg.games_per_iter + batch_sz - 1) // batch_sz
+    slots = max(1, min(cfg.mcts_batch, cfg.games_per_iter))
+    park_after = max(0, int(cfg.park_after_plies))
+    park_tail = bool(cfg.park_tail)
 
-    for b in range(num_batches):
-        start = b * batch_sz
-        n = min(batch_sz, cfg.games_per_iter - start)
-        engines = [CapablancaEngine() for _ in range(n)]
-        histories: List[List] = [[] for _ in range(n)]
-        # Per-side counters: v alternates sign ply-to-ply
-        # (root from side-to-move perspective), a shared counter would reset every other half-move.
-        resign_counts = [[0, 0] for _ in range(n)]
-        resigned = [False] * n
-        # LC0 resign playthrough: with probability resign_playthrough play WITHOUT resign
-        # (to calibrate the threshold and gather data about "tough positions").
-        enable_resign = [np.random.random() >= cfg.resign_playthrough for _ in range(n)]
+    engines: List = [None] * slots
+    histories: List[List] = [[] for _ in range(slots)]
+    resign_counts = [[0, 0] for _ in range(slots)]
+    resigned = [False] * slots
+    adjudicated: List[Optional[float]] = [None] * slots
+    enable_resign = [True] * slots
+    ply = [0] * slots        # полуходов в ЭТОЙ партии, с её первого хода
+    stint = [0] * slots      # полуходов с момента, как партия села в этот слот
+    live = [False] * slots
 
-        active = list(range(n))
-        move_num = 0
-        adjudicated = [None] * n
+    placed = 0               # партий посажено в слоты за итерацию (бюджет)
+    started = 0              # из них начатых с нуля
+    done = 0                 # партий доиграно
+    pos_count = 0
+    parked_n = resumed_n = 0
+    mate_w = mate_b = draws = adjudications = 0
+    resign_w = resign_b = 0
+    timeout_w = timeout_b = timeout_d = 0
+    reported = 0             # сколько партий уже попало в строки отчёта
 
-        # Tree reuse: one RustMCTS for the entire game batch. After each move
-        # make_move(game_idx, move) shifts the root to the chosen child and
-        # keeps the sub-tree — 2-3x better quality at the same inference cost.
-        rust_mcts_reuse = mcts.new_tree(engines)
+    def _take(i: int) -> bool:
+        """Посадить в слот i отложенную партию, иначе новую. False = нечем.
 
-        while active and move_num < cfg.max_game_length:
-            # Playout Cap Randomization: on fast_sim_fraction moves use fast_simulations
-            # Decision applied to the whole batch simultaneously (shared MCTS object)
-            use_full_search = np.random.random() >= cfg.fast_sim_fraction
-            current_sims = cfg.simulations if use_full_search else cfg.fast_simulations
+        Бюджет итерации — это НОВЫЕ партии: `games_per_iter` штук, как и раньше.
+        Подхваченная из очереди партия бюджет не тратит, она уже начата в одной
+        из прошлых итераций. Когда новых партий не осталось, пул больше никого
+        не сажает и спокойно доигрывает то, что в нём есть.
+        """
+        nonlocal placed, started, resumed_n
+        if started >= cfg.games_per_iter:
+            live[i] = False
+            return False
+        if _PARKED_GAMES:
+            g = _PARKED_GAMES.pop(0)
+            engines[i] = g["engine"]
+            histories[i] = g["history"]
+            resign_counts[i] = g["resign_counts"]
+            enable_resign[i] = g["enable_resign"]
+            ply[i] = g["ply"]
+            resumed_n += 1
+        else:
+            engines[i] = CapablancaEngine()
+            histories[i] = []
+            resign_counts[i] = [0, 0]
+            # LC0 resign playthrough: доля партий играется БЕЗ права сдаться,
+            # чтобы калибровать порог и собирать данные о тяжёлых позициях.
+            enable_resign[i] = np.random.random() >= cfg.resign_playthrough
+            ply[i] = 0
+            started += 1
+        placed += 1
+        resigned[i] = False
+        adjudicated[i] = None
+        stint[i] = 0
+        live[i] = True
+        return True
 
-            # collect → infer → apply (+ KLD early exit) lives in UltraFastMCTS
-            # so self-play, eval and game_stats all drive the same loop.
-            mcts.run_search(rust_mcts_reuse, current_sims)
-            sparse_pols = rust_mcts_reuse.get_policies_sparse()
-            raw_vals  = rust_mcts_reuse.get_values()
-            raw_draws = rust_mcts_reuse.get_draws()
-            # Gumbel completed-Q policy target: fetch per-child root stats. Only
-            # the STORED target uses it; move selection below stays on visit counts.
-            gumbel = cfg.policy_target_mode == "gumbel"
-            child_stats = rust_mcts_reuse.get_root_children_stats() if gumbel else None
-            # get_policies_sparse()/get_values() return one entry per EACH game
-            # in rust_mcts_reuse.games (length = n, not len(active)).
-            # Index by game_idx; otherwise after the first game in the batch finishes
-            # all remaining games get wrong policy/value.
-            values_np = np.array(raw_vals,  dtype=np.float32)
-            draws_np  = np.array(raw_draws, dtype=np.float32)
+    def _park(i: int) -> None:
+        """Снять партию с пачки, не доигрывая: слот нужен другим."""
+        nonlocal parked_n
+        _PARKED_GAMES.append({
+            "engine": engines[i],
+            "history": histories[i],
+            "resign_counts": resign_counts[i],
+            "enable_resign": enable_resign[i],
+            "ply": ply[i],
+        })
+        parked_n += 1
 
-            new_active = []
-            for j, game_idx in enumerate(active):
-                eng = engines[game_idx]
-                legal = eng.get_legal_moves_int()
-                if not legal:
-                    rust_mcts_reuse.set_game_finished(game_idx)
-                    continue
+    def _finish(i: int) -> None:
+        """Партия кончилась: определить исход и выложить позиции в буфер."""
+        nonlocal done, pos_count
+        nonlocal mate_w, mate_b, draws, adjudications
+        nonlocal resign_w, resign_b, timeout_w, timeout_b, timeout_d
+        eng = engines[i]
+        if resigned[i]:
+            # Сдача: проиграл тот, кто ходил последним.
+            last_side = histories[i][-1][2] if histories[i] else 0
+            result = -1.0 if last_side == 0 else 1.0
+            if result > 0: resign_w += 1
+            else:          resign_b += 1
+        elif adjudicated[i] is not None:
+            result = adjudicated[i]
+            adjudications += 1
+            if result > 0: mate_w += 1
+            else:          mate_b += 1
+        elif eng.is_game_over():
+            result = eng.game_result()
+            if result == 1.0:    mate_w += 1
+            elif result == -1.0: mate_b += 1
+            else:                draws += 1
+        else:
+            result = 0.0 if cfg.timeout_as_draw else eng.material_result()
+            if result > 0.5:    timeout_w += 1
+            elif result < -0.5: timeout_b += 1
+            else:               timeout_d += 1
 
-                side = eng.side_to_move()
-                pol_idx_raw, pol_val_raw = sparse_pols[game_idx]
-                pol_lookup = {
-                    int(idx): float(val)
-                    for idx, val in zip(pol_idx_raw, pol_val_raw)
-                }
-                root_v_raw = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
-                root_d_raw = float(draws_np[game_idx]) if game_idx < len(draws_np) else 0.0
-                keep_position = (
-                    (not cfg.playout_cap_train_only_full) or use_full_search
-                )
-                if keep_position:
-                    # Board encoding is expensive. For PCR fast-search moves the
-                    # sample is discarded later, so do not compute/store it.
-                    board_np = np.asarray(eng.get_board_tensor(), dtype=np.float32)
-                    if gumbel and game_idx < len(child_stats):
-                        c_idx, c_pri, c_vis, c_q = child_stats[game_idx]
-                        g_idx, g_val = gumbel_improved_policy(
-                            c_idx, c_pri, c_vis, c_q, root_v_raw)
-                        pol_sparse = (
-                            np.asarray(g_idx, dtype=np.int16),
-                            np.asarray(g_val, dtype=np.float16),
-                        )
-                    else:
-                        pol_sparse = (
-                            np.asarray(pol_idx_raw, dtype=np.int16),
-                            np.asarray(pol_val_raw, dtype=np.float16),
-                        )
-                else:
-                    board_np = None
-                    pol_sparse = None
-                # idx 5 (move_idx) — policy index of selected move, patched below
-                # after sampling. idx 6 (root_d_raw) — search draw prob for the
-                # full-WDL Q-blend. List (not tuple) so move_idx can be mutated.
-                histories[game_idx].append(
-                    [board_np, pol_sparse, side, root_v_raw, use_full_search, -1,
-                     root_d_raw])
+        total_plies = len(histories[i])
+        for k, entry in enumerate(histories[i]):
+            board_np, pol_sparse, side = entry[0], entry[1], entry[2]
+            # Playout cap: позиции быстрого поиска в обучение не идут.
+            if cfg.playout_cap_train_only_full and len(entry) > 4 and not entry[4]:
+                continue
+            if board_np is None or pol_sparse is None:
+                continue
+            v = result if side == 0 else -result
+            draw_target = -1.0   # sentinel → WDL восстанавливается из v (legacy)
+            # Цель value — смесь исхода z и корневой оценки поиска (KataGo/LC0).
+            # Чистый z шумен: одна поздняя ошибка переворачивает метку у всех
+            # предыдущих позиций. Поиск уже оценил ЭТУ позицию (entry[3]=root_Q,
+            # entry[6]=root_D, POV ходящего, тот же знак, что у z).
+            if cfg.value_q_weight > 0.0:
+                root_q = entry[3]
+                root_d = entry[6] if len(entry) > 6 else None
+                if root_q is not None:
+                    w = cfg.value_q_weight
+                    v = (1.0 - w) * v + w * float(root_q)
+                    if root_d is not None:
+                        z_is_draw = 1.0 if abs(result) < 1e-6 else 0.0
+                        draw_target = (1.0 - w) * z_is_draw + w * float(root_d)
+            # MLH: сколько полуходов ОСТАЛОСЬ до конца партии, как их считает
+            # поиск — терминал 0, позиция перед матующим ходом 1.
+            remaining = max(0, total_plies - k)
+            mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
+            # Цель future-головы: ход через два полухода (наш следующий, та же
+            # сторона и та же ориентация канонического индекса).
+            future_idx = histories[i][k + 2][5] if k + 2 < total_plies else -1
+            all_samples.append(
+                pack_sample_sparse(board_np, pol_sparse, float(v),
+                                   float(mlh_norm), int(future_idx),
+                                   float(draw_target)))
+            pos_count += 1
+        done += 1
 
-                # Temperature decay (argmax branch below catches tau ≈ 0)
-                if move_num < cfg.temperature_moves:
-                    tau = cfg.temperature
-                elif move_num < cfg.temperature_moves + 20:
-                    progress = (move_num - cfg.temperature_moves) / 20.0
-                    tau = cfg.temperature * (1 - progress) + cfg.temperature_late * progress
-                else:
-                    tau = cfg.temperature_late
-
-                raw = np.array([
-                    pol_lookup.get(eng.move_int_to_policy_idx(m), 0.0)
-                    for m in legal
-                ], dtype=np.float64)
-
-                if tau < 0.01:
-                    # tau≈0 = hard argmax (avoid 1/0 = inf → NaN)
-                    if np.isfinite(raw).all() and raw.max(initial=0.0) > 0.0:
-                        move = int(legal[int(np.argmax(raw))])
-                    else:
-                        move = int(np.random.choice(legal))
-                else:
-                    if np.isfinite(raw).all() and raw.max(initial=0.0) > 0.0:
-                        raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
-                        s = raw.sum()
-                        probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
-                    else:
-                        probs = np.ones(len(legal)) / len(legal)
-                    move = int(np.random.choice(legal, p=probs))
-
-                # Record canonical policy index of the selected move in history —
-                # this is the future target for the future head of neighboring positions.
-                _mpidx = eng.move_int_to_policy_idx(move)
-                histories[game_idx][-1][5] = _mpidx if _mpidx is not None else -1
-
-                eng.make_move_int(move)
-                rust_mcts_reuse.make_move(game_idx, move)  # tree reuse
-
-                if eng.is_game_over():
-                    rust_mcts_reuse.set_game_finished(game_idx)
-                    continue
-
-                # Resign: WDL-based (LC0-style), with playthrough probability.
-                # P(L) = (1 - Q - D) / 2 — exact probability of losing.
-                # enable_resign[g]=False → play to completion (for calibration + data).
-                if move_num >= cfg.resign_min_move and enable_resign[game_idx]:
-                    q = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
-                    d = float(draws_np[game_idx])  if game_idx < len(draws_np)  else 0.0
-                    p_loss = max(0.0, min(1.0, (1.0 - q - d) / 2.0))
-                    _wdl_thr = (cfg.resign_wdl_early
-                                if iteration < cfg.resign_warmup_iters
-                                else cfg.resign_wdl_threshold)
-                    _q_thr = (cfg.resign_threshold_early
-                              if iteration < cfg.resign_warmup_iters
-                              else cfg.resign_threshold)
-                    # Triggers if EITHER P(L) is high OR Q is low (old checkpoints have D=0)
-                    should_resign = p_loss > _wdl_thr or q < _q_thr
-                    if should_resign:
-                        resign_counts[game_idx][side] += 1
-                    else:
-                        resign_counts[game_idx][side] = 0
-
-                    if resign_counts[game_idx][side] >= cfg.resign_consec:
-                        resigned[game_idx] = True
-                        # Rust cannot see a resignation — tell it, or the dead
-                        # game keeps eating leaves out of every GPU batch.
-                        rust_mcts_reuse.set_game_finished(game_idx)
-                        continue
-
-                # Adjudication:
-                # If after the move there is a decisive material advantage
-                # (≥8 points, ≥10 moves without captures, ≥15 full moves) —
-                # end the game without waiting for checkmate or timeout.
-                adj = eng.adjudication_result() if cfg.adjudicate else None
-                if adj is not None and cfg.adjudicate_q_gate > 0.0:
-                    # lc0-style net confirmation: root_v_raw is the side-to-move
-                    # (mover) POV value of the pre-move position; convert to white
-                    # POV and require it to agree with the material verdict (adj is
-                    # white POV ±1). Rejects fortress/compensation false positives.
-                    root_v_white = root_v_raw if side == 0 else -root_v_raw
-                    if root_v_white * adj < cfg.adjudicate_q_gate:
-                        adj = None
-                if adj is not None:
-                    adjudicated[game_idx] = adj
-                    rust_mcts_reuse.set_game_finished(game_idx)
-                else:
-                    new_active.append(game_idx)
-
-            active = new_active
-            move_num += 1
-
-        batch_positions = 0
-        # Game categories. Win/loss counts split BY OUTCOME TYPE so a colour
-        # imbalance isn't hidden inside the resign/timeout buckets — that used
-        # to look like "black wins more" when in reality most black wins came
-        # from white resigning. resigns/timeouts are still also reported as
-        # totals for backward-compat sanity.
-        mate_w = mate_b = draws = adjudications = 0
-        resign_w = resign_b = 0     # split by who actually won
-        timeout_w = timeout_b = timeout_d = 0
-
-        for i, eng in enumerate(engines):
-            if resigned[i]:
-                # Resignation: the side that moved last lost
-                # Determine who resigned from side_to_move (opponent to move → previous side resigned)
-                last_side = histories[i][-1][2] if histories[i] else 0
-                result = -1.0 if last_side == 0 else 1.0
-                if result > 0: resign_w += 1
-                else:          resign_b += 1
-            elif adjudicated[i] is not None:
-                # Adjudication — decisive material advantage
-                result = adjudicated[i]
-                adjudications += 1
-                if result > 0: mate_w += 1
-                else:          mate_b += 1
-            elif eng.is_game_over():
-                result = eng.game_result()
-                if result == 1.0:   mate_w += 1
-                elif result == -1.0: mate_b += 1
-                else:                draws += 1
-            else:
-                result = 0.0 if cfg.timeout_as_draw else eng.material_result()
-                if result > 0.5:    timeout_w += 1
-                elif result < -0.5: timeout_b += 1
-                else:                timeout_d += 1
-
-            total_plies = len(histories[i])
-            for k, entry in enumerate(histories[i]):
-                board_np, pol_sparse, side = entry[0], entry[1], entry[2]
-                # Playout cap: skip fast-search positions during training
-                if cfg.playout_cap_train_only_full and len(entry) > 4 and not entry[4]:
-                    continue
-                if board_np is None or pol_sparse is None:
-                    continue
-                v = result if side == 0 else -result
-                draw_target = -1.0   # sentinel → WDL reconstructed from v (legacy)
-                # Value target = blend of game outcome z and the MCTS root value
-                # (KataGo/LC0). Pure z is high-variance: one late blunder flips the
-                # label on every earlier position. The search already evaluated THIS
-                # position (entry[3]=root_Q, entry[6]=root_D, side-to-move POV, same
-                # sign as z), a far lower-variance estimate. Full WDL: blend the
-                # win-loss axis (Q) AND the draw axis (D). value_q_weight=0 → pure-z.
-                if cfg.value_q_weight > 0.0:
-                    root_q = entry[3]
-                    root_d = entry[6] if len(entry) > 6 else None
-                    if root_q is not None:
-                        w = cfg.value_q_weight
-                        v = (1.0 - w) * v + w * float(root_q)
-                        if root_d is not None:
-                            z_is_draw = 1.0 if abs(result) < 1e-6 else 0.0
-                            draw_target = (1.0 - w) * z_is_draw + w * float(root_d)
-                # MLH target: how many half-moves REMAIN from this position to game end.
-                # Normalized to [0, 1] by dividing by MLH_PLY_NORM. Counted the way
-                # the search counts it: a terminal position is 0 and every ply before
-                # it adds one, so the position before the mating move is 1, not 0.
-                # (On timeout the final position is unknown → use the game "tail" as-is.)
-                remaining = max(0, total_plies - k)
-                mlh_norm = min(1.0, remaining / MLH_PLY_NORM)
-                # Future move target: move at k+2 (our next move — same side,
-                # same canonical policy-index orientation). -1 if game ended.
-                future_idx = histories[i][k + 2][5] if k + 2 < total_plies else -1
-                all_samples.append(
-                    pack_sample_sparse(board_np, pol_sparse, float(v),
-                                       float(mlh_norm), int(future_idx),
-                                       float(draw_target)))
-                batch_positions += 1
-
-        # Aggregate totals per colour across all outcome types. Adjudications
-        # are already counted inside mate_w/mate_b above, so they aren't added.
+    def _report() -> None:
+        """Строка отчёта — та же, что раньше печаталась на каждую пачку."""
         total_w = mate_w + resign_w + timeout_w
         total_b = mate_b + resign_b + timeout_b
         total_d = draws + timeout_d
-        total_counted = total_w + total_b + total_d
-        sanity = "" if total_counted == n else f" ⚠️ sanity {total_counted}/{n}"
-        print(f"  Batch {b+1}/{num_batches}: {n} games, "
-              f"{batch_positions} positions, {move_num} ходов | "
+        counted = total_w + total_b + total_d
+        sanity = "" if counted == done else f" ⚠️ sanity {counted}/{done}"
+        extra = ""
+        if park_after or park_tail:
+            extra = (f" | отложено {parked_n}, подхвачено {resumed_n}, "
+                     f"в очереди {len(_PARKED_GAMES)}")
+        print(f"  Партий {done}/{cfg.games_per_iter}: {pos_count} positions | "
               f"W={total_w} (мат {mate_w}, resign {resign_w}, timeout {timeout_w}) · "
               f"B={total_b} (мат {mate_b}, resign {resign_b}, timeout {timeout_b}) · "
-              f"D={total_d} (пат {draws}, timeout {timeout_d}){sanity}")
+              f"D={total_d} (пат {draws}, timeout {timeout_d}){sanity}{extra}")
 
-    # KLD-early-exit statistics
+    for i in range(slots):
+        _take(i)
+    if not any(live):
+        return all_samples
+    # Переиспользование дерева: один RustMCTS на весь пул. После сыгранного хода
+    # make_move(slot, move) сдвигает корень в выбранного ребёнка и сохраняет
+    # поддерево — 2-3x качества поиска за ту же цену. Освободившийся слот
+    # получает новое дерево через reset_game, деревья соседей не страдают.
+    rust_mcts_reuse = mcts.new_tree(engines)
+
+    while any(live):
+        # Playout Cap Randomization: доля ходов ищется укороченным поиском.
+        # Решение общее на шаг пула — партии всё равно ищут независимо.
+        use_full_search = np.random.random() >= cfg.fast_sim_fraction
+        current_sims = cfg.simulations if use_full_search else cfg.fast_simulations
+
+        # collect → infer → apply (+ ранний выход по KLD) живёт в UltraFastMCTS,
+        # чтобы самоигра, матчи и диагностика гоняли один и тот же цикл.
+        mcts.run_search(rust_mcts_reuse, current_sims)
+        sparse_pols = rust_mcts_reuse.get_policies_sparse()
+        raw_vals  = rust_mcts_reuse.get_values()
+        raw_draws = rust_mcts_reuse.get_draws()
+        gumbel = cfg.policy_target_mode == "gumbel"
+        child_stats = rust_mcts_reuse.get_root_children_stats() if gumbel else None
+        values_np = np.array(raw_vals,  dtype=np.float32)
+        draws_np  = np.array(raw_draws, dtype=np.float32)
+
+        # Слоты, которые освободятся на этом шаге: их занимаем ПОСЛЕ прохода,
+        # иначе новая партия попадёт под чужие policy/value этого же шага.
+        freed: List[int] = []
+        to_park: List[int] = []
+
+        for game_idx in [i for i in range(slots) if live[i]]:
+            eng = engines[game_idx]
+            legal = eng.get_legal_moves_int()
+            if not legal:
+                rust_mcts_reuse.set_game_finished(game_idx)
+                freed.append(game_idx)
+                continue
+
+            side = eng.side_to_move()
+            pol_idx_raw, pol_val_raw = sparse_pols[game_idx]
+            pol_lookup = {
+                int(idx): float(val)
+                for idx, val in zip(pol_idx_raw, pol_val_raw)
+            }
+            root_v_raw = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
+            root_d_raw = float(draws_np[game_idx]) if game_idx < len(draws_np) else 0.0
+            keep_position = (
+                (not cfg.playout_cap_train_only_full) or use_full_search
+            )
+            if keep_position:
+                # Кодирование доски дорогое. Позиции быстрого поиска всё равно
+                # выбрасываются — не считаем их.
+                board_np = np.asarray(eng.get_board_tensor(), dtype=np.float32)
+                if gumbel and game_idx < len(child_stats):
+                    c_idx, c_pri, c_vis, c_q = child_stats[game_idx]
+                    g_idx, g_val = gumbel_improved_policy(
+                        c_idx, c_pri, c_vis, c_q, root_v_raw)
+                    pol_sparse = (
+                        np.asarray(g_idx, dtype=np.int16),
+                        np.asarray(g_val, dtype=np.float16),
+                    )
+                else:
+                    pol_sparse = (
+                        np.asarray(pol_idx_raw, dtype=np.int16),
+                        np.asarray(pol_val_raw, dtype=np.float16),
+                    )
+            else:
+                board_np = None
+                pol_sparse = None
+            # idx 5 (move_idx) — индекс выбранного хода, дописывается ниже после
+            # выбора. idx 6 (root_d_raw) — вероятность ничьей от поиска, для
+            # полного WDL в Q-смешивании. Список, а не кортеж — idx 5 меняется.
+            histories[game_idx].append(
+                [board_np, pol_sparse, side, root_v_raw, use_full_search, -1,
+                 root_d_raw])
+
+            # Температура по счётчику ЭТОЙ партии, а не пула: в слоте может
+            # сидеть партия, начатая позже остальных.
+            gply = ply[game_idx]
+            if gply < cfg.temperature_moves:
+                tau = cfg.temperature
+            elif gply < cfg.temperature_moves + 20:
+                progress = (gply - cfg.temperature_moves) / 20.0
+                tau = cfg.temperature * (1 - progress) + cfg.temperature_late * progress
+            else:
+                tau = cfg.temperature_late
+
+            raw = np.array([
+                pol_lookup.get(eng.move_int_to_policy_idx(m), 0.0)
+                for m in legal
+            ], dtype=np.float64)
+
+            if tau < 0.01:
+                # tau≈0 = жёсткий argmax (1/0 = inf → NaN)
+                if np.isfinite(raw).all() and raw.max(initial=0.0) > 0.0:
+                    move = int(legal[int(np.argmax(raw))])
+                else:
+                    move = int(np.random.choice(legal))
+            else:
+                if np.isfinite(raw).all() and raw.max(initial=0.0) > 0.0:
+                    raw = np.power(np.maximum(raw, 1e-8), 1.0 / tau)
+                    s = raw.sum()
+                    probs = raw / s if s > 0 else np.ones(len(legal)) / len(legal)
+                else:
+                    probs = np.ones(len(legal)) / len(legal)
+                move = int(np.random.choice(legal, p=probs))
+
+            # Канонический индекс выбранного хода — цель future-головы для
+            # соседних позиций.
+            _mpidx = eng.move_int_to_policy_idx(move)
+            histories[game_idx][-1][5] = _mpidx if _mpidx is not None else -1
+
+            eng.make_move_int(move)
+            rust_mcts_reuse.make_move(game_idx, move)  # переиспользование дерева
+            ply[game_idx] += 1
+            stint[game_idx] += 1
+
+            if eng.is_game_over():
+                rust_mcts_reuse.set_game_finished(game_idx)
+                freed.append(game_idx)
+                continue
+
+            # Сдача по WDL (как у LC0), с долей партий без права сдаться.
+            # P(L) = (1 - Q - D) / 2 — точная вероятность проигрыша.
+            if ply[game_idx] >= cfg.resign_min_move and enable_resign[game_idx]:
+                q = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
+                d = float(draws_np[game_idx])  if game_idx < len(draws_np)  else 0.0
+                p_loss = max(0.0, min(1.0, (1.0 - q - d) / 2.0))
+                _wdl_thr = (cfg.resign_wdl_early
+                            if iteration < cfg.resign_warmup_iters
+                            else cfg.resign_wdl_threshold)
+                _q_thr = (cfg.resign_threshold_early
+                          if iteration < cfg.resign_warmup_iters
+                          else cfg.resign_threshold)
+                # Срабатывает, если ЛИБО P(L) велика, ЛИБО Q мала (у старых
+                # чекпоинтов D=0).
+                should_resign = p_loss > _wdl_thr or q < _q_thr
+                if should_resign:
+                    resign_counts[game_idx][side] += 1
+                else:
+                    resign_counts[game_idx][side] = 0
+
+                if resign_counts[game_idx][side] >= cfg.resign_consec:
+                    resigned[game_idx] = True
+                    # Rust не видит сдачу — без этого мёртвая партия продолжает
+                    # выедать листья из каждой пачки на карту.
+                    rust_mcts_reuse.set_game_finished(game_idx)
+                    freed.append(game_idx)
+                    continue
+
+            # Судья: решающий материальный перевес (≥8 пешек, ≥10 ходов без
+            # взятий, ≥15 полных ходов) — закончить, не дожидаясь мата.
+            adj = eng.adjudication_result() if cfg.adjudicate else None
+            if adj is not None and cfg.adjudicate_q_gate > 0.0:
+                # Подтверждение сетью в духе lc0: root_v_raw — оценка позиции ДО
+                # хода с POV ходящего; переводим в POV белых и требуем согласия
+                # с материальным приговором (adj — ±1 с POV белых). Отсекает
+                # крепости и позиционную компенсацию.
+                root_v_white = root_v_raw if side == 0 else -root_v_raw
+                if root_v_white * adj < cfg.adjudicate_q_gate:
+                    adj = None
+            if adj is not None:
+                adjudicated[game_idx] = adj
+                rust_mcts_reuse.set_game_finished(game_idx)
+                freed.append(game_idx)
+                continue
+
+            if ply[game_idx] >= cfg.max_game_length:
+                # Лимит длины: исход по материалу, как и раньше.
+                rust_mcts_reuse.set_game_finished(game_idx)
+                freed.append(game_idx)
+                continue
+
+            if park_after and stint[game_idx] >= park_after:
+                # Отложить: партия жива, но держит слот слишком долго.
+                rust_mcts_reuse.set_game_finished(game_idx)
+                to_park.append(game_idx)
+
+        # Хвост итерации: новых партий больше нет, пул наполовину опустел, и
+        # каждый следующий вызов сети идёт по удвоенной цене за лист. Оставшиеся
+        # партии дешевле отложить — в следующей итерации они доиграются в полном
+        # пуле. Это и есть та часть, ради которой очередь вообще заведена:
+        # долив слотов держит пул полным, пока новые партии не кончились.
+        if (park_tail and started >= cfg.games_per_iter and not _PARKED_GAMES
+                and not to_park):
+            still_live = [i for i in range(slots) if live[i] and i not in freed]
+            if 0 < len(still_live) <= max(1, slots // 2):
+                for i in still_live:
+                    rust_mcts_reuse.set_game_finished(i)
+                to_park.extend(still_live)
+
+        for game_idx in freed:
+            _finish(game_idx)
+        for game_idx in to_park:
+            _park(game_idx)
+        for game_idx in freed + to_park:
+            live[game_idx] = False
+            if _take(game_idx):
+                rust_mcts_reuse.reset_game(game_idx, engines[game_idx])
+        if done - reported >= slots:
+            reported = done
+            _report()
+
+    if done > reported:
+        _report()
+    if (park_after or park_tail) and _PARKED_GAMES:
+        print(f"  Отложено на следующую итерацию: {len(_PARKED_GAMES)} партий "
+              f"(позиции попадут в буфер, когда они доиграются)")
+
+    # Статистика раннего выхода по KLD
     if cfg.kld_enabled and cfg.kld_threshold > 0.0:
         _ks = mcts.kld_stats()
         if _ks['calls'] > 0:
@@ -1792,6 +1928,18 @@ def train(cfg: Config = None):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     if not torch.cuda.is_available():
         print("⚠️  CUDA не найдена, используется CPU — будет медленно")
+
+    # Потолок видеопамяти. Кэширующий аллокатор берёт память жадно и не отдаёт:
+    # на 384 каналах прогон занимал 15.5 ГБ из 16.3, и проверкам здоровья с
+    # матчами (они идут при замороженном обучении, память при этом остаётся
+    # занятой) не доставалось ничего — обе модели падали с CUDA OOM. С потолком
+    # аллокатор переиспользует кэш вместо роста, а свободный остаток достаётся
+    # проверкам. Живых тензоров тут единицы гигабайт, так что запас большой.
+    frac = float(os.environ.get("CAPA_VRAM_FRACTION", "0") or 0)
+    if frac > 0 and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(frac)
+        total = torch.cuda.get_device_properties(0).total_memory / 2**30
+        print(f"   Потолок VRAM: {frac:.0%} ({frac * total:.1f} ГБ из {total:.1f})")
 
     if cfg.use_ema and cfg.ema_decay <= 0:
         steps = max(cfg.min_train_steps, cfg.train_steps)
@@ -2341,11 +2489,22 @@ def train(cfg: Config = None):
 
         net.train()
 
+        # Отдать кэш видеопамяти перед сменой фазы. В self-play формы батчей
+        # пляшут (адаптивные бакеты + перекомпиляции), аллокатор копит мелкие
+        # куски, а тренировке нужны крупные непрерывные — переиспользовать
+        # накопленное она не может, и процесс разрастался до 15 ГБ из 15.6.
+        # После этого хватало любой мелочи со стороны (13.09: Discord занял
+        # 670 МБ под аппаратное ускорение) — и прогон падал с CUDA OOM.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         print(f"  🏋️  Тренировка (до {cfg.train_steps} шагов, ≤1 эпохи)...")
         train_start = time.time()
         # EMA is updated INSIDE train_epoch after each step (correct per-step semantics).
         metrics = train_epoch(net, optimizer, buffer, cfg, device, iteration, ema=ema)
         train_time = time.time() - train_start
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()      # и обратно, перед следующим self-play
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
@@ -2648,10 +2807,25 @@ if __name__ == "__main__":
                         help="Вероятность случайного хода FSF (0=детерминированный, 0.4=40%% рандом)")
 
     # Buffer window size and game length
+    parser.add_argument("--fpu", type=float, default=None,
+                        help="Пессимизм поиска к непосещённым ходам (умолчание "
+                             "движка 0.33). Выше — поиск сильнее доверяет политике")
+    parser.add_argument("--policy-temp", type=float, default=1.0,
+                        help="Температура приоритета в поиске: <1 заостряет, >1 размывает")
+    parser.add_argument("--trt-inference", action="store_true",
+                        help="инференс self-play через TensorRT (FP16) вместо "
+                             "torch.compile: 1.4x по замеру, движок пересобирается "
+                             "каждую итерацию под свежие веса")
     parser.add_argument("--buffer-max",       type=int,   default=1_000_000,
                         help="Максимальный размер replay буфера (default: 1000000, рек. 300000 при большом потоке данных)")
     parser.add_argument("--max-game-length",  type=int,   default=300,
                         help="Максимальная длина партии в полуходах (default: 300)")
+    parser.add_argument("--park-tail", action="store_true", default=False,
+                        help="Отложить остаток пула на следующую итерацию, когда "
+                             "новых партий нет, а живых слотов меньше половины")
+    parser.add_argument("--park-after-plies", type=int, default=0,
+                        help="Отложить партию, отыгравшую столько полуходов подряд, "
+                             "и доиграть её позже в полной пачке (0 = выключено)")
     parser.add_argument("--timeout-as-draw",  action="store_true", default=False,
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
 
@@ -2761,7 +2935,12 @@ if __name__ == "__main__":
         lag_opponent_sims=args.lag_sims,
         fsf_noise_prob=args.fsf_random_prob,
         buffer_max=args.buffer_max,
+        trt_inference=args.trt_inference,
+        fpu=args.fpu,
+        policy_temp=args.policy_temp,
         max_game_length=args.max_game_length,
+        park_after_plies=args.park_after_plies,
+        park_tail=args.park_tail,
         timeout_as_draw=args.timeout_as_draw,
     )
     train(cfg)
