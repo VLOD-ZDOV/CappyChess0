@@ -1,5 +1,7 @@
 # ♛ Capablanca Chess Zero
 
+*[Русская версия](README_RU.md)*
+
 **An AlphaZero-style engine trained entirely from self-play** — no human games,
 no opening books, no handcrafted evaluation. The network discovers everything
 on its own board.
@@ -665,8 +667,22 @@ To distribute the GUI without making users install Python and dependencies:
 3. Bundle with **PyInstaller**:
 
    ```bash
-   pyinstaller --onedir --windowed --name capablanca-gui gui.py
+   pip install pyinstaller
+   cd python_src
+   pyinstaller --noconfirm --clean --name capablanca-gui \
+       --paths . \
+       --hidden-import onnx_engine \
+       --collect-all onnxruntime \
+       --collect-all capablanca_engine \
+       --exclude-module torch --exclude-module matplotlib \
+       --exclude-module scipy --exclude-module pandas \
+       --exclude-module tensorrt --exclude-module tensorrt_libs \
+       --exclude-module triton --exclude-module cupy \
+       gui.py
    ```
+
+   The exclusions matter: without them TensorRT rides along and inflates the
+   bundle to several gigabytes, even though the GUI never uses it.
 
 4. Place `capablanca.onnx` next to the produced executable — the GUI
    auto-loads it.
@@ -696,42 +712,6 @@ intentional design choices and PyTorch/ONNX ecosystem quirks.
 
 ---
 
-## 🇷🇺 Кратко по-русски
+## 🇷🇺 По-русски
 
-AlphaZero-движок, обучаемый **только** на self-play — без человеческих
-партий и дебютных книг.
-
-**Цикл обучения:** сеть играет батч партий сама с собой, поиск MCTS даёт
-policy-таргеты (визиты) и value-таргеты (результат); позиции копятся в
-FIFO-буфере; сеть обучается на мульти-таргет лоссе (policy + value +
-moves-left + future) → новые веса → следующий раунд self-play.
-
-**Сеть `CapablancaNet`:** вход 139 плоскостей (8 досок истории × 17 + 3
-мета, канонический флип под сторону хода) → input-conv → башня
-ResNet-блоков со Squeeze-Excitation → блоки Transformer с относительным
-позиционным смещением (RPB, через `scaled_dot_product_attention`) →
-четыре головы:
-
-- **policy** — 7000 логитов, prior для MCTS;
-- **value (WDL)** — Win/Draw/Loss, оценка `Q = P(Win) − P(Loss)`;
-- **moves-left** — сколько полуходов до конца (доводить выигрыш до мата);
-- **future** — ход на 2 полухода вперёд, вспомогательная голова только
-  для обучения.
-
-Особенности: GroupNorm вместо BatchNorm (корректен при batch=1 и сдвиге
-распределения), активация Mish, RPB вместо Smolgen (≈2.3К параметров на
-блок).
-
-**MCTS:** PUCT с параметрами из Lc0, безбордовые узлы (~60 байт), батчевый
-поиск, переиспользование дерева, слияние транспозиций (в GUI), virtual
-loss с правильной формулой `(W − vloss)/N` для разброса параллельных
-селектов. Опционально — curriculum-обучение против Fairy-Stockfish с
-адаптивной силой учителя и contempt-сдвигом.
-
-**GUI:** один self-contained `.onnx` файл, инференс через onnxruntime, без
-PyTorch. Tree reuse между ходами, smart prune вместо очистки таблицы,
-ограниченный NN-кэш. Стрелки в стиле Nibbler с двумя проходами, mate
-display в боковой шкале, c_puct/contempt слайдеры в тулбаре.
-
-Подробности про будущие улучшения — в `ROADMAP.md`. Известные особенности
-и баги-фичи — в `KNOWN_QUIRKS.md`.
+Полный перевод этого файла — [README_RU.md](README_RU.md).

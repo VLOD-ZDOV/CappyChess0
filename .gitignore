@@ -3,6 +3,7 @@
 *.pth
 *.onnx
 *.onnx.data
+*.data
 *.npz
 *.pkl
 checkpoints*/
