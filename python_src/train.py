@@ -217,8 +217,30 @@ class FairyStockfishWrapper:
         except: self.proc.kill()
 
 
+def _load_book_openings(cfg, count: int):
+    """Книжные линии, в которых у БЕЛЫХ перевес по оценке движка.
+
+    Оценка движка завышена по величине, но направление у неё верное (проверено
+    партиями движка против себя: 80% у белых против 30% в контроле). Поэтому
+    для отбора она годится, а в метки её пускать нельзя.
+    """
+    import json
+    import random
+    try:
+        with open(cfg.book_path) as f:
+            lines = json.load(f)["lines"]
+    except Exception as e:
+        print(f"  ⚠️  Книга не прочитана ({e}) — партии от книжных стартов пропущены")
+        return []
+    bad_for_black = [l["moves"] for l in lines if l.get("eval", 0.0) >= cfg.book_min_eval]
+    if not bad_for_black:
+        return []
+    return [random.choice(bad_for_black) for _ in range(count)]
+
+
 def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
-                       fsf_nodes: int, mcts_sims: int = 100):
+                       fsf_nodes: int, mcts_sims: int = 100,
+                       openings=None, nn_side_fixed=None, value_alpha=None):
     """Generates num_games games against an external opponent.
 
     fsf_nodes == 0 : random mover — first curriculum level.
@@ -236,7 +258,12 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
     All games in a batch share `nn_side` so the whole batch has the same side
     to move each ply; the side alternates between batches.
     """
-    fsf_value_alpha = getattr(cfg, 'fsf_value_alpha', 0.7)
+    # Вес, с которым оценка движка подмешивается в цель для value. Для партий
+    # от книжных стартов он ставится в ноль: замер 16.09 показал, что оценки
+    # движка в дебюте завышены примерно вдесятеро (+7.22 там, где реально около
+    # +240 Elo). Пустить их в метки — верный способ испортить value-голову.
+    fsf_value_alpha = (value_alpha if value_alpha is not None
+                       else getattr(cfg, 'fsf_value_alpha', 0.7))
     fsf_noise_prob  = getattr(cfg, 'fsf_noise_prob', 0.0)
     use_random = (fsf_nodes == 0)
     fsf = None
@@ -266,8 +293,24 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
 
     for b in range(num_batches):
         n = min(batch_sz, num_games - b * batch_sz)
-        nn_side = b % 2
+        # Сторона сети: обычно чередуется по пачкам, но для книжных стартов
+        # задаётся снаружи — там сеть всегда садится за ХУДШУЮ сторону, чтобы
+        # учитель показал ей проигрыш. За лучшую сажать нельзя: сеть перевес не
+        # реализует (замер 16.09: 60% там, где движок берёт 80%), и выучила бы
+        # «хорошая позиция плохая».
+        nn_side = nn_side_fixed if nn_side_fixed is not None else b % 2
         engines = [CapablancaEngine() for _ in range(n)]
+        uci_history = [[] for _ in range(n)]
+        start_ply = 0
+        if openings is not None:
+            for g in range(n):
+                for uci in openings[(b * batch_sz + g) % len(openings)]:
+                    mv = _uci_to_int(uci, engines[g])
+                    if mv is None:
+                        break
+                    engines[g].make_move_int(mv)
+                    uci_history[g].append(uci)
+                start_ply = max(start_ply, len(uci_history[g]))
         tree = mcts.new_tree(engines)
 
         # NN positions only: (board, sparse_pol, side, ply, root_q, root_d, [fsf_eval])
@@ -275,12 +318,13 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
         # right after our move); score_cp > 0 means the mover (FSF) is winning,
         # so the NN's view is -tanh(cp/400).
         positions = [[] for _ in range(n)]
-        uci_history = [[] for _ in range(n)]
-        game_plies = [0] * n
+        # Счётчики стартуют с книжного полухода, иначе цель moves-left съедет
+        # на длину дебюта: она считается как total_plies - ply.
+        game_plies = [start_ply] * n
         adjudicated = [None] * n
         broken = [False] * n
         active = list(range(n))
-        move_num = 0
+        move_num = start_ply
 
         while active and move_num < cfg.max_game_length:
             is_nn = (move_num % 2) == nn_side
@@ -661,6 +705,16 @@ class Config:
     # 0 = выключено. Замер 15.09: порог 150 даёт ~6% скорости сам по себе,
     # а вместе с доливом слотов — до потолка в 19%.
     park_after_plies: int = 0
+    # Доля партий итерации, которые начинаются с книжной позиции, ЗАВЕДОМО
+    # плохой для сети, и играются против движка-учителя. Лечит измеренную
+    # слепоту value-головы в дебюте: сеть считает равными позиции, между
+    # которыми на деле около 390 Elo. 0 = выключено.
+    book_path: str = ""
+    book_fraction: float = 0.0
+    book_min_eval: float = 1.5      # какие линии считать плохими для чёрных
+    book_fsf_nodes: int = 20000     # учитель должен выигрывать, но не громить
+    # Отдельный путь к движку: общий `fsf_path` включает старый курс с фазами.
+    book_fsf_path: str = "fairy-stockfish-largeboard_x86-64-bmi2"
     # Отложить остаток пула, когда новых партий в итерации уже нет, а живых
     # слотов осталось меньше половины: в этом режиме лист стоит вдвое дороже.
     park_tail: bool = False
@@ -2324,6 +2378,20 @@ def train(cfg: Config = None):
         fsf_path = cfg.fsf_path
         fsf_enabled = bool(fsf_path and os.path.exists(fsf_path))
 
+        # Часть партий итерации уйдёт на книжные старты против движка-учителя —
+        # вычитаем их из бюджета самоигры заранее, чтобы объём данных за итерацию
+        # не вырос. Возвращается `games_per_iter` сразу после генерации.
+        games_this_iter = cfg.games_per_iter
+        book_games = 0
+        # Абсолютный путь обязателен: Popen с голым именем ищет файл в PATH, а
+        # не в текущем каталоге, и движок «не находится» при существующем файле.
+        book_engine = os.path.abspath(cfg.book_fsf_path) if cfg.book_fsf_path else ""
+        if cfg.book_path and cfg.book_fraction > 0 and os.path.exists(book_engine):
+            book_games = int(games_this_iter * cfg.book_fraction)
+            cfg.games_per_iter = games_this_iter - book_games
+            print(f"[Iter {iteration}] 📖 {book_games} партий от книжных стартов "
+                  f"против движка ({cfg.book_fsf_nodes} узлов), сеть за худшую сторону")
+
         if cfg.curriculum_mode and not fsf_enabled:
             print(f"[Iter {iteration}] ⚠️  --curriculum требует --fsf-path, переходим в self-play")
 
@@ -2432,6 +2500,24 @@ def train(cfg: Config = None):
             net.eval()
             with torch.inference_mode():
                 samples = generate_games(net, cfg, device, iteration)
+
+        # Партии от книжных стартов против движка-учителя. Стоят здесь, а не
+        # внутри ветки самоигры: веток три, и любая может оказаться выбранной.
+        # Свой путь к движку (`book_fsf_path`) — чтобы не трогать `--fsf-path`,
+        # который включает совсем другой режим, старый курс с фазами FSF-heavy.
+        if book_games:
+            openings = _load_book_openings(cfg, book_games)
+            if openings:
+                net.eval()
+                with torch.inference_mode():
+                    bs, _, _, _ = generate_fsf_games(
+                        net, device, cfg, book_games, book_engine,
+                        cfg.book_fsf_nodes, mcts_sims=cfg.simulations,
+                        openings=openings,
+                        nn_side_fixed=1,      # сеть за чёрных — худшая сторона
+                        value_alpha=0.0)      # оценки движка в метки НЕ пускать
+                samples.extend(bs)
+        cfg.games_per_iter = games_this_iter
 
         # Restore training weights (only if EMA was applied)
         if use_ema_now:
@@ -2820,6 +2906,19 @@ if __name__ == "__main__":
                         help="Максимальный размер replay буфера (default: 1000000, рек. 300000 при большом потоке данных)")
     parser.add_argument("--max-game-length",  type=int,   default=300,
                         help="Максимальная длина партии в полуходах (default: 300)")
+    parser.add_argument("--opening-book", dest="book_path", type=str, default="",
+                        help="JSON с линиями книги: доля партий пойдёт от плохих "
+                             "для сети стартов против движка-учителя")
+    parser.add_argument("--book-fraction", type=float, default=0.0,
+                        help="Какая доля партий итерации идёт от книжных стартов")
+    parser.add_argument("--book-min-eval", type=float, default=1.5,
+                        help="Порог оценки движка, выше которого линия считается "
+                             "плохой для чёрных")
+    parser.add_argument("--book-fsf-nodes", type=int, default=20000,
+                        help="Узлов движку-учителю в этих партиях")
+    parser.add_argument("--book-fsf-path", type=str,
+                        default="fairy-stockfish-largeboard_x86-64-bmi2",
+                        help="Путь к движку для книжных партий (не включает курс)")
     parser.add_argument("--park-tail", action="store_true", default=False,
                         help="Отложить остаток пула на следующую итерацию, когда "
                              "новых партий нет, а живых слотов меньше половины")
@@ -2940,6 +3039,11 @@ if __name__ == "__main__":
         policy_temp=args.policy_temp,
         max_game_length=args.max_game_length,
         park_after_plies=args.park_after_plies,
+        book_path=args.book_path,
+        book_fraction=args.book_fraction,
+        book_min_eval=args.book_min_eval,
+        book_fsf_nodes=args.book_fsf_nodes,
+        book_fsf_path=args.book_fsf_path,
         park_tail=args.park_tail,
         timeout_as_draw=args.timeout_as_draw,
     )
