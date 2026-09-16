@@ -23,6 +23,7 @@ from collections import defaultdict
 from typing import List, Tuple, Dict
 
 import numpy as np
+import archive as archive_mod
 import torch
 
 # PyTorch's intra-op pool defaults to half the core count and busy-waits
@@ -184,6 +185,7 @@ def play_batch(
     ptemp_black: float = None,
     policy_only_after_white: int = None,
     policy_only_after_black: int = None,
+    arch=None,
 ) -> List[float]:
     """
     Plays num_games games: net_white as white, net_black as black.
@@ -213,6 +215,7 @@ def play_batch(
     results = [None] * num_games
     move_counts = [0] * num_games
     histories = [[] for _ in range(num_games)]  # for verbose and PGN
+    arch_rows = [[] for _ in range(num_games)]  # позиции для архива
 
     # One persistent tree per network, both tracking the real game. Every move
     # is applied to both, so each search resumes from the sub-tree the previous
@@ -247,6 +250,12 @@ def play_batch(
             # 7000-float vector per game per ply.
             sparse_pols = tree.get_policies_sparse()
 
+        # Архив: доска и ПОЛНОЕ распределение визитов на 800 симуляциях. Поиск
+        # их уже посчитал ради выбора хода — оставалось только не выбрасывать.
+        if arch is not None and not bare:
+            vals = np.asarray(tree.get_values(), dtype=np.float32)
+            draws_np = np.asarray(tree.get_draws(), dtype=np.float32)
+
         for gi in active:
             if bare:
                 dense = raw_by_game[gi]
@@ -257,10 +266,30 @@ def play_batch(
             else:
                 pol_idx, pol_val = sparse_pols[gi]
                 lookup = {int(i): float(v) for i, v in zip(pol_idx, pol_val)}
+            if arch is not None and not bare:
+                pi, pv = sparse_pols[gi]
+                # Индексы ходов считаются ДО хода: move_int_to_policy_idx
+                # переворачивает доску по стороне, которая ходит СЕЙЧАС, а
+                # _apply_policy_move ход уже применяет.
+                idx_of = {mv: engines[gi].move_int_to_policy_idx(mv)
+                          for mv in engines[gi].get_legal_moves_int()}
+                arch_rows[gi].append([
+                    np.asarray(engines[gi].get_board_tensor(), dtype=np.float32),
+                    np.asarray(pi, dtype=np.int16), np.asarray(pv, dtype=np.float16),
+                    int(move_counts[gi]), int(side),
+                    float(vals[gi]) if gi < len(vals) else 0.0,
+                    float(draws_np[gi]) if gi < len(draws_np) else -1.0,
+                    -1,
+                ])
+            else:
+                idx_of = None
             m = _apply_policy_move(engines[gi], lookup,
                                    move_counts[gi], temperature_moves)
             if m is not None:
                 histories[gi].append(m)
+                if idx_of is not None:
+                    got = idx_of.get(m)
+                    arch_rows[gi][-1][7] = -1 if got is None else int(got)
                 tree_w.make_move(gi, m)
                 tree_b.make_move(gi, m)
             move_counts[gi] += 1
@@ -289,6 +318,25 @@ def play_batch(
             if pgn_path is not None:
                 res_str = "1-0" if r > 0.5 else ("0-1" if r < -0.5 else "1/2-1/2")
                 save_pgn(histories[gi], res_str, pgn_path, white_name, black_name)
+            if arch is not None and arch_rows[gi]:
+                if eng.is_game_over():
+                    term = (archive_mod.TERM_MATE if abs(r) > 0.5
+                            else archive_mod.DRAW_REASON_TO_TERM.get(
+                                eng.draw_reason(), archive_mod.TERM_DRAW_RULE))
+                else:
+                    term = archive_mod.TERM_LIMIT
+                g_id = arch.add_game(
+                    result=int(round(r)) if abs(r) > 0.5 else 0,
+                    plies=move_counts[gi], term=term, playthrough=0,
+                    resign_ply=-1, resign_side=-1,
+                    source=archive_mod.SOURCE_MATCH,
+                    white_id=arch.name_id(white_name),
+                    black_id=arch.name_id(black_name))
+                for row in arch_rows[gi]:
+                    arch.add_position(row[0], row[1], row[2], game=g_id,
+                                      ply=row[3], side=row[4], full=True,
+                                      root_q=row[5], root_d=row[6], move=row[7])
+                arch_rows[gi] = []
         done = num_games - len(new_active)
         if done - reported >= report_step or (not new_active and done > reported):
             reported = done
@@ -351,6 +399,7 @@ def run_match(
     ptemp_b: float = None,
     policy_only_after: int = None,
     policy_only_after_b: int = None,
+    arch=None,
 ) -> Dict:
     """
     Plays `games` games between A and B (half with A as white, half with B as white).
@@ -383,7 +432,8 @@ def run_match(
                       fpu_white=fpu, fpu_black=fpu_b,
                       ptemp_white=ptemp, ptemp_black=ptemp_b,
                       policy_only_after_white=policy_only_after,
-                      policy_only_after_black=policy_only_after_b)
+                      policy_only_after_black=policy_only_after_b,
+                      arch=arch)
     for r in res1:
         if r > 0:   wins_a += 1
         elif r < 0: wins_b += 1
@@ -406,7 +456,7 @@ def run_match(
                       parallel_sims=(parallel_sims_b if parallel_sims_b is not None
                                      else parallel_sims),
                       parallel_sims_black=parallel_sims,
-                      c_puct_white=c_puct_b, c_puct_black=c_puct)
+                      c_puct_white=c_puct_b, c_puct_black=c_puct, arch=arch)
     for r in res2:
         # r — result for white (= B), convert to result for A
         r_a = -r
@@ -614,6 +664,11 @@ def main():
                         help="parallel_sims для ВТОРОЙ модели. Позволяет столкнуть "
                              "одни и те же веса с разными настройками поиска — "
                              "измерить настройку поиска без переобучения.")
+    parser.add_argument("--archive-dir", type=str, default="",
+                        help="Писать партии матча в архив. Поиск в матче идёт на "
+                             "800 симуляциях и сдачи нет вовсе, поэтому такие "
+                             "партии чище самоигровых — но они OFF-POLICY: годятся "
+                             "для засева новой линии, не для живого буфера")
     parser.add_argument("--kld", type=float, default=0.0,
                         help="Порог KLD early-exit: MCTS останавливается раньше, когда "
                              "распределение визитов стабилизировалось. 0 = выкл. "
@@ -664,6 +719,14 @@ def main():
     match_results = []
     t_total = time.time()
 
+    # Писатель архива один на весь турнир: номер «итерации» берём из времени,
+    # чтобы куски разных турниров не перетирали друг друга.
+    archive_writer = None
+    if args.archive_dir:
+        archive_writer = archive_mod.ArchiveWriter(
+            args.archive_dir, int(time.time()) % 1000000,
+            int(np.asarray(CapablancaEngine().get_board_tensor()).size))
+
     for i, ((name_a, net_a), (name_b, net_b)) in enumerate(pairs, 1):
         print(f"\n[{i}/{len(pairs)}]", end="")
         result = run_match(
@@ -688,8 +751,14 @@ def main():
             timeout_as_draw=args.timeout_as_draw,
             compile_mode=compile_mode,
             kld_threshold=args.kld,
+            arch=archive_writer,
         )
         match_results.append(result)
+
+    if archive_writer is not None:
+        n = archive_writer.close()
+        print(f"\n  📚 В архив записано {n:,} позиций "
+              f"({len(archive_writer.games['result']):,} партий матчей)".replace(",", " "))
 
     # Leaderboard
     print_leaderboard(models, match_results)

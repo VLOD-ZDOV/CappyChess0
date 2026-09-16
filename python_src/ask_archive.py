@@ -56,6 +56,9 @@ def main():
     p.add_argument("--min-ply", type=int)
     p.add_argument("--max-ply", type=int)
     o = ap.add_argument_group("вывод")
+    o.add_argument("--book", type=int, metavar="N", nargs="?", const=2,
+                   help="вывести книгу: позиции, встреченные хотя бы N раз (по "
+                        "умолчанию 2), с ходами и их результатами")
     o.add_argument("--export", metavar="ФАЙЛ.npz", help="выгрузить доски и политику")
     o.add_argument("--limit", type=int, help="не больше стольких позиций")
     args = ap.parse_args()
@@ -94,6 +97,16 @@ def main():
                 print(f"  {name}: {c}")
     if not n_p:
         return 0
+
+    if args.book:
+        book = ar.book_from(pm, min_games=args.book)
+        print(f"\nкнига: {len(book)} позиций, встреченных ≥{args.book} раз")
+        top = sorted(book.items(), key=lambda kv: -kv[1]["n"])[:15]
+        for k, e in top:
+            moves = sorted(e["moves"].items(), key=lambda kv: -kv[1][0])[:4]
+            mv_s = ", ".join(f"ход {m}: {c}× ({100*sc/c:.0f}%)" for m, (c, sc) in moves)
+            print(f"  позиция встречена {e['n']:5d}× · очки ходящего "
+                  f"{100*e['score']/e['n']:.0f}% · {mv_s}")
 
     if args.export:
         b = ar.boards(pm)

@@ -53,6 +53,9 @@ TERM_NAMES = {TERM_MATE: "мат", TERM_RESIGN: "сдача",
 DRAW_REASON_TO_TERM = {0: TERM_STALEMATE, 1: TERM_FIFTY,
                        2: TERM_REPETITION, 3: TERM_MATERIAL}
 
+SOURCE_SELFPLAY = 0
+SOURCE_MATCH = 1
+
 # Столбцы позиции и их типы. Держим списком, чтобы читатель и писатель не
 # разъезжались.
 POS_COLS = {
@@ -72,6 +75,14 @@ GAME_COLS = {
     "plies": np.int16,    # длина партии в полуходах
     "term": np.int8,      # TERM_*
     "iter": np.int32,     # итерация обучения
+    # Откуда партия: 0 самоигра, 1 матч между двумя сетями. У матчевых партий
+    # другое качество — поиск глубже (800 симуляций против 600/100) и сдачи нет
+    # вовсе, поэтому метка value не может оказаться ложной сдачей. Но они
+    # OFF-POLICY: их играли другие чекпоинты, и в живой буфер их лить нельзя.
+    "source": np.int8,
+    # Кто играл каждой стороной — индекс в массиве `names` из meta (-1 неизвестно).
+    "white_id": np.int8,
+    "black_id": np.int8,
     "playthrough": np.int8,   # 1 = партия игралась без права сдаться
     # Полуход, на котором сдача сработала бы: НОМЕР ПОЗИЦИИ, тот же, что в поле
     # `ply` позиций, — чтобы можно было брать позиции после приговора одним
@@ -87,7 +98,7 @@ class ArchiveWriter:
     """Пишет одну итерацию. Доски дописываются сразу, столбцы копятся в списках
     (они мелкие) и уходят в meta одним куском в close()."""
 
-    def __init__(self, directory, iteration, board_len):
+    def __init__(self, directory, iteration, board_len, names=None):
         os.makedirs(directory, exist_ok=True)
         self.dir = directory
         self.iteration = int(iteration)
@@ -100,8 +111,20 @@ class ArchiveWriter:
         self.pol_idx = []
         self.pol_val = []
         self.rows = 0
+        # Имена игроков (чекпоинтов). Хранятся строками один раз, в партиях
+        # лежат индексы — иначе имя повторялось бы у каждой позиции.
+        self.names = list(names or [])
 
-    def add_game(self, result, plies, term, playthrough, resign_ply, resign_side=-1):
+    def name_id(self, name):
+        """Индекс имени, добавляя его при первой встрече."""
+        if name is None:
+            return -1
+        if name not in self.names:
+            self.names.append(name)
+        return self.names.index(name)
+
+    def add_game(self, result, plies, term, playthrough, resign_ply, resign_side=-1,
+                 source=SOURCE_SELFPLAY, white_id=-1, black_id=-1):
         """Завести партию и вернуть её индекс — его кладут в поле `game` позиций."""
         self.games["result"].append(int(result))
         self.games["plies"].append(int(plies))
@@ -110,6 +133,9 @@ class ArchiveWriter:
         self.games["playthrough"].append(int(bool(playthrough)))
         self.games["resign_ply"].append(int(resign_ply))
         self.games["resign_side"].append(int(resign_side))
+        self.games["source"].append(int(source))
+        self.games["white_id"].append(int(white_id))
+        self.games["black_id"].append(int(black_id))
         return len(self.games["result"]) - 1
 
     def add_position(self, board, pol_idx, pol_val, game, ply, side, full,
@@ -144,7 +170,8 @@ class ArchiveWriter:
             pi[i, :len(a)] = a
             pv[i, :len(b)] = b
         out = {"pol_idx": pi, "pol_val": pv,
-               "board_len": np.asarray([self.board_len], dtype=np.int32)}
+               "board_len": np.asarray([self.board_len], dtype=np.int32),
+               "names": np.asarray(self.names or [""], dtype="<U64")}
         for k, dt in POS_COLS.items():
             out[k] = np.asarray(self.pos[k], dtype=dt)
         for k, dt in GAME_COLS.items():
@@ -314,6 +341,50 @@ class Archive:
                 k = pi >= 0
                 out.append((pi[k], pv[k]))
         return out
+
+    # ── база данных: поиск по позиции ────────────────────────────────────────
+
+    def position_keys(self, mask=None):
+        """Ключ позиции для каждой строки: хеш ТОЛЬКО расстановки фигур, без
+        истории и без счётчиков. Две записи с одним ключом — это одна и та же
+        позиция на доске, пришедшая из разных партий."""
+        import hashlib
+        idx = np.flatnonzero(mask) if mask is not None else np.arange(
+            self.p["game"].shape[0])
+        b = self.boards(np.isin(np.arange(self.p["game"].shape[0]), idx))
+        piece_planes = 16 * 80          # 8 наших + 8 чужих, текущая позиция
+        return idx, np.array([hashlib.blake2b(row[:piece_planes].tobytes(),
+                                              digest_size=8).digest()
+                              for row in b])
+
+    def book_from(self, mask=None, min_games=2):
+        """Дебютная/эндшпильная книга, выведенная из партий.
+
+        Для каждой позиции, встреченной хотя бы `min_games` раз, собирает:
+        какие ходы из неё делались, сколько раз и с каким исходом. Это и есть
+        книга — но не список чужих рекомендаций, а статистика того, что
+        действительно игралось и чем кончилось.
+
+        Возвращает словарь: ключ позиции → {"n", "score", "moves": {ход: (сколько,
+        очки)}}, где очки — с точки зрения СТОРОНЫ, которая ходит.
+        """
+        idx, keys = self.position_keys(mask)
+        side = self.p["side"][idx]
+        move = self.p["move"][idx]
+        res = self.g["result"][self.p["game"][idx]]
+        pov = np.where(side == 0, res, -res)        # исход глазами ходящего
+        pts = np.where(pov > 0, 1.0, np.where(pov < 0, 0.0, 0.5))
+        out = {}
+        for i, k in enumerate(keys):
+            e = out.setdefault(k, {"n": 0, "score": 0.0, "moves": {}})
+            e["n"] += 1
+            e["score"] += float(pts[i])
+            mv = int(move[i])
+            if mv < 0:
+                continue        # ход не записан (куски архива до 16.09 вечера)
+            c, sc = e["moves"].get(mv, (0, 0.0))
+            e["moves"][mv] = (c + 1, sc + float(pts[i]))
+        return {k: v for k, v in out.items() if v["n"] >= min_games}
 
     def summary(self):
         n_g = self.g["result"].shape[0]
