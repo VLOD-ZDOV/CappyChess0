@@ -8,7 +8,7 @@ import time
 import numpy as np
 import torch
 from collections import OrderedDict
-from typing import List
+from typing import List, Optional
 
 # NVIDIA optimizations (mirrors train.py settings — ensures they're active
 # when imported from gui.py / game_stats.py, when train.py is not loaded).
@@ -446,9 +446,14 @@ class UltraFastMCTS:
         policies, _, _, _ = self._infer(arr)
         return policies
 
-    def new_tree(self, engines: List):
-        """Fresh RustMCTS over `engines`, configured from this instance's flags."""
-        rust_mcts = _RustMCTS(engines, self._parallel_sims)
+    def new_tree(self, engines: List, seed: Optional[int] = None):
+        """Fresh RustMCTS over `engines`, configured from this instance's flags.
+
+        `seed` fixes the Rust-side RNG (root Dirichlet noise). Left None the
+        engine seeds itself from the clock, which is what self-play wants; tests
+        and A/B runs pass a seed so two runs can be compared directly."""
+        rust_mcts = _RustMCTS(engines, self._parallel_sims,
+                              None if seed is None else int(seed))
         if self.contempt != 0.0:
             rust_mcts.set_contempt(self.contempt)
         # add_dirichlet=False (eval / FSF / lagged) must actually disable root

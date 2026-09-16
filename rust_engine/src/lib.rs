@@ -2366,17 +2366,22 @@ pub struct RustMCTS {
 #[pymethods]
 impl RustMCTS {
     #[new]
-    pub fn new(engines: Vec<PyRef<CapablancaEngine>>, parallel_sims: usize) -> Self {
+    #[pyo3(signature = (engines, parallel_sims, seed = None))]
+    pub fn new(engines: Vec<PyRef<CapablancaEngine>>, parallel_sims: usize,
+               seed: Option<u64>) -> Self {
         let games = engines.iter().map(|e|
             SingleMcts::new_with_history(e.board.clone(), e.board_history.clone(),
                                          e.position_history.clone())
         ).collect();
-        // Seed from system time — so parallel RustMCTS instances (fsf/lagged
-        // create one object per game) don't get identical Dirichlet noise.
-        let seed = std::time::SystemTime::now()
+        // Default: seed from system time, so parallel RustMCTS instances
+        // (fsf/lagged create one object per game) don't get identical Dirichlet
+        // noise. An explicit seed makes a run reproducible — without it two
+        // self-play runs with the same Python seed still diverge, and no A/B
+        // can tell a real change from noise.
+        let seed = seed.unwrap_or_else(|| std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0xdeadbeefcafe1234u64)
+            .unwrap_or(0xdeadbeefcafe1234u64))
             .wrapping_mul(0x9e3779b97f4a7c15)
             .wrapping_add(0xbf58476d1ce4e5b9);
         RustMCTS { games, parallel_sims, rng: seed, leaf_counts: Vec::new() }
