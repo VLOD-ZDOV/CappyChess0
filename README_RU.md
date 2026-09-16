@@ -678,6 +678,17 @@ python eval.py <weights_A.pth> <weights_B.pth> --games 200 \
    Исключения важны: без них в сборку заезжает TensorRT и раздувает её до
    нескольких гигабайт, хотя GUI им не пользуется.
 
+   **Собрать `.exe` под Windows можно и из Linux, через Wine.** Сам PyInstaller
+   кросс-компилировать не умеет, но ничто не мешает запустить под Wine
+   настоящий виндовый Python и собрать им. Движок на Rust кросс-компилируется
+   обычным `cargo build --target x86_64-pc-windows-gnu` (нужна возможность
+   `generate-import-lib` у pyo3 и переменная `PYO3_CROSS_PYTHON_VERSION`), а
+   полученный `.dll` переименовывается в `capablanca_engine.pyd` и добавляется
+   через `--add-binary`. Учти, что pip внутри Wine обычно не видит сеть: колёса
+   качаются хозяйским pip с `--platform win_amd64` и ставятся с
+   `--no-index --find-links`, причём зависимости с пометкой
+   `sys_platform == "win32"` (`pefile`, `pywin32-ctypes`) надо перечислить руками.
+
 4. Положи `capablanca.onnx` рядом с полученным исполняемым файлом — GUI
    подхватит его сам.
 

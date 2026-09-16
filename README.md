@@ -687,6 +687,17 @@ To distribute the GUI without making users install Python and dependencies:
    The exclusions matter: without them TensorRT rides along and inflates the
    bundle to several gigabytes, even though the GUI never uses it.
 
+   **A Windows `.exe` can be built from Linux under Wine** — PyInstaller cannot
+   cross-compile, but nothing stops you running a real Windows Python under
+   Wine and building with that. The Rust engine cross-compiles with
+   `cargo build --target x86_64-pc-windows-gnu` (add `generate-import-lib` to
+   the pyo3 features and set `PYO3_CROSS_PYTHON_VERSION`), and the resulting
+   `.dll` is renamed to `capablanca_engine.pyd` and added with `--add-binary`.
+   Note that pip inside Wine usually has no network: download the wheels with
+   the host pip using `--platform win_amd64` and install them with
+   `--no-index --find-links`, naming the `sys_platform == "win32"` dependencies
+   (`pefile`, `pywin32-ctypes`) explicitly.
+
 4. Place `capablanca.onnx` next to the produced executable — the GUI
    auto-loads it.
 

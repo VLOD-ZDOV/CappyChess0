@@ -8,7 +8,7 @@ name = "capablanca_engine"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.28", features = ["extension-module"] }
+pyo3 = { version = "0.28", features = ["extension-module", "generate-import-lib"] }
 numpy = "0.28"
 ndarray = "0.16"
 
