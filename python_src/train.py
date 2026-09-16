@@ -267,6 +267,15 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
                        else getattr(cfg, 'fsf_value_alpha', 0.7))
     fsf_noise_prob  = getattr(cfg, 'fsf_noise_prob', 0.0)
     use_random = (fsf_nodes == 0)
+    opp_label = "Random" if use_random else f"FSF-{fsf_nodes}"
+    # Партии против движка — тоже партии: в архив они идут помеченными как
+    # чужие, чтобы их не спутали с самоигрой. Политика есть только на ходах
+    # СЕТИ: за движок распределения визитов у нас нет.
+    arch_fsf = None
+    if getattr(cfg, "archive_dir", ""):
+        arch_fsf = archive_mod.ArchiveWriter(
+            cfg.archive_dir, 900000 + (int(time.time()) % 90000),
+            int(np.asarray(CapablancaEngine().get_board_tensor()).size))
     fsf = None
     if not use_random:
         try:
@@ -355,9 +364,10 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
                         side, move_num,
                         float(vals[g]) if g < len(vals) else None,
                         float(draw_ps[g]) if g < len(draw_ps) else None,
-                        None,
+                        None, -1,
                     ])
                     move = _sample_move_from_policy(eng, pol_lookup, legal)
+                    positions[g][-1][7] = int(move)
                 elif use_random:
                     move = int(np.random.choice(legal))
                 else:
@@ -410,7 +420,24 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
             else:                  nn_draws  += 1
 
             total_plies = game_plies[g]
-            for board_np, pol_sparse, side, ply, root_q, root_d, fsf_eval in positions[g]:
+            if arch_fsf is not None and positions[g]:
+                term = (archive_mod.TERM_MATE if abs(result) > 0.5
+                        else archive_mod.DRAW_REASON_TO_TERM.get(
+                            eng.draw_reason(), archive_mod.TERM_DRAW_RULE)
+                        ) if eng.is_game_over() else archive_mod.TERM_LIMIT
+                nn_name = os.path.basename(getattr(cfg, "_arch_net_name", "") or "сеть")
+                g_id = arch_fsf.add_game(
+                    result=int(round(result)) if abs(result) > 0.5 else 0,
+                    plies=total_plies, term=term, playthrough=0, resign_ply=-1,
+                    source=archive_mod.SOURCE_FSF,
+                    white_id=arch_fsf.name_id(nn_name if nn_side == 0 else opp_label),
+                    black_id=arch_fsf.name_id(opp_label if nn_side == 0 else nn_name))
+                for row in positions[g]:
+                    arch_fsf.add_position(row[0], row[1][0], row[1][1], game=g_id,
+                                          ply=row[3], side=row[2], full=True,
+                                          root_q=row[4] or 0.0, root_d=row[5],
+                                          move=-1, move_raw=row[7])
+            for board_np, pol_sparse, side, ply, root_q, root_d, fsf_eval, _mv in positions[g]:
                 z = result if side == 0 else -result
                 if not use_random and fsf_eval is not None:
                     # Mix FSF's dense positional eval with the game result.
@@ -422,9 +449,11 @@ def generate_fsf_games(net, device, cfg, num_games: int, fsf_path: str,
                     board_np, pol_sparse, float(v), float(mlh_norm),
                     -1, float(draw_target)))
 
+    if arch_fsf is not None:
+        n_a = arch_fsf.close()
+        print(f"  📚 В архив записано {n_a} позиций партий против движка")
     if fsf is not None:
         fsf.close()
-    opp_label = "Random" if use_random else f"FSF-{fsf_nodes}"
     print(f"  {opp_label}: {num_games-errors} партий | бел={wins} чёрн={losses} ничьи={draws} "
           f"ошибки={errors} | NN: +{nn_wins}/={nn_draws}/-{nn_losses} "
           f"| {len(all_samples)} позиций")
@@ -1542,7 +1571,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     side=entry[2], full=bool(entry[4]),
                     root_q=entry[3] if entry[3] is not None else 0.0,
                     root_d=entry[6] if len(entry) > 6 else None,
-                    move=entry[5] if len(entry) > 5 else -1)
+                    move=entry[5] if len(entry) > 5 else -1,
+                    move_raw=entry[7] if len(entry) > 7 else -1)
 
         for k, entry in enumerate(histories[i]):
             board_np, pol_sparse, side = entry[0], entry[1], entry[2]
@@ -1677,9 +1707,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             # idx 5 (move_idx) — индекс выбранного хода, дописывается ниже после
             # выбора. idx 6 (root_d_raw) — вероятность ничьей от поиска, для
             # полного WDL в Q-смешивании. Список, а не кортеж — idx 5 меняется.
+            # idx 7 — тот же ход в координатах доски, дописывается рядом с idx 5.
             histories[game_idx].append(
                 [board_np, pol_sparse, side, root_v_raw, use_full_search, -1,
-                 root_d_raw])
+                 root_d_raw, -1])
 
             # Температура по счётчику ЭТОЙ партии, а не пула: в слоте может
             # сидеть партия, начатая позже остальных.
@@ -1716,6 +1747,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             # соседних позиций.
             _mpidx = eng.move_int_to_policy_idx(move)
             histories[game_idx][-1][5] = _mpidx if _mpidx is not None else -1
+            histories[game_idx][-1][7] = int(move)
 
             eng.make_move_int(move)
             rust_mcts_reuse.make_move(game_idx, move)  # переиспользование дерева

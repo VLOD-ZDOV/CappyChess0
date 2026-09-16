@@ -54,7 +54,10 @@ DRAW_REASON_TO_TERM = {0: TERM_STALEMATE, 1: TERM_FIFTY,
                        2: TERM_REPETITION, 3: TERM_MATERIAL}
 
 SOURCE_SELFPLAY = 0
-SOURCE_MATCH = 1
+SOURCE_MATCH = 1        # сеть против сети, 800 симуляций, сдачи нет
+SOURCE_FSF = 2          # сеть против движка
+SOURCE_HUMAN = 3        # партия человека, загружена из PGN — политики нет
+SOURCE_NAMES = {0: "самоигра", 1: "матч сетей", 2: "против движка", 3: "человек"}
 
 # Столбцы позиции и их типы. Держим списком, чтобы читатель и писатель не
 # разъезжались.
@@ -69,6 +72,10 @@ POS_COLS = {
     # архив неполон: из него нельзя ни восстановить партию, ни собрать цель
     # future-головы, которой нужен ход через два полухода.
     "move": np.int16,
+    # Тот же ход, но в координатах ДОСКИ: (откуда << 10) | (куда << 3) | превращение.
+    # Индекс политики для чёрных считается по перевёрнутой доске, поэтому назвать
+    # по нему ход человеческим языком нельзя — а по этому можно.
+    "move_raw": np.int32,
 }
 GAME_COLS = {
     "result": np.int8,    # +1 победа белых, 0 ничья, -1 победа чёрных
@@ -139,7 +146,7 @@ class ArchiveWriter:
         return len(self.games["result"]) - 1
 
     def add_position(self, board, pol_idx, pol_val, game, ply, side, full,
-                     root_q, root_d, move=-1):
+                     root_q, root_d, move=-1, move_raw=-1):
         b = np.asarray(board, dtype=np.float16)
         if b.size != self.board_len:
             raise ValueError(f"доска {b.size} элементов, ожидалось {self.board_len}")
@@ -154,6 +161,7 @@ class ArchiveWriter:
         self.pos["root_q"].append(root_q)
         self.pos["root_d"].append(-1.0 if root_d is None else root_d)
         self.pos["move"].append(-1 if move is None else move)
+        self.pos["move_raw"].append(-1 if move_raw is None else move_raw)
 
     def close(self):
         """Дописать meta и сделать файлы видимыми. Пустая итерация не
@@ -360,31 +368,43 @@ class Archive:
     def book_from(self, mask=None, min_games=2):
         """Дебютная/эндшпильная книга, выведенная из партий.
 
-        Для каждой позиции, встреченной хотя бы `min_games` раз, собирает:
-        какие ходы из неё делались, сколько раз и с каким исходом. Это и есть
-        книга — но не список чужих рекомендаций, а статистика того, что
-        действительно игралось и чем кончилось.
+        Для каждой позиции, встреченной хотя бы `min_games` раз: какие ходы из
+        неё делались, сколько раз и с какой разбивкой побед/ничьих/поражений.
+        Это не список чужих рекомендаций, а статистика того, что действительно
+        игралось и чем кончилось — как эксплорер на шахматных сайтах.
 
-        Возвращает словарь: ключ позиции → {"n", "score", "moves": {ход: (сколько,
-        очки)}}, где очки — с точки зрения СТОРОНЫ, которая ходит.
+        Всё считается С ТОЧКИ ЗРЕНИЯ СТОРОНЫ, КОТОРАЯ ХОДИТ: «победа» в записи
+        хода чёрных означает победу чёрных. Иначе смешивать ходы обоих цветов в
+        одной таблице нельзя.
+
+        Возвращает: ключ позиции → {"n", "w","d","l", "side",
+        "moves": {ход_в_координатах_доски: {"n","w","d","l"}}}.
         """
         idx, keys = self.position_keys(mask)
         side = self.p["side"][idx]
-        move = self.p["move"][idx]
+        raw = self.p["move_raw"][idx]
+        move_idx = self.p["move"][idx]
         res = self.g["result"][self.p["game"][idx]]
         pov = np.where(side == 0, res, -res)        # исход глазами ходящего
-        pts = np.where(pov > 0, 1.0, np.where(pov < 0, 0.0, 0.5))
         out = {}
         for i, k in enumerate(keys):
-            e = out.setdefault(k, {"n": 0, "score": 0.0, "moves": {}})
+            e = out.setdefault(k, {"n": 0, "w": 0, "d": 0, "l": 0,
+                                   "side": int(side[i]), "moves": {}})
+            kind = "w" if pov[i] > 0 else ("l" if pov[i] < 0 else "d")
             e["n"] += 1
-            e["score"] += float(pts[i])
-            mv = int(move[i])
+            e[kind] += 1
+            mv = int(raw[i])
             if mv < 0:
-                continue        # ход не записан (куски архива до 16.09 вечера)
-            c, sc = e["moves"].get(mv, (0, 0.0))
-            e["moves"][mv] = (c + 1, sc + float(pts[i]))
+                # Куски до появления столбца: ход восстанавливается из
+                # канонического индекса, кроме превращений.
+                mv = idx_to_move(move_idx[i], side[i])
+                if mv is None:
+                    continue
+            m = e["moves"].setdefault(mv, {"n": 0, "w": 0, "d": 0, "l": 0})
+            m["n"] += 1
+            m[kind] += 1
         return {k: v for k, v in out.items() if v["n"] >= min_games}
+
 
     def summary(self):
         n_g = self.g["result"].shape[0]
@@ -398,3 +418,35 @@ class Archive:
         full = int((self.p["full"] == 1).sum())
         lines.append(f"  позиций полного поиска {full:,}, быстрых {n_p-full:,}")
         return "\n".join(lines).replace(",", " ")
+def idx_to_move(idx, side):
+    """Канонический индекс политики → ход в координатах доски.
+
+    Обычный ход кодируется как `откуда * 80 + куда` по доске, повёрнутой к
+    ходящему, поэтому обратим: развернуть обратно при side == 1. Превращения
+    (индекс ≥ 6400) хранят только вертикали, не поля, и восстановлению не
+    подлежат — для них возвращается None.
+
+    Нужно, чтобы назвать ходы в кусках архива, записанных до появления столбца
+    `move_raw`: там индекс есть, а координаты доски — нет.
+    """
+    idx = int(idx)
+    if idx < 0 or idx >= 6400:
+        return None
+    f, t = idx // 80, idx % 80
+    if side == 1:                       # развернуть канонический поворот
+        f = (7 - f // 10) * 10 + f % 10
+        t = (7 - t // 10) * 10 + t % 10
+    return (f << 10) | (t << 3)
+
+
+def move_to_uci(m):
+    """Ход в координатах доски → строка вида e2e4 / f7f8q. Доска 10 клеток в
+    ширину, поэтому поле = ряд*10 + вертикаль."""
+    if m is None or m < 0:
+        return "?"
+    promo = m & 0b111
+    t = (m >> 3) & 0x7F
+    f = (m >> 10) & 0x7F
+    s = (f"{chr(ord('a') + f % 10)}{f // 10 + 1}"
+         f"{chr(ord('a') + t % 10)}{t // 10 + 1}")
+    return s + " nbrqac"[promo] if 0 < promo < 7 else s

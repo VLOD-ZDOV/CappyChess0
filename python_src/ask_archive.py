@@ -59,6 +59,10 @@ def main():
     o.add_argument("--book", type=int, metavar="N", nargs="?", const=2,
                    help="вывести книгу: позиции, встреченные хотя бы N раз (по "
                         "умолчанию 2), с ходами и их результатами")
+    o.add_argument("--book-positions", type=int, default=5,
+                   help="сколько самых частых позиций показать (по умолчанию 5)")
+    o.add_argument("--book-moves", type=int, default=8,
+                   help="сколько ходов на позицию (по умолчанию 8)")
     o.add_argument("--export", metavar="ФАЙЛ.npz", help="выгрузить доски и политику")
     o.add_argument("--limit", type=int, help="не больше стольких позиций")
     args = ap.parse_args()
@@ -101,12 +105,25 @@ def main():
     if args.book:
         book = ar.book_from(pm, min_games=args.book)
         print(f"\nкнига: {len(book)} позиций, встреченных ≥{args.book} раз")
-        top = sorted(book.items(), key=lambda kv: -kv[1]["n"])[:15]
-        for k, e in top:
-            moves = sorted(e["moves"].items(), key=lambda kv: -kv[1][0])[:4]
-            mv_s = ", ".join(f"ход {m}: {c}× ({100*sc/c:.0f}%)" for m, (c, sc) in moves)
-            print(f"  позиция встречена {e['n']:5d}× · очки ходящего "
-                  f"{100*e['score']/e['n']:.0f}% · {mv_s}")
+        # Всё — глазами стороны, которая ходит: иначе ходы белых и чёрных в
+        # одной таблице несопоставимы.
+        top = sorted(book.items(), key=lambda kv: -kv[1]["n"])[:args.book_positions]
+        for pi, (k, e) in enumerate(top, 1):
+            who = "белые" if e["side"] == 0 else "чёрные"
+            print(f"\n  [{pi}] позиция встречена {e['n']}× · ходят {who} · "
+                  f"итог для них: {e['w']}W {e['d']}D {e['l']}L "
+                  f"({100*(e['w']+0.5*e['d'])/e['n']:.0f}%)")
+            moves = sorted(e["moves"].items(), key=lambda kv: -kv[1]["n"])
+            if not moves:
+                print("      (ходы в этих кусках архива не записаны)")
+                continue
+            print(f"      {'ход':<8}{'сыграно':>9}{'доля':>7}   "
+                  f"{'W':>5}{'D':>5}{'L':>5}   очки")
+            for mv, m in moves[:args.book_moves]:
+                sc = 100 * (m["w"] + 0.5 * m["d"]) / m["n"]
+                print(f"      {A.move_to_uci(mv):<8}{m['n']:>9}"
+                      f"{100*m['n']/e['n']:>6.0f}%   "
+                      f"{m['w']:>5}{m['d']:>5}{m['l']:>5}   {sc:>4.0f}%")
 
     if args.export:
         b = ar.boards(pm)

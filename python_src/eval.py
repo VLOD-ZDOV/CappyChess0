@@ -279,7 +279,7 @@ def play_batch(
                     int(move_counts[gi]), int(side),
                     float(vals[gi]) if gi < len(vals) else 0.0,
                     float(draws_np[gi]) if gi < len(draws_np) else -1.0,
-                    -1,
+                    -1, -1,
                 ])
             else:
                 idx_of = None
@@ -290,6 +290,7 @@ def play_batch(
                 if idx_of is not None:
                     got = idx_of.get(m)
                     arch_rows[gi][-1][7] = -1 if got is None else int(got)
+                    arch_rows[gi][-1][8] = int(m)
                 tree_w.make_move(gi, m)
                 tree_b.make_move(gi, m)
             move_counts[gi] += 1
@@ -335,7 +336,8 @@ def play_batch(
                 for row in arch_rows[gi]:
                     arch.add_position(row[0], row[1], row[2], game=g_id,
                                       ply=row[3], side=row[4], full=True,
-                                      root_q=row[5], root_d=row[6], move=row[7])
+                                      root_q=row[5], root_d=row[6], move=row[7],
+                                      move_raw=row[8])
                 arch_rows[gi] = []
         done = num_games - len(new_active)
         if done - reported >= report_step or (not new_active and done > reported):

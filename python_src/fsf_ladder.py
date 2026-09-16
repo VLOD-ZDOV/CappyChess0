@@ -50,6 +50,8 @@ def main():
                     help="0 = argmax (замер силы); >0 = сэмплирование")
     ap.add_argument("--fsf-path", default=FSF_DEFAULT)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--archive-dir", default="",
+                    help="писать партии против движка в архив")
     a = ap.parse_args()
 
     if a.tau <= 0.0:
@@ -79,6 +81,7 @@ def main():
     cfg.mcts_batch = a.games
     cfg.mcts_parallel_sims = a.parallel
     cfg.contempt = 0.0
+    cfg.archive_dir = a.archive_dir
 
     levels = ([("skill", v) for v in a.skill] if a.skill else
               [("elo", v) for v in a.elo] if a.elo else
