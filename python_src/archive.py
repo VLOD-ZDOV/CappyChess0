@@ -32,11 +32,26 @@ BOARDS_RE = re.compile(r"^boards_(\d+)\.f16$")
 # Чем кончилась партия.
 TERM_MATE = 0
 TERM_RESIGN = 1
-TERM_DRAW_RULE = 2      # пат, 50 ходов, недостаточный материал
+TERM_DRAW_RULE = 2      # ничья по правилам без уточнения (старые куски архива)
 TERM_LIMIT = 3          # упёрлась в max_game_length, исход по материалу
 TERM_ADJUDICATED = 4    # судья по материалу
-TERM_NAMES = {TERM_MATE: "мат", TERM_RESIGN: "сдача", TERM_DRAW_RULE: "ничья по правилам",
-              TERM_LIMIT: "лимит ходов", TERM_ADJUDICATED: "судья"}
+# Ничьи разделены: «пат» и «50 ходов» — совершенно разные вещи. Пат означает,
+# что сторона загнала соперника в позицию без ходов и упустила выигрыш; 50 ходов
+# — что не смогла реализовать перевес; недостаток материала — что реализовывать
+# было нечем. В журнале до 16.09 все три печатались одним словом «пат».
+TERM_STALEMATE = 5
+TERM_FIFTY = 6
+TERM_REPETITION = 7
+TERM_MATERIAL = 8
+TERM_NAMES = {TERM_MATE: "мат", TERM_RESIGN: "сдача",
+              TERM_DRAW_RULE: "ничья по правилам (без уточнения)",
+              TERM_LIMIT: "лимит ходов", TERM_ADJUDICATED: "судья",
+              TERM_STALEMATE: "пат", TERM_FIFTY: "50 ходов",
+              TERM_REPETITION: "троекратное повторение",
+              TERM_MATERIAL: "недостаток материала"}
+# draw_reason() в движке → TERM_*
+DRAW_REASON_TO_TERM = {0: TERM_STALEMATE, 1: TERM_FIFTY,
+                       2: TERM_REPETITION, 3: TERM_MATERIAL}
 
 # Столбцы позиции и их типы. Держим списком, чтобы читатель и писатель не
 # разъезжались.

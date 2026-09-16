@@ -1400,6 +1400,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
     mate_w = mate_b = draws = adjudications = 0
     resign_w = resign_b = 0
     timeout_w = timeout_b = timeout_d = 0
+    draw_kind: dict = {}     # причина ничьей → сколько партий
     # Калибровка порога сдачи по доигранным партиям (--resign-playthrough).
     pt_done = pt_verdicts = pt_wrong_draw = pt_wrong_win = 0
     pt_extra_plies = 0
@@ -1478,7 +1479,12 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             result = eng.game_result()
             if result == 1.0:    mate_w += 1
             elif result == -1.0: mate_b += 1
-            else:                draws += 1
+            else:
+                draws += 1
+                # Раньше все ничьи по правилам печатались словом «пат», хотя пат
+                # и правило 50 ходов означают разное: первое — упущенный выигрыш,
+                # второе — неумение реализовать.
+                draw_kind[eng.draw_reason()] = draw_kind.get(eng.draw_reason(), 0) + 1
         else:
             result = 0.0 if cfg.timeout_as_draw else eng.material_result()
             if result > 0.5:    timeout_w += 1
@@ -1511,8 +1517,13 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             elif adjudicated[i] is not None:
                 term = archive_mod.TERM_ADJUDICATED
             elif eng.is_game_over():
-                term = (archive_mod.TERM_MATE if abs(result) > 0.5
-                        else archive_mod.TERM_DRAW_RULE)
+                if abs(result) > 0.5:
+                    term = archive_mod.TERM_MATE
+                else:
+                    # Какое именно правило сработало. Пат, 50 ходов и недостаток
+                    # материала — разные диагнозы, а печатались одним словом.
+                    term = archive_mod.DRAW_REASON_TO_TERM.get(
+                        eng.draw_reason(), archive_mod.TERM_DRAW_RULE)
             else:
                 term = archive_mod.TERM_LIMIT
             g_id = arch.add_game(
@@ -1577,13 +1588,17 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         counted = total_w + total_b + total_d
         sanity = "" if counted == done else f" ⚠️ sanity {counted}/{done}"
         extra = ""
+        if draw_kind:
+            names = {0: "пат", 1: "50 ходов", 2: "повторение", 3: "мало материала"}
+            extra += " | ничьи: " + ", ".join(
+                f"{names.get(k, '?')} {v}" for k, v in sorted(draw_kind.items()))
         if park_after or park_tail:
             extra = (f" | отложено {parked_n}, подхвачено {resumed_n}, "
                      f"в очереди {len(_PARKED_GAMES)}")
         print(f"  Партий {done}/{cfg.games_per_iter}: {pos_count} positions | "
               f"W={total_w} (мат {mate_w}, resign {resign_w}, timeout {timeout_w}) · "
               f"B={total_b} (мат {mate_b}, resign {resign_b}, timeout {timeout_b}) · "
-              f"D={total_d} (пат {draws}, timeout {timeout_d}){sanity}{extra}")
+              f"D={total_d} (по правилам {draws}, timeout {timeout_d}){sanity}{extra}")
 
     for i in range(slots):
         _take(i)

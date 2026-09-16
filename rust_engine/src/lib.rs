@@ -634,6 +634,34 @@ impl CapablancaEngine {
         self.legal_cache.as_ref().unwrap().is_empty()
     }
 
+    /// Why the game is drawn, when it is: 0 stalemate, 1 the 50-move rule,
+    /// 2 threefold repetition, 3 insufficient material, -1 not a draw (or the
+    /// game is not over). The counters used to print every rule draw as
+    /// "stalemate", which hid which rule actually fires.
+    ///
+    /// Order matters and matches is_game_over/game_result: no legal moves is
+    /// decided first (a mate delivered by the 100th half-move still wins), then
+    /// the clock, then material, then repetition.
+    pub fn draw_reason(&mut self) -> i32 {
+        self.ensure_legal_cache();
+        if self.legal_cache.as_ref().unwrap().is_empty() {
+            return if self.board.in_check(self.board.side) { -1 } else { 0 };
+        }
+        if self.board.halfmove_clock >= 100 { return 1; }
+        if self.board.is_insufficient_material() { return 3; }
+        let cur = compute_board_hash(&self.board);
+        if self.position_history.iter().filter(|&&h| h == cur).count() >= 3 {
+            return 2;
+        }
+        -1
+    }
+
+    /// Whether the material on the board can still deliver mate. Exposed so the
+    /// rule can be checked against another engine instead of trusted.
+    pub fn insufficient_material(&self) -> bool {
+        self.board.is_insufficient_material()
+    }
+
     pub fn game_result(&mut self) -> f32 {
         // Checkmate/stalemate FIRST: a mate delivered by the move that brings
         // the halfmove clock to 100 still wins (FIDE 50-move rule yields to
@@ -703,8 +731,34 @@ impl CapablancaEngine {
 }
 
 // MODULE REGISTRATION WITH EXPLICIT NAME
+/// Verdict of the insufficient-material rule on an ARBITRARY material setup.
+///
+/// The engine can only reach positions by playing moves from the start, so the
+/// rule was untestable on endgames it never walks into (a lone archbishop, three
+/// same-coloured bishops). This takes the pieces directly — `(piece, square)`
+/// pairs, square = rank*10 + file — and runs the very same code the game uses,
+/// so what is checked here is the rule itself, not a copy of it.
+#[pyfunction]
+fn insufficient_material_of(white: Vec<(usize, u32)>,
+                            black: Vec<(usize, u32)>) -> PyResult<bool> {
+    let mut b = Board { pieces: [[0; 8]; 2], side: 0, castling: 0,
+                        ep_square: None, halfmove_clock: 0, fullmove: 1 };
+    for (c, list) in [(0usize, &white), (1usize, &black)] {
+        for &(piece, sq) in list.iter() {
+            if piece >= 8 || sq >= 80 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("фигура {} на поле {} вне доски", piece, sq)));
+            }
+            b.pieces[c][piece] |= 1u128 << sq;
+        }
+    }
+
+    Ok(b.is_insufficient_material())
+}
+
 #[pymodule(name = "capablanca_engine")]
 fn capablanca_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(pyo3::wrap_pyfunction!(insufficient_material_of, m)?)?;
     m.add_class::<CapablancaEngine>()?;
     m.add_class::<RustMCTS>()?;
     Ok(())
