@@ -1530,7 +1530,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     entry[0], entry[1][0], entry[1][1], game=g_id, ply=k,
                     side=entry[2], full=bool(entry[4]),
                     root_q=entry[3] if entry[3] is not None else 0.0,
-                    root_d=entry[6] if len(entry) > 6 else None)
+                    root_d=entry[6] if len(entry) > 6 else None,
+                    move=entry[5] if len(entry) > 5 else -1)
 
         for k, entry in enumerate(histories[i]):
             board_np, pol_sparse, side = entry[0], entry[1], entry[2]

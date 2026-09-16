@@ -47,6 +47,10 @@ POS_COLS = {
     "full": np.int8,      # 1 полный поиск, 0 быстрый (playout cap)
     "root_q": np.float16, # оценка корня поиском, с точки зрения ходящего
     "root_d": np.float16, # вероятность ничьей по поиску (-1 = не было)
+    # Сделанный ход, канонический индекс политики (-1 = неизвестен). Без него
+    # архив неполон: из него нельзя ни восстановить партию, ни собрать цель
+    # future-головы, которой нужен ход через два полухода.
+    "move": np.int16,
 }
 GAME_COLS = {
     "result": np.int8,    # +1 победа белых, 0 ничья, -1 победа чёрных
@@ -94,7 +98,7 @@ class ArchiveWriter:
         return len(self.games["result"]) - 1
 
     def add_position(self, board, pol_idx, pol_val, game, ply, side, full,
-                     root_q, root_d):
+                     root_q, root_d, move=-1):
         b = np.asarray(board, dtype=np.float16)
         if b.size != self.board_len:
             raise ValueError(f"доска {b.size} элементов, ожидалось {self.board_len}")
@@ -108,6 +112,7 @@ class ArchiveWriter:
         self.pos["full"].append(1 if full else 0)
         self.pos["root_q"].append(root_q)
         self.pos["root_d"].append(-1.0 if root_d is None else root_d)
+        self.pos["move"].append(-1 if move is None else move)
 
     def close(self):
         """Дописать meta и сделать файлы видимыми. Пустая итерация не
@@ -159,6 +164,15 @@ class Archive:
                 continue
             with np.load(meta_path) as z:
                 m = {k: z[k] for k in z.files}
+            # Куски, записанные до появления столбца, читаются как «неизвестно»,
+            # а не ломают чтение всего архива.
+            n_rows = m["game"].shape[0]
+            for col, dt in POS_COLS.items():
+                if col not in m:
+                    m[col] = np.full(n_rows, -1, dtype=dt)
+            for col, dt in GAME_COLS.items():
+                if "g_" + col not in m:
+                    m["g_" + col] = np.full(m["g_result"].shape[0], -1, dtype=dt)
             self.shards.append((it, os.path.join(directory, name), m))
             n = m["game"].shape[0]
             for k in POS_COLS:
