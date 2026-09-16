@@ -295,7 +295,7 @@ def play_batch(
             print(f" {done * 100 // num_games}%", end="", flush=True)
         active = new_active
 
-    return results
+    return results, histories
 
 
 def _apply_policy_move(engine: CapablancaEngine, policy: dict,
@@ -371,7 +371,7 @@ def run_match(
     print(f"  [{name_a} белые] {n1} партий...", end="", flush=True)
     t0 = time.time()
     pgn1 = os.path.join(pgn_dir, f"{name_a}_vs_{name_b}.pgn") if pgn_dir else None
-    res1 = play_batch(net_a, net_b, device, n1, simulations,
+    res1, hist1 = play_batch(net_a, net_b, device, n1, simulations,
                       max_moves, temperature_moves, mcts_batch,
                       verbose=verbose, pgn_path=pgn1,
                       white_name=name_a, black_name=name_b,
@@ -397,7 +397,7 @@ def run_match(
     print(f"  [{name_b} белые] {half} партий...", end="", flush=True)
     t0 = time.time()
     pgn2 = os.path.join(pgn_dir, f"{name_b}_vs_{name_a}.pgn") if pgn_dir else None
-    res2 = play_batch(net_b, net_a, device, half, simulations,
+    res2, hist2 = play_batch(net_b, net_a, device, half, simulations,
                       max_moves, temperature_moves, mcts_batch,
                       verbose=verbose, pgn_path=pgn2,
                       white_name=name_b, black_name=name_a,
@@ -421,11 +421,38 @@ def run_match(
     total = wins_a + wins_b + draws
     wr_a = (wins_a + 0.5 * draws) / total if total > 0 else 0.0
 
+    # Сколько партий на самом деле РАЗНЫЕ. Шум в матче вносит только температура
+    # первых ходов, а чем острее становится политика, тем меньше разных дебютов
+    # она выдаёт — и часть партий повторяется ход в ход. Повтор не несёт новых
+    # сведений: он всегда даёт тот же результат, только утяжеляет его в счёте.
+    # Поэтому интервал, посчитанный по номинальному числу партий, оказывается
+    # уже настоящего, и матч выглядит точнее, чем он есть.
+    dup_note = ""
+    seqs = [tuple(h) for h in (list(hist1) + list(hist2)) if h]
+    if seqs:
+        from collections import Counter
+        clusters = Counter(seqs)
+        distinct = len(clusters)
+        biggest = max(clusters.values())
+        # Поправка Киша на кластеризацию: N_eff = N^2 / sum(m_i^2).
+        n_eff = len(seqs) ** 2 / sum(m * m for m in clusters.values())
+        if distinct < len(seqs):
+            dup_note = (f"  Разных партий: {distinct} из {len(seqs)}"
+                        f" (самый крупный повтор — {biggest}),"
+                        f" действующий объём выборки {n_eff:.0f}")
+            if n_eff < 0.8 * len(seqs):
+                ci_eff = _wilson_ci((wins_a + 0.5 * draws) * n_eff / total, n_eff)
+                dup_note += (f"\n  ⚠️  Повторов много: честный интервал шире —"
+                             f" [{ci_eff[0]*100:.1f}%, {ci_eff[1]*100:.1f}%]."
+                             f" Поднять --temperature-moves или число партий.")
+
     # Wilson confidence interval (95%)
     ci = _wilson_ci(wins_a + 0.5 * draws, total)
 
     print(f"\n  Итог: {name_a} {wins_a}W / {draws}D / {wins_b}L  "
           f"винрейт {wr_a:.1%}  CI [{ci[0]:.1%}, {ci[1]:.1%}]")
+    if dup_note:
+        print(dup_note)
 
     return {
         "name_a": name_a, "name_b": name_b,
