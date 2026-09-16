@@ -17,6 +17,7 @@ import pickle
 import subprocess
 import numpy as np
 
+import archive as archive_mod
 import buffer_io
 import torch
 import torch.nn as nn
@@ -825,6 +826,11 @@ class Config:
     #   2) Network doesn't learn to defend in tough positions (resigns cut off data)
     # 0.10 = 10% of games played to completion, rest with resign.
     resign_playthrough: float = 0.10
+    # Каталог архива самоигры. Пусто — архив не ведётся (поведение как раньше).
+    archive_dir: str = ""
+    # Зерно генератора в Rust-поиске. None — от часов, как и было. Задаётся
+    # только тестами и A/B, где два прогона надо сравнить напрямую.
+    search_seed: Optional[int] = None
 
     # Infrastructure
     device: str = "cuda"
@@ -1321,6 +1327,11 @@ def print_diversity(stats: dict, prefix: str = "  Diversity"):
 # найдётся место. Содержимое — состояние слота, см. _park ниже.
 _PARKED_GAMES: List[dict] = []
 
+# Итог последней калибровки порога сдачи — чтобы тест мог сверить счётчик
+# самоигры с тем, что отвечает архив на тех же партиях.
+_LAST_FALSE_RESIGNS = 0
+_LAST_RESIGN_VERDICTS = 0
+
 
 def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration: int = 0) -> List[Sample]:
     """Самоигра пулом слотов.
@@ -1353,6 +1364,16 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                          rust_fpu=cfg.fpu, policy_temp=cfg.policy_temp)
     all_samples: List[Sample] = []
 
+    # Архив: полный поток фактов самоигры, отдельно от буфера обучения. Буфер —
+    # кольцо, он забывает старое и хранит только позиции полного поиска; архив
+    # хранит всё и навсегда, включая быстрые позиции и свойства партий, чтобы
+    # из него потом можно было выбрать любой срез.
+    arch = None
+    if getattr(cfg, "archive_dir", ""):
+        arch = archive_mod.ArchiveWriter(
+            cfg.archive_dir, iteration,
+            int(np.asarray(CapablancaEngine().get_board_tensor()).size))
+
     slots = max(1, min(cfg.mcts_batch, cfg.games_per_iter))
     park_after = max(0, int(cfg.park_after_plies))
     park_tail = bool(cfg.park_tail)
@@ -1363,6 +1384,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
     resigned = [False] * slots
     adjudicated: List[Optional[float]] = [None] * slots
     enable_resign = [True] * slots
+    # Доигрываемая партия: (полуход, сторона), на котором сдача СРАБОТАЛА БЫ.
+    # None — порог ещё не набрался. Нужен, чтобы сверить приговор с настоящим
+    # исходом: без этого доля ложных сдач неизмерима.
+    would_resign: List[Optional[tuple]] = [None] * slots
     ply = [0] * slots        # полуходов в ЭТОЙ партии, с её первого хода
     stint = [0] * slots      # полуходов с момента, как партия села в этот слот
     live = [False] * slots
@@ -1375,6 +1400,9 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
     mate_w = mate_b = draws = adjudications = 0
     resign_w = resign_b = 0
     timeout_w = timeout_b = timeout_d = 0
+    # Калибровка порога сдачи по доигранным партиям (--resign-playthrough).
+    pt_done = pt_verdicts = pt_wrong_draw = pt_wrong_win = 0
+    pt_extra_plies = 0
     reported = 0             # сколько партий уже попало в строки отчёта
 
     def _take(i: int) -> bool:
@@ -1395,6 +1423,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             histories[i] = g["history"]
             resign_counts[i] = g["resign_counts"]
             enable_resign[i] = g["enable_resign"]
+            would_resign[i] = g["would_resign"]
             ply[i] = g["ply"]
             resumed_n += 1
         else:
@@ -1404,6 +1433,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             # LC0 resign playthrough: доля партий играется БЕЗ права сдаться,
             # чтобы калибровать порог и собирать данные о тяжёлых позициях.
             enable_resign[i] = np.random.random() >= cfg.resign_playthrough
+            would_resign[i] = None
             ply[i] = 0
             started += 1
         placed += 1
@@ -1421,6 +1451,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             "history": histories[i],
             "resign_counts": resign_counts[i],
             "enable_resign": enable_resign[i],
+            "would_resign": would_resign[i],
             "ply": ply[i],
         })
         parked_n += 1
@@ -1430,6 +1461,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         nonlocal done, pos_count
         nonlocal mate_w, mate_b, draws, adjudications
         nonlocal resign_w, resign_b, timeout_w, timeout_b, timeout_d
+        nonlocal pt_done, pt_verdicts, pt_wrong_draw, pt_wrong_win, pt_extra_plies
         eng = engines[i]
         if resigned[i]:
             # Сдача: проиграл тот, кто ходил последним.
@@ -1454,6 +1486,52 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             else:               timeout_d += 1
 
         total_plies = len(histories[i])
+
+        # Сдача — это ДОСРОЧНЫЙ приговор, и до сих пор его никто не проверял.
+        # В доигранной партии известен настоящий исход, поэтому приговор можно
+        # сверить: сторона, которая "сдалась бы", обязана была проиграть. Ничья
+        # или её победа означают, что порог сработал впустую, а в обычных
+        # партиях такая же позиция получила бы НЕВЕРНУЮ метку value.
+        if not enable_resign[i]:
+            pt_done += 1
+            if would_resign[i] is not None:
+                wr_ply, wr_side = would_resign[i]
+                pt_verdicts += 1
+                pt_extra_plies += max(0, total_plies - wr_ply)
+                lost = (result < -0.5) if wr_side == 0 else (result > 0.5)
+                if not lost:
+                    if abs(result) < 0.5:
+                        pt_wrong_draw += 1
+                    else:
+                        pt_wrong_win += 1
+
+        if arch is not None:
+            if resigned[i]:
+                term = archive_mod.TERM_RESIGN
+            elif adjudicated[i] is not None:
+                term = archive_mod.TERM_ADJUDICATED
+            elif eng.is_game_over():
+                term = (archive_mod.TERM_MATE if abs(result) > 0.5
+                        else archive_mod.TERM_DRAW_RULE)
+            else:
+                term = archive_mod.TERM_LIMIT
+            g_id = arch.add_game(
+                result=int(round(result)) if abs(result) > 0.5 else 0,
+                plies=total_plies, term=term,
+                playthrough=not enable_resign[i],
+                # would_resign хранит СЧЁТЧИК полуходов (он растёт до проверки
+                # порога); в архиве нужен номер позиции — на единицу меньше.
+                resign_ply=(would_resign[i][0] - 1 if would_resign[i] else -1),
+                resign_side=(would_resign[i][1] if would_resign[i] else -1))
+            for k, entry in enumerate(histories[i]):
+                if entry[0] is None or entry[1] is None:
+                    continue
+                arch.add_position(
+                    entry[0], entry[1][0], entry[1][1], game=g_id, ply=k,
+                    side=entry[2], full=bool(entry[4]),
+                    root_q=entry[3] if entry[3] is not None else 0.0,
+                    root_d=entry[6] if len(entry) > 6 else None)
+
         for k, entry in enumerate(histories[i]):
             board_np, pol_sparse, side = entry[0], entry[1], entry[2]
             # Playout cap: позиции быстрого поиска в обучение не идут.
@@ -1514,7 +1592,9 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
     # make_move(slot, move) сдвигает корень в выбранного ребёнка и сохраняет
     # поддерево — 2-3x качества поиска за ту же цену. Освободившийся слот
     # получает новое дерево через reset_game, деревья соседей не страдают.
-    rust_mcts_reuse = mcts.new_tree(engines)
+    # Зерно поиска. В обучении его нет — самоигра должна быть разной каждую
+    # итерацию. Тест и A/B передают число и получают повторимый прогон.
+    rust_mcts_reuse = mcts.new_tree(engines, seed=getattr(cfg, "search_seed", None))
 
     while any(live):
         # Playout Cap Randomization: доля ходов ищется укороченным поиском.
@@ -1557,9 +1637,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             keep_position = (
                 (not cfg.playout_cap_train_only_full) or use_full_search
             )
-            if keep_position:
-                # Кодирование доски дорогое. Позиции быстрого поиска всё равно
-                # выбрасываются — не считаем их.
+            # Архиву нужны и быстрые позиции тоже: обучению они не годятся
+            # (политика искалась 100 симуляциями), но как факт партии они
+            # полноценны. Кодирование доски стоит 22 мкс — около 0.1% итерации.
+            if keep_position or arch is not None:
                 board_np = np.asarray(eng.get_board_tensor(), dtype=np.float32)
                 if gumbel and game_idx < len(child_stats):
                     c_idx, c_pri, c_vis, c_q = child_stats[game_idx]
@@ -1632,7 +1713,9 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
 
             # Сдача по WDL (как у LC0), с долей партий без права сдаться.
             # P(L) = (1 - Q - D) / 2 — точная вероятность проигрыша.
-            if ply[game_idx] >= cfg.resign_min_move and enable_resign[game_idx]:
+            # Порог считается и в доигрываемых партиях тоже: там он ничего не
+            # прекращает, но запоминает, где сдача случилась БЫ.
+            if ply[game_idx] >= cfg.resign_min_move:
                 q = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
                 d = float(draws_np[game_idx])  if game_idx < len(draws_np)  else 0.0
                 p_loss = max(0.0, min(1.0, (1.0 - q - d) / 2.0))
@@ -1651,12 +1734,18 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     resign_counts[game_idx][side] = 0
 
                 if resign_counts[game_idx][side] >= cfg.resign_consec:
-                    resigned[game_idx] = True
-                    # Rust не видит сдачу — без этого мёртвая партия продолжает
-                    # выедать листья из каждой пачки на карту.
-                    rust_mcts_reuse.set_game_finished(game_idx)
-                    freed.append(game_idx)
-                    continue
+                    if enable_resign[game_idx]:
+                        resigned[game_idx] = True
+                        # Rust не видит сдачу — без этого мёртвая партия
+                        # продолжает выедать листья из каждой пачки на карту.
+                        rust_mcts_reuse.set_game_finished(game_idx)
+                        freed.append(game_idx)
+                        continue
+                    if would_resign[game_idx] is None:
+                        # Доигрываемая партия: приговор записан, партия идёт
+                        # дальше. Запоминаем ПЕРВОЕ срабатывание — сверять надо
+                        # ровно тот момент, в который сдача и произошла бы.
+                        would_resign[game_idx] = (ply[game_idx], side)
 
             # Судья: решающий материальный перевес (≥8 пешек, ≥10 ходов без
             # взятий, ≥15 полных ходов) — закончить, не дожидаясь мата.
@@ -1716,6 +1805,25 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
     if (park_after or park_tail) and _PARKED_GAMES:
         print(f"  Отложено на следующую итерацию: {len(_PARKED_GAMES)} партий "
               f"(позиции попадут в буфер, когда они доиграются)")
+
+    if arch is not None:
+        n_arch = arch.close()
+        print(f"  📚 Архив iter {iteration}: {n_arch:,} позиций "
+              f"({arch.rows - sum(arch.pos['full']):,} быстрых), "
+              f"{len(arch.games['result']):,} партий")
+
+    # Калибровка порога сдачи. Считается только по доигранным партиям, где
+    # приговор успел набраться: остальные ничего о пороге не говорят.
+    global _LAST_FALSE_RESIGNS, _LAST_RESIGN_VERDICTS
+    _LAST_FALSE_RESIGNS = pt_wrong_draw + pt_wrong_win
+    _LAST_RESIGN_VERDICTS = pt_verdicts
+    if pt_verdicts > 0:
+        wrong = pt_wrong_draw + pt_wrong_win
+        print(f"  Сдача: приговоров в доигранных партиях {pt_verdicts} "
+              f"(из {pt_done}), ложных {wrong} "
+              f"({100.0 * wrong / pt_verdicts:.1f}%: ничьих {pt_wrong_draw}, "
+              f"побед {pt_wrong_win}) · сдача экономит "
+              f"{pt_extra_plies / pt_verdicts:.0f} полуходов на партию")
 
     # Статистика раннего выхода по KLD
     if cfg.kld_enabled and cfg.kld_threshold > 0.0:
@@ -2833,6 +2941,9 @@ if __name__ == "__main__":
                              "обновлялся раз в итерацию вместо per-step).")
     parser.add_argument("--resign-threshold",      type=float, default=-0.95,
                         help="Финальный порог сдачи (default: -0.95)")
+    parser.add_argument("--archive-dir",           type=str,   default="",
+                        help="Каталог полного архива самоигры (все позиции, включая "
+                             "быстрые, + свойства партий для выборок). Пусто — не вести")
     parser.add_argument("--resign-playthrough",    type=float, default=0.10,
                         help="Доля игр без resign для калибровки (LC0-style). "
                              "0.10 = 10%% играем до конца. (default: 0.10)")
@@ -3019,6 +3130,7 @@ if __name__ == "__main__":
         resign_consec=args.resign_consec,
         resign_min_move=args.resign_min_move,
         resign_playthrough=args.resign_playthrough,
+        archive_dir=args.archive_dir,
         force_save=args.force_save,
         curriculum_mode=args.curriculum,
         fsf_nodes_current=args.fsf_nodes_start,
