@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--parallel", type=int, default=32)
     ap.add_argument("--side", choices=["white", "black"], default="white",
                     help="сторона ЧЕЛОВЕКА")
+    ap.add_argument("--archive-dir", default="", help="писать законченные партии в архив")
     ap.add_argument("--move", default=None, help="сделать один ход и выйти")
     ap.add_argument("--state", default="play_state.json")
     ap.add_argument("--new", action="store_true", help="начать партию заново")
@@ -139,7 +140,24 @@ def main():
             line += f"{args.resign_consec} хода подряд)"
         return line
 
+    def _archive_if_over():
+        if not getattr(args, "archive_dir", "") or state.get("archived"):
+            return
+        if not (engine.is_game_over() or state.get("resigned")):
+            return
+        import archive as A
+        r = engine.game_result() if engine.is_game_over() else (
+            -1.0 if engine.side_to_move() == 0 else 1.0)
+        n = A.archive_moves(args.archive_dir,
+                            [move_to_uci(m) for m in state["moves"]],
+                            int(round(r)) if abs(r) > 0.5 else 0,
+                            A.SOURCE_HUMAN, white="человек", black="сеть")
+        if n:
+            state["archived"] = True
+            print(f"в архив записано {n} позиций")
+
     def status():
+        _archive_if_over()
         if state.get("resigned"):
             return "\n*** сеть сдалась ***"
         if engine.is_game_over():

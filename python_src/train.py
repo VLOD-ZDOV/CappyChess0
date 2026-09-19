@@ -518,6 +518,12 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
 
     Returns: (samples, cur_wins, cur_draws, cur_losses)
     """
+    arch_fsf = None
+    if getattr(cfg, "archive_dir", ""):
+        arch_fsf = archive_mod.ArchiveWriter(
+            cfg.archive_dir, 700000 + (int(time.time()) % 90000),
+            int(np.asarray(CapablancaEngine().get_board_tensor()).size))
+
     from model import CapablancaNet
 
     lagged_net = CapablancaNet(
@@ -629,6 +635,21 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
             else:                   cur_draws  += 1
 
             total_plies = game_plies[g]
+            if arch_fsf is not None and positions[g]:
+                term = (archive_mod.TERM_MATE if abs(result) > 0.5
+                        else archive_mod.DRAW_REASON_TO_TERM.get(
+                            eng.draw_reason(), archive_mod.TERM_DRAW_RULE)
+                        ) if eng.is_game_over() else archive_mod.TERM_LIMIT
+                g_id = arch_fsf.add_game(
+                    result=int(round(result)) if abs(result) > 0.5 else 0,
+                    plies=total_plies, term=term, playthrough=0, resign_ply=-1,
+                    source=archive_mod.SOURCE_MATCH,
+                    white_id=arch_fsf.name_id("сеть" if nn_side == 0 else "отстающая"),
+                    black_id=arch_fsf.name_id("отстающая" if nn_side == 0 else "сеть"))
+                for row in positions[g]:
+                    arch_fsf.add_position(row[0], row[1][0], row[1][1], game=g_id,
+                                          ply=row[3], side=row[2], full=True,
+                                          root_q=row[4] or 0.0, root_d=row[5])
             for board_np, pol_sparse, side, ply, root_q, root_d in positions[g]:
                 z = result if side == 0 else -result
                 v, draw_target = _blend_value(cfg, z, root_q, root_d, result)
@@ -638,6 +659,9 @@ def generate_lagged_games(net, lagged_sd: dict, cfg, device: "torch.device",
                     board_np, pol_sparse, float(v), float(mlh_norm),
                     -1, float(draw_target)))
 
+    if arch_fsf is not None:
+        n_a = arch_fsf.close()
+        print(f"  📚 В архив записано {n_a} позиций партий против отстающей сети")
     del lagged_net
     total = cur_wins + cur_draws + cur_losses
     wr = (cur_wins + 0.5 * cur_draws) / total if total > 0 else 0.0

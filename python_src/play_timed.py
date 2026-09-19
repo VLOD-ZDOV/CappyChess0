@@ -111,6 +111,8 @@ def main():
                          "1.0 доказан матчем (+72 Elo к умолчанию 0.33)")
     ap.add_argument("--fsf-threads", type=int, default=4)
     ap.add_argument("--fsf-hash", type=int, default=256)
+    ap.add_argument("--archive-dir", default="",
+                    help="писать партию в архив")
     ap.add_argument("--pgn", default=None, help="куда записать партию (PGN)")
     a = ap.parse_args()
 
@@ -198,6 +200,14 @@ def main():
     print(f"Часы: белые {clock[0]:.1f} с, чёрные {clock[1]:.1f} с")
     if a.pgn:
         save_pgn(a.pgn, history, result, nn_side, a.tc, a.fsf_threads)
+    if a.archive_dir:
+        import archive as A
+        n = A.archive_moves(a.archive_dir, history,
+                            None if not engine.is_game_over() else int(r),
+                            A.SOURCE_FSF,
+                            white="сеть" if nn_side == 0 else "движок",
+                            black="движок" if nn_side == 0 else "сеть")
+        print(f"в архив записано {n} позиций")
         print(f"Партия записана в {a.pgn} — открывается кнопкой «Открыть партию» в gui.py")
     fsf.close()
 

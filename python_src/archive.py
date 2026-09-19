@@ -418,6 +418,54 @@ class Archive:
         full = int((self.p["full"] == 1).sum())
         lines.append(f"  позиций полного поиска {full:,}, быстрых {n_p-full:,}")
         return "\n".join(lines).replace(",", " ")
+def archive_moves(directory, moves, result, source, white="?", black="?",
+                  engine=None, iteration=None):
+    """Записать одну партию по списку ходов UCI. Возвращает число позиций.
+
+    Общий путь для всего, что играет партии, но не считает распределение
+    визитов: часы, CLI, GUI, импорт PGN. Политики у таких позиций нет.
+    Нелегальный ход обрывает запись: лучше пропустить партию, чем записать
+    мусор."""
+    import time as _t
+    from capablanca_engine import CapablancaEngine
+    eng = engine or CapablancaEngine()
+    board_len = int(np.asarray(eng.get_board_tensor()).size)
+    w = ArchiveWriter(directory,
+                      int(_t.time()) % 1000000 if iteration is None else iteration,
+                      board_len)
+    rows = []
+    for uci in moves:
+        mv = _uci_to_move(eng, uci)
+        if mv is None:
+            return 0
+        rows.append((np.asarray(eng.get_board_tensor(), dtype=np.float32),
+                     eng.side_to_move(), mv))
+        eng.make_move_int(mv)
+    if not rows:
+        return 0
+    if result is None:
+        result = int(eng.game_result()) if eng.is_game_over() else 0
+    if eng.is_game_over():
+        term = (TERM_MATE if abs(result) > 0.5
+                else DRAW_REASON_TO_TERM.get(eng.draw_reason(), TERM_DRAW_RULE))
+    else:
+        term = TERM_LIMIT
+    g = w.add_game(result=int(result), plies=len(rows), term=term, playthrough=0,
+                   resign_ply=-1, source=source,
+                   white_id=w.name_id(white), black_id=w.name_id(black))
+    for ply, (board, side, mv) in enumerate(rows):
+        w.add_position(board, [], [], game=g, ply=ply, side=side, full=False,
+                       root_q=0.0, root_d=-1.0, move=-1, move_raw=int(mv))
+    return w.close()
+
+
+def _uci_to_move(eng, uci):
+    for m in eng.get_legal_moves_int():
+        if move_to_uci(m & ~0b111 | (m & 0b111)) == uci:
+            return m
+    return None
+
+
 def idx_to_move(idx, side):
     """Канонический индекс политики → ход в координатах доски.
 

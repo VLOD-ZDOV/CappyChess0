@@ -1595,6 +1595,8 @@ class NibblerGUI(QMainWindow):
         self.archive_dialog.show()
 
     def load_archive_dir(self, directory):
+        # Тот же каталог используется и для записи сыгранных здесь партий.
+        self.archive_dir = directory
         self.statusBar().showMessage(f"Загрузка архива: {directory}...")
         self.archive_loader = ArchiveLoaderThread(directory)
         self.archive_loader.progress.connect(lambda msg: self.statusBar().showMessage(msg))
@@ -1913,6 +1915,14 @@ class NibblerGUI(QMainWindow):
                 if lg is not None and lg.head["result"] is None:
                     lg.finish(r)
                     msg += f"  ·  записано: games/{os.path.basename(lg.txt_path)}"
+                    if A is not None and getattr(self, "archive_dir", ""):
+                        n = A.archive_moves(
+                            self.archive_dir, [x["uci"] for x in lg.plies],
+                            int(round(r)) if abs(r) > 0.5 else 0,
+                            A.SOURCE_HUMAN, white=lg.head.get("network", "?"),
+                            black=lg.head.get("network", "?"))
+                        if n:
+                            msg += f"  ·  в архив: {n} позиций"
             except Exception as e:
                 msg += f"  ·  запись не сохранена: {e}"
             self.statusBar().showMessage(f"Партия окончена — {msg}")

@@ -52,67 +52,24 @@ def parse(text):
     return games
 
 
-def uci_to_move(eng, uci):
-    """UCI → ход движка, сверяясь со списком легальных в ЭТОЙ позиции."""
-    for m in eng.get_legal_moves_int():
-        f, t, p = (m >> 10) & 0x7F, (m >> 3) & 0x7F, m & 0b111
-        s = (f"{chr(ord('a') + f % 10)}{f // 10 + 1}"
-             f"{chr(ord('a') + t % 10)}{t // 10 + 1}")
-        if p:
-            s += " nbrqac"[p]
-        if s == uci:
-            return m
-    return None
-
-
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     adir, files = sys.argv[1], sys.argv[2:]
-    board_len = int(np.asarray(CapablancaEngine().get_board_tensor()).size)
-    import time
-    w = A.ArchiveWriter(adir, 800000 + (int(time.time()) % 90000), board_len)
     total_g = total_p = skipped = 0
-
     for path in files:
-        games = parse(open(path, errors="ignore").read())
         name = os.path.splitext(os.path.basename(path))[0][:60]
-        for moves, result in games:
-            eng = CapablancaEngine()
-            rows, ok = [], True
-            for uci in moves:
-                mv = uci_to_move(eng, uci)
-                if mv is None:
-                    ok = False
-                    break
-                rows.append((np.asarray(eng.get_board_tensor(), dtype=np.float32),
-                             eng.side_to_move(), mv))
-                eng.make_move_int(mv)
-            if not ok or not rows:
+        for moves, result in parse(open(path, errors="ignore").read()):
+            n = A.archive_moves(adir, moves, result, A.SOURCE_HUMAN,
+                                white=name, black=name)
+            if n:
+                total_g += 1
+                total_p += n
+            else:
                 skipped += 1
-                continue
-            # Результат из PGN, а если его нет — доиграно ли до конца по правилам.
-            if result is None:
-                result = int(eng.game_result()) if eng.is_game_over() else 0
-            term = (A.TERM_MATE if eng.is_game_over() and abs(result) > 0.5
-                    else A.DRAW_REASON_TO_TERM.get(eng.draw_reason(), A.TERM_DRAW_RULE)
-                    if eng.is_game_over() else A.TERM_LIMIT)
-            g_id = w.add_game(result=result, plies=len(rows), term=term,
-                              playthrough=0, resign_ply=-1,
-                              source=A.SOURCE_HUMAN,
-                              white_id=w.name_id(name), black_id=w.name_id(name))
-            for ply, (board, side, mv) in enumerate(rows):
-                # Политики нет — пустой список, а не выдуманное распределение.
-                w.add_position(board, [], [], game=g_id, ply=ply, side=side,
-                               full=False, root_q=0.0, root_d=-1.0,
-                               move=-1, move_raw=int(mv))
-            total_g += 1
-            total_p += len(rows)
-
-    n = w.close()
     print(f"загружено {total_g} партий, {total_p} позиций"
           + (f"; пропущено {skipped} (ход не разобран)" if skipped else ""))
-    print(f"в архиве {n} новых строк · помечены как «человек», политики у них нет")
+    return 0
 
 
 if __name__ == "__main__":
