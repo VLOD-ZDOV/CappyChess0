@@ -1,21 +1,15 @@
 """Capablanca AI — Nibbler-style real-time analysis GUI.
 
 A dark-themed analysis frontend for the Capablanca Chess network, inspired by
-Nibbler (rooklift/nibbler). Talks to the network directly through mcts.py — no
-UCI bridge — and renders the native 10x8 board with Archbishop and Chancellor.
+Nibbler (rooklift/nibbler). Talks to the network directly through onnx_engine.py
+and renders the native 10x8 board with Archbishop and Chancellor.
 
 Features:
   * Live MCTS analysis with a ranked move infobox (N / P / Q / WDL).
-  * Transposition-aware search: positions reached by different move orders are
-    merged into a single search node (see TranspositionSearch below).
-  * Per-position analysis snapshots — reviewing history shows the cached
-    analysis instead of launching a fresh search.
-  * Eval bar, per-game winrate graph and a table of analyzed positions.
-  * Play against the network (either colour) or watch engine self-play.
-  * Coloured move arrows with the move winrate printed inside them.
-
-UI text is in Russian to match the rest of the project; code comments are in
-English.
+  * Opening Book / Explorer with WDL percentages from self-play archive.
+  * Interactive Archive Game Browser with filters and game replay.
+  * Transposition-aware search and tree reuse across moves.
+  * Eval bar, per-game winrate graph and table of analyzed positions.
 """
 
 import math
@@ -33,17 +27,20 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QSpinBox, QGroupBox, QDialog, QComboBox, QMessageBox,
                              QCheckBox, QSizePolicy, QShortcut, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView,
-                             QFrame)
+                             QFrame, QTabWidget, QScrollArea)
 from PyQt5.QtGui import (QPainter, QColor, QFont, QPen, QPolygonF, QKeySequence)
 from PyQt5.QtCore import Qt, QRect, QRectF, QPointF, QThread, pyqtSignal
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import archive as A
+except ImportError:
+    A = None
 
 try:
     from capablanca_engine import CapablancaEngine
     from onnx_engine import OnnxEngine, VIRTUAL_LOSS
 except ImportError as e:
-    # Самая частая причина — запуск системным питоном. Движок `capablanca_engine`
-    # это скомпилированный Rust-модуль, он ставится в виртуальное окружение
-    # проекта и системному интерпретатору не виден.
     _venv = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "venv")
     print(f"Ошибка импорта: {e}\n")
     if "capablanca_engine" in str(e):
@@ -55,8 +52,8 @@ except ImportError as e:
         else:
             print("Движок не собран. Из корня проекта:\n")
             print("    python -m venv venv")
-            print("    venv/bin/pip install -r requirements.txt   (Windows: venv\\Scripts\\pip)")
-            print("    venv/bin/pip install ./rust_engine         (нужен Rust: https://rustup.rs)\n")
+            print("    venv/bin/pip install -r requirements.txt")
+            print("    venv/bin/pip install ./rust_engine\n")
     else:
         traceback.print_exc()
     sys.exit(1)
@@ -64,25 +61,20 @@ except ImportError as e:
 
 # ───────────────────────────── Constants ──────────────────────────────────
 
-# piece_type: PAWN=0 KNIGHT=1 BISHOP=2 ROOK=3 QUEEN=4 ARCH=5 CHANC=6 KING=7
 PIECE_GLYPHS = {0: '♟', 1: '♞', 2: '♝', 3: '♜', 4: '♛', 5: 'A', 6: 'C', 7: '♚'}
-
-# Promotion: m_int stores p_val = piece_const + 1 (see lib.rs encode_move).
 _PROMO_FROM_VAL = [None, None, 'n', 'b', 'r', 'q', 'a', 'c']
 _PROMO_LABELS = [('q', 'Ферзь ♛'), ('r', 'Ладья ♜'), ('b', 'Слон ♝'),
                  ('n', 'Конь ♞'), ('a', 'Архиепископ A'), ('c', 'Канцлер C')]
 
-# Arrow / rank colours, brightest first (Nibbler-style ranked highlighting).
 RANK_COLORS = [QColor("#3aa655"), QColor("#3d7fd6"), QColor("#d98a1f"),
                QColor("#9b59b6"), QColor("#1aa3a3")]
 GREY = QColor("#6f6f6f")
 
-FPU_REDUCTION = 0.330      # relative first-play-urgency, from lc0
-MAX_SELECT_DEPTH = 160     # hard safety cap on selection descent
-TT_MAX_NODES = 500_000     # ttable cap; when exceeded, we drop the dead branches
-PV_DEPTH = 10              # plies of principal variation shown per move
+FPU_REDUCTION = 0.330
+MAX_SELECT_DEPTH = 160
+TT_MAX_NODES = 500_000
+PV_DEPTH = 10
 
-# Theme
 BG = "#262626"
 BG2 = "#2f2f2f"
 BG3 = "#383838"
@@ -91,15 +83,14 @@ ACCENT = "#5b9bd5"
 LIGHT_SQ = QColor("#e9edcc")
 DARK_SQ = QColor("#7a9b5b")
 
-W_COL = QColor("#3aa655")   # WDL bar: win
-D_COL = QColor("#8a8a8a")   # draw
-L_COL = QColor("#cf4f3a")   # loss
+W_COL = QColor("#3aa655")   # Win (Green)
+D_COL = QColor("#7f8c8d")   # Draw (Grey)
+L_COL = QColor("#cf4f3a")   # Loss (Red)
 
 
 # ───────────────────────────── Move helpers ───────────────────────────────
 
 def decode_move(m_int):
-    """m_int -> (from_sq, to_sq, promo_letter|None). Squares are rank*10+file."""
     p_val = m_int & 0b111
     to_sq = (m_int >> 3) & 0x7F
     from_sq = (m_int >> 10) & 0x7F
@@ -108,7 +99,6 @@ def decode_move(m_int):
 
 
 def sq_to_str(s):
-    """Square index -> coordinate string, e.g. 0 -> 'a1', 79 -> 'j8'."""
     return f"{chr(ord('a') + (s % 10))}{(s // 10) + 1}"
 
 
@@ -118,13 +108,6 @@ def move_to_uci(m_int):
 
 
 def value_to_wdl(v):
-    """Map a scalar value in [-1, 1] to a (win, draw, loss) triple.
-
-    Linear, so the bar's implied Q = W - L is exactly the Q printed next to it.
-    The old sqrt variant turned q=0.5 into W=0.71 / D=0.29 → an implied Q of
-    0.71, i.e. the WDL bar and the eval column disagreed. Same mapping
-    train.py uses for its value targets (`value_to_wdl` there).
-    """
     v = max(-1.0, min(1.0, float(v)))
     p_win = max(0.0, v)
     p_loss = max(0.0, -v)
@@ -136,34 +119,86 @@ _HASH_WARNED = [False]
 
 
 def position_key(engine):
-    """Transposition key for a position.
-
-    Prefers the engine's native ``position_hash`` (pieces + side + castling +
-    en-passant). Falls back to a piece-list hash if the engine binary predates
-    that method — that fallback ignores castling/ep rights, so rebuild the Rust
-    engine (``maturin develop --release``) for fully correct transpositions.
-    """
     fn = getattr(engine, "position_hash", None)
     if fn is not None:
         return fn()
     if not _HASH_WARNED[0]:
         _HASH_WARNED[0] = True
-        print("⚠️  engine.position_hash отсутствует — пересоберите Rust-движок "
-              "для точных транспозиций. Использую запасной ключ.")
+        print("⚠️  engine.position_hash отсутствует — используется запасной ключ.")
     return hash((tuple(sorted(engine.get_pieces())), engine.side_to_move()))
+
+
+# ─────────────────────── Фоновая загрузка архива ──────────────────────────
+
+class ArchiveLoaderThread(QThread):
+    """Индексирует партии и дебютную книгу без блокировки интерфейса."""
+    progress = pyqtSignal(str)
+    loaded = pyqtSignal(object, object, object)
+    error = pyqtSignal(str)
+
+    def __init__(self, directory, max_book_ply=32):
+        super().__init__()
+        self.directory = directory
+        self.max_book_ply = max_book_ply
+
+    def run(self):
+        try:
+            if A is None:
+                raise ImportError("Модуль archive.py не найден рядом с gui.py")
+            self.progress.emit("Чтение метаданных архива...")
+            ar = A.Archive(self.directory)
+            n_games = len(ar.g["result"])
+
+            p_games = ar.p["game"]
+            p_moves = ar.p["move_raw"]
+            p_idxs = ar.p["move"]
+            p_sides = ar.p["side"]
+
+            self.progress.emit("Сборка цепочек ходов...")
+            games_moves = [[] for _ in range(n_games)]
+            for g_id, m_raw, m_idx, s in zip(p_games, p_moves, p_idxs, p_sides):
+                if g_id < n_games:
+                    if m_raw >= 0:
+                        mv = int(m_raw)
+                    else:
+                        mv = A.idx_to_move(m_idx, s)
+                    if mv is not None:
+                        games_moves[g_id].append(mv)
+
+            self.progress.emit(f"Построение книги дебютов из {n_games:,} партий...")
+            book = {}
+            for g_id, moves in enumerate(games_moves):
+                res = int(ar.g["result"][g_id])
+                eng = CapablancaEngine()
+                for ply_num, mv in enumerate(moves[:self.max_book_ply]):
+                    k = position_key(eng)
+                    stm = eng.side_to_move()
+                    if res == 0:
+                        kind = "d"
+                    elif (res > 0 and stm == 0) or (res < 0 and stm == 1):
+                        kind = "w"
+                    else:
+                        kind = "l"
+
+                    entry = book.setdefault(k, {"total": 0, "side": stm, "moves": {}})
+                    entry["total"] += 1
+                    m_stats = entry["moves"].setdefault(mv, {"w": 0, "d": 0, "l": 0, "n": 0})
+                    m_stats["n"] += 1
+                    m_stats[kind] += 1
+
+                    try:
+                        eng.make_move_int(mv)
+                    except Exception:
+                        break
+
+            self.loaded.emit(ar, games_moves, book)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ───────────────────── Transposition-aware search tree ────────────────────
 
 class _TNode:
-    """A search node, uniquely identified by a board position.
-
-    Statistics (visits / value) live on the node and are therefore shared by
-    every move order that reaches this position — that is the merge. Move
-    priors live on the *edges* instead, since a prior is parent-specific.
-    ``draw_sum`` accumulates the network's draw probability per visit so that
-    a contempt factor can rescale Q at selection time without re-running search.
-    """
     __slots__ = ("visits", "value_sum", "draw_sum", "vloss", "is_expanded",
                  "is_terminal", "children")
 
@@ -174,15 +209,9 @@ class _TNode:
         self.vloss = 0
         self.is_expanded = False
         self.is_terminal = False
-        self.children = {}          # move_int -> _TEdge
+        self.children = {}
 
     def q(self):
-        # value_sum is in THIS node's own side-to-move POV, and the parent
-        # scores a child as -child_q (negamax). So a virtual loss — which must
-        # make an in-flight node LESS attractive to its parent — has to push
-        # this node's q UP, i.e. count each pending visit as a WIN (+1) here.
-        # Subtracting instead made -child_q rise, so every parallel select
-        # piled back onto the same in-flight leaf (see _best_edge).
         d = self.visits + self.vloss
         return (self.value_sum + self.vloss) / d if d > 0 else 0.0
 
@@ -200,16 +229,7 @@ class _TEdge:
 # ───────────────────────────── Search thread ──────────────────────────────
 
 class SearchThread(QThread):
-    """Background transposition-aware MCTS worker.
-
-    Builds a search DAG for one fixed position and streams ranked statistics
-    back to the GUI. Two move orders that reach the same position share one
-    _TNode, so their visits and values accumulate together. The DAG (``ttable``)
-    is owned by the GUI and persists across moves, so a search picks up the
-    sub-tree an earlier search already built for this position (tree reuse).
-    A path-hash set guards against repetition cycles.
-    """
-    update = pyqtSignal(object)   # dict payload
+    update = pyqtSignal(object)
 
     def __init__(self, move_history, mcts, max_sims, ttable, contempt=0.0):
         super().__init__()
@@ -217,18 +237,14 @@ class SearchThread(QThread):
         self.mcts = mcts
         self.max_sims = max_sims if max_sims > 0 else 50_000_000
         self.c_puct = mcts.c_puct
-        # Contempt (LC0 search.cc): Q_effective = (W - L + contempt * D) / N.
-        # Positive → draws disliked (aggressive); negative → draws acceptable.
-        # Applied only inside the PUCT selection, never to the displayed Q.
         self.contempt = float(contempt)
         self.running = True
-        self.ttable = ttable        # shared, persists across moves -> tree reuse
-        self.tt_hits = 0            # number of merged (transposed) edges
-        self.reused = 0             # visits inherited from earlier searches
+        self.ttable = ttable
+        self.tt_hits = 0
+        self.reused = 0
         self.root_engine = None
         self.root_hash = 0
 
-    # ---- tree primitives ----
     def _replay(self, moves):
         eng = self.root_engine.copy()
         for m in moves:
@@ -247,11 +263,6 @@ class SearchThread(QThread):
             c = e.child
             started = c.visits + c.vloss
             if started > 0:
-                # Child Q is in the child's POV — negate for the parent. Each
-                # in-flight visit counts as a WIN for the child (+vloss), so the
-                # parent's -q drops and parallel selects scatter across moves
-                # instead of all piling onto the same leaf (matches lib.rs
-                # MctsNode::q). Contempt adds the (sign-invariant) draw mass.
                 q_child = (c.value_sum + c.vloss + cont * c.draw_sum) / started
                 q_in_parent = -q_child
             else:
@@ -262,11 +273,6 @@ class SearchThread(QThread):
         return best
 
     def _select(self, root):
-        """Descend from the root. Returns (path_nodes, path_moves, kind).
-
-        kind is 'leaf' (needs evaluation / expansion) or 'rep' (the chosen edge
-        re-enters a position already on this path — treated as a draw).
-        """
         node = root
         path_nodes = [root]
         path_moves = []
@@ -303,7 +309,7 @@ class SearchThread(QThread):
                 node = _TNode()
                 self.ttable[h] = node
             else:
-                self.tt_hits += 1                 # transposition merged
+                self.tt_hits += 1
             leaf.children[m] = _TEdge(float(pr), m, node, h)
         leaf.is_expanded = True
 
@@ -314,8 +320,6 @@ class SearchThread(QThread):
 
     @staticmethod
     def _backup(path, leaf_value, leaf_draw=0.0):
-        # leaf_value is from the leaf's side-to-move; sign flips up the path.
-        # draw is sign-invariant (a draw is a draw for both sides).
         sign = 1.0
         for n in reversed(path):
             n.visits += 1
@@ -325,13 +329,11 @@ class SearchThread(QThread):
 
     @staticmethod
     def _terminal_value(sim):
-        r = sim.game_result()                      # white's perspective
+        r = sim.game_result()
         return r if sim.side_to_move() == 0 else -r
 
     @staticmethod
     def _pv(node, max_depth):
-        """Principal variation from `node`: the most-visited child at each
-        step. Returns the continuation as a list of move ints."""
         line = []
         seen = set()
         for _ in range(max_depth):
@@ -341,13 +343,12 @@ class SearchThread(QThread):
             if best.child.visits == 0:
                 break
             line.append(best.move)
-            if best.child_hash in seen:            # repetition — stop
+            if best.child_hash in seen:
                 break
             seen.add(best.child_hash)
             node = best.child
         return line
 
-    # ---- main loop ----
     def run(self):
         try:
             engine = CapablancaEngine()
@@ -365,9 +366,6 @@ class SearchThread(QThread):
             self.root_hash = position_key(engine)
             mcts = self.mcts
 
-            # Tree reuse: if this position was already explored (as the root of
-            # an earlier search or as a sub-node of one) its _TNode is still in
-            # the shared table — pick it up and keep accumulating visits.
             root = self.ttable.get(self.root_hash)
             if root is None:
                 root = _TNode()
@@ -378,26 +376,23 @@ class SearchThread(QThread):
                 self._expand(root, engine, policy[0])
             self.reused = root.visits
 
-            child_nn = {}        # root move -> (child_q, child_d) network eval
-            total = root.visits  # continue the count, don't restart it
+            child_nn = {}
+            total = root.visits
             last_emit = 0.0
             bs = mcts.batch_size
 
             while self.running and total < self.max_sims:
                 tensors, pending = [], []
-                in_flight = set()     # ids of leaves already in this batch
+                in_flight = set()
                 attempts = 0
                 while (len(tensors) < bs and attempts < bs * 4 and self.running):
                     attempts += 1
                     path_nodes, path_moves, kind = self._select(root)
                     leaf = path_nodes[-1]
-                    # Virtual loss should already have steered us elsewhere; the
-                    # guard keeps a tiny tree from spending the whole GPU batch
-                    # on one position (mirrors RustMCTS::collect_leaves_append).
                     if kind == 'leaf' and id(leaf) in in_flight:
                         continue
 
-                    if kind == 'rep':                    # repetition -> draw
+                    if kind == 'rep':
                         self._backup(path_nodes, 0.0, 1.0)
                         total += 1
                         continue
@@ -417,8 +412,7 @@ class SearchThread(QThread):
                         total += 1
                         continue
 
-                    tensors.append(np.asarray(sim.get_board_tensor(),
-                                               dtype=np.float32))
+                    tensors.append(np.asarray(sim.get_board_tensor(), dtype=np.float32))
                     pending.append((leaf, path_nodes, path_moves, sim))
                     in_flight.add(id(leaf))
                     self._vloss(path_nodes, VIRTUAL_LOSS)
@@ -431,18 +425,16 @@ class SearchThread(QThread):
                         self._vloss(path_nodes, -VIRTUAL_LOSS)
                         v = float(vals[i])
                         d = float(draws[i])
-                        m_ply = float(mlhs[i]) * 200.0    # MLH_PLY_NORM, see model.py
-                        if len(path_moves) == 1:         # direct child of root
+                        m_ply = float(mlhs[i]) * 200.0
+                        if len(path_moves) == 1:
                             child_nn[path_moves[0]] = (v, d, m_ply)
                         self._backup(path_nodes, v, d)
                     total += len(pending)
 
                 now = time.time()
-                if (now - last_emit > 0.13 or total >= self.max_sims
-                        or not self.running):
+                if (now - last_emit > 0.13 or total >= self.max_sims or not self.running):
                     last_emit = now
-                    self._emit(root, stm, total, child_nn,
-                               finished=(total >= self.max_sims))
+                    self._emit(root, stm, total, child_nn, finished=(total >= self.max_sims))
                 self.msleep(1)
 
             self._emit(root, stm, total, child_nn, finished=True)
@@ -453,10 +445,6 @@ class SearchThread(QThread):
 
     def _emit(self, root, stm, total, child_nn, finished):
         payload = payload_from_node(root, stm, child_nn)
-        # Сигнал Qt доставляется в очереди: посылка, отправленная до хода,
-        # приходит уже после него. Без отметки о позиции получатель приписывал
-        # её текущему ходу и рисовал стрелки чужой позиции — «сходи с поля,
-        # где нет фигуры». Помечаем и проверяем на приёме.
         payload["ply"] = len(self.move_history)
         payload["root_hash"] = self.root_hash
         payload["sims"] = total
@@ -467,13 +455,6 @@ class SearchThread(QThread):
 
 
 def payload_from_node(root, stm, child_nn=None):
-    """Build a GUI payload dict from a search-tree node.
-
-    Used both by the live search (``SearchThread._emit``) and by the GUI to
-    render a tree's already-accumulated state without running a search — e.g.
-    showing the residual sims a position carries via tree reuse while analysis
-    is stopped.
-    """
     tv = sum(e.child.visits for e in root.children.values())
     moves = []
     for m, e in root.children.items():
@@ -484,7 +465,7 @@ def payload_from_node(root, stm, child_nn=None):
             "move": m,
             "visits": c.visits,
             "prior": e.prior,
-            "q": -(c.value_sum / c.visits),       # value from the mover's side
+            "q": -(c.value_sum / c.visits),
             "frac": (c.visits / tv) if tv > 0 else 0.0,
             "nn": child_nn.get(m) if child_nn else None,
             "pv": [m] + SearchThread._pv(c, PV_DEPTH),
@@ -497,23 +478,7 @@ def payload_from_node(root, stm, child_nn=None):
 
 # ──────────────────────────── Game logger ─────────────────────────────────
 
-
 class GameLogger:
-    """Пишет партию в два файла рядом: ходы и оценки.
-
-        games/<время>.txt    список ходов, читается глазами
-        games/<время>.json   оценки поиска, читается разбором
-
-    Раздельно потому, что смотреть партию и разбирать её — разные задачи, а
-    один файл со всем сразу нечитаем в обеих ролях.
-
-    В каждой записи есть `legal` — сколько ходов было легально. Без него
-    единственный ход в списке сети выглядит как «позиция безнадёжна», хотя это
-    может быть обычный шах с одним отступлением; на этом уже ошиблись.
-
-    Оба файла переписываются после КАЖДОГО хода и атомарно: партия, брошенная
-    на середине, всё равно оставляет пригодные файлы."""
-
     DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games")
     RESULTS = {"draw": "ничья", "white": "победа белых", "black": "победа чёрных"}
 
@@ -555,7 +520,6 @@ class GameLogger:
                                else ("white" if r > 0 else "black"))
         self.flush()
 
-    # ---- запись ----
     @staticmethod
     def _atomic(path, text):
         tmp = path + ".tmp"
@@ -595,16 +559,11 @@ class GameLogger:
 # ───────────────────────────── Eval bar ───────────────────────────────────
 
 class EvalBar(QWidget):
-    """Vertical evaluation bar — white fill grows from the bottom.
-
-    If a (heuristic) mate is detected, displays "M<n>" / "-M<n>" instead of
-    the percentage. Mate-in-n is a full-move count, not plies."""
-
     def __init__(self):
         super().__init__()
         self.setFixedWidth(36)
         self.white_wr = 0.5
-        self.mate_in = None      # signed full-move count or None
+        self.mate_in = None
 
     def set_winrate(self, wr_white):
         self.white_wr = max(0.0, min(1.0, wr_white))
@@ -612,8 +571,6 @@ class EvalBar(QWidget):
         self.update()
 
     def set_eval(self, wr_white, mate_in=None):
-        """mate_in: signed int (+N = white mates in N, -N = black mates in N),
-        or None for no mate detected."""
         self.white_wr = max(0.0, min(1.0, wr_white))
         self.mate_in = mate_in
         self.update()
@@ -645,7 +602,6 @@ class EvalBar(QWidget):
 # ───────────────────────────── Winrate graph ──────────────────────────────
 
 class WinrateGraph(QWidget):
-    """Per-game winrate graph (white POV). Click a point to jump to that ply."""
     seek = pyqtSignal(int)
 
     def __init__(self):
@@ -706,9 +662,7 @@ class WinrateGraph(QWidget):
 # ───────────────────────────── Infobox ────────────────────────────────────
 
 class InfoBox(QWidget):
-    """Ranked move list with N / P / Q / WDL — the Nibbler-style infobox."""
     play_move = pyqtSignal(int)
-
     ROW_H = 64
 
     def __init__(self):
@@ -781,7 +735,6 @@ class InfoBox(QWidget):
             p.drawText(QRect(14, y + 23, w - 100, 15),
                        Qt.AlignVCenter | Qt.AlignLeft, stats)
 
-            # Principal variation — the engine's expected line ("queue of moves").
             pv = d.get("pv")
             if pv:
                 p.setPen(QColor("#8fa6bd"))
@@ -793,7 +746,6 @@ class InfoBox(QWidget):
                 p.drawText(pv_rect, Qt.AlignVCenter | Qt.AlignLeft, pv_str)
 
             if d["nn"] is not None:
-                # nn is (q, d) or (q, d, m_plies); ignore extras.
                 cq, cd = d["nn"][0], d["nn"][1]
                 win = max(0.0, (1.0 - cd - cq) / 2.0)
                 loss = max(0.0, (1.0 - cd + cq) / 2.0)
@@ -810,6 +762,354 @@ class InfoBox(QWidget):
             p.drawRect(bx + ww, by, dw, 5)
             p.setBrush(L_COL)
             p.drawRect(bx + ww + dw, by, bw - ww - dw, 5)
+
+
+# ───────────────────── Book Explorer (WDL по ходам) ──────────────────────
+
+class BookBox(QWidget):
+    """Дебютная книга: список ходов, сыгранных из текущей позиции, с WDL-процентами."""
+    play_move = pyqtSignal(int)
+    ROW_H = 48
+
+    def __init__(self):
+        super().__init__()
+        self.moves_data = []
+        self.total_games = 0
+        self.side_to_move = 0
+        self.hover = -1
+        self.has_archive = False
+        self.setMouseTracking(True)
+        self.setMinimumWidth(330)
+
+    def set_book_data(self, entry, has_archive=True):
+        self.has_archive = has_archive
+        if entry is None or not entry.get("moves"):
+            self.moves_data = []
+            self.total_games = 0
+            self.side_to_move = 0
+        else:
+            self.total_games = entry["total"]
+            self.side_to_move = entry["side"]
+            m_items = []
+            for mv, st in entry["moves"].items():
+                n = st["n"]
+                w = st["w"]
+                d = st["d"]
+                l = st["l"]
+                score = (w + 0.5 * d) / n if n > 0 else 0.5
+                freq = n / self.total_games if self.total_games > 0 else 0.0
+                m_items.append({
+                    "move": mv, "n": n, "w": w, "d": d, "l": l,
+                    "w_pct": w / n if n > 0 else 0.0,
+                    "d_pct": d / n if n > 0 else 0.0,
+                    "l_pct": l / n if n > 0 else 0.0,
+                    "score": score, "freq": freq
+                })
+            m_items.sort(key=lambda x: x["n"], reverse=True)
+            self.moves_data = m_items
+
+        needed_h = max(1, len(self.moves_data)) * self.ROW_H + 28
+        self.setMinimumHeight(needed_h)
+        self.update()
+
+    def _row_at(self, y):
+        if y < 24:
+            return -1
+        i = (y - 24) // self.ROW_H
+        return i if 0 <= i < len(self.moves_data) else -1
+
+    def mouseMoveEvent(self, ev):
+        h = self._row_at(ev.y())
+        if h != self.hover:
+            self.hover = h
+            self.setCursor(Qt.PointingHandCursor if h >= 0 else Qt.ArrowCursor)
+            self.update()
+
+    def leaveEvent(self, _):
+        self.hover = -1
+        self.setCursor(Qt.ArrowCursor)
+        self.update()
+
+    def mousePressEvent(self, ev):
+        i = self._row_at(ev.y())
+        if i >= 0:
+            self.play_move.emit(self.moves_data[i]["move"])
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(BG2))
+        w = self.width()
+
+        if not self.has_archive:
+            p.setPen(QColor("#888"))
+            p.setFont(QFont("Segoe UI", 10))
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       "Архив не загружен.\nНажмите «📦 Архив партий».")
+            return
+
+        if not self.moves_data:
+            p.setPen(QColor("#777"))
+            p.setFont(QFont("Segoe UI", 10))
+            p.drawText(self.rect(), Qt.AlignCenter,
+                       "В архиве нет партий с этой позицией\n(или глубже дебюта).")
+            return
+
+        # Заголовок
+        who = "белые" if self.side_to_move == 0 else "чёрные"
+        p.setPen(QColor("#aaa"))
+        p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        p.drawText(QRect(8, 4, w - 16, 16), Qt.AlignVCenter | Qt.AlignLeft,
+                   f"Всего партий: {self.total_games:,}  ·  ход: {who}")
+        p.setPen(QPen(QColor("#3d3d3d"), 1))
+        p.drawLine(8, 22, w - 8, 22)
+
+        for i, d in enumerate(self.moves_data):
+            y = 24 + i * self.ROW_H
+            row = QRect(0, y, w, self.ROW_H)
+            if i == self.hover:
+                p.fillRect(row, QColor(BG3))
+            elif i % 2:
+                p.fillRect(row, QColor("#2a2a2a"))
+
+            # UCI ход
+            p.setPen(QColor(FG))
+            p.setFont(QFont("Consolas", 11, QFont.Bold))
+            p.drawText(QRect(12, y + 2, 80, 18), Qt.AlignVCenter | Qt.AlignLeft,
+                       move_to_uci(d["move"]))
+
+            # Игр + частота
+            p.setPen(QColor("#9c9c9c"))
+            p.setFont(QFont("Segoe UI", 8))
+            n_txt = f"{d['n']:,} ({d['freq']*100:.0f}%)"
+            p.drawText(QRect(96, y + 2, 130, 18), Qt.AlignVCenter | Qt.AlignLeft, n_txt)
+
+            # Очки (%)
+            p.setPen(QColor(ACCENT).lighter(120))
+            p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+            p.drawText(QRect(w - 74, y + 2, 64, 18), Qt.AlignVCenter | Qt.AlignRight,
+                       f"{d['score']*100:.1f}%")
+
+            # WDL Полоса
+            bx = 12
+            bw = w - 24
+            by = y + 22
+            bh = 17
+
+            ww = int(round(bw * d["w_pct"]))
+            dw = int(round(bw * d["d_pct"]))
+            lw = bw - ww - dw
+
+            p.setPen(Qt.NoPen)
+            # Победа
+            if ww > 0:
+                p.setBrush(W_COL)
+                p.drawRoundedRect(QRectF(bx, by, ww, bh), 2, 2)
+            # Ничья
+            if dw > 0:
+                p.setBrush(D_COL)
+                p.drawRoundedRect(QRectF(bx + ww, by, dw, bh), 2, 2)
+            # Поражение
+            if lw > 0:
+                p.setBrush(L_COL)
+                p.drawRoundedRect(QRectF(bx + ww + dw, by, lw, bh), 2, 2)
+
+            # Проценты внутри сегментов
+            p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+            p.setPen(QColor("#ffffff"))
+
+            if ww >= 28:
+                p.drawText(QRect(bx, by, ww, bh), Qt.AlignCenter, f"{d['w_pct']*100:.0f}%")
+            if dw >= 28:
+                p.drawText(QRect(bx + ww, by, dw, bh), Qt.AlignCenter, f"{d['d_pct']*100:.0f}%")
+            if lw >= 28:
+                p.drawText(QRect(bx + ww + dw, by, lw, bh), Qt.AlignCenter, f"{d['l_pct']*100:.0f}%")
+
+
+# ─────────────────────── Диалог выбора партий архива ───────────────────────
+
+class ArchiveDialog(QDialog):
+    """Окно просмотра и фильтрации партий из архива."""
+    load_game = pyqtSignal(int)
+
+    def __init__(self, main_win, parent=None):
+        super().__init__(parent)
+        self.main_win = main_win
+        self.setWindowTitle("Архив партий")
+        self.resize(920, 620)
+        self.filtered_ids = []
+
+        lay = QVBoxLayout(self)
+
+        top_row = QHBoxLayout()
+        self.lbl_path = QLabel("Архив не выбран")
+        self.lbl_path.setStyleSheet("color: #aaa; font-style: italic;")
+        btn_browse = QPushButton("📂 Выбрать папку архива...")
+        btn_browse.clicked.connect(self.choose_directory)
+        top_row.addWidget(btn_browse)
+        top_row.addWidget(self.lbl_path, 1)
+        lay.addLayout(top_row)
+
+        # Фильтры
+        filter_box = QGroupBox("Фильтры отбора партий")
+        fl = QHBoxLayout(filter_box)
+
+        fl.addWidget(QLabel("Исход:"))
+        self.cb_result = QComboBox()
+        self.cb_result.addItems(["Все", "1-0 (Белые)", "½-½ (Ничья)", "0-1 (Чёрные)"])
+        self.cb_result.currentIndexChanged.connect(self.apply_filter)
+        fl.addWidget(self.cb_result)
+
+        fl.addWidget(QLabel("Окончание:"))
+        self.cb_term = QComboBox()
+        self.cb_term.addItem("Все")
+        if A:
+            for t_id in sorted(A.TERM_NAMES):
+                self.cb_term.addItem(A.TERM_NAMES[t_id], t_id)
+        self.cb_term.currentIndexChanged.connect(self.apply_filter)
+        fl.addWidget(self.cb_term)
+
+        fl.addWidget(QLabel("Полуходов:"))
+        self.spin_min_plies = QSpinBox()
+        self.spin_min_plies.setRange(0, 500)
+        self.spin_min_plies.setValue(0)
+        self.spin_min_plies.valueChanged.connect(self.apply_filter)
+        fl.addWidget(self.spin_min_plies)
+        fl.addWidget(QLabel("–"))
+        self.spin_max_plies = QSpinBox()
+        self.spin_max_plies.setRange(0, 500)
+        self.spin_max_plies.setValue(500)
+        self.spin_max_plies.valueChanged.connect(self.apply_filter)
+        fl.addWidget(self.spin_max_plies)
+
+        lay.addWidget(filter_box)
+
+        # Таблица партий
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["#", "Итерация", "Исход", "Ходов", "Окончание", "Источник"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table.cellDoubleClicked.connect(self._row_double_clicked)
+        lay.addWidget(self.table, 1)
+
+        # Низ
+        bottom = QHBoxLayout()
+        self.lbl_count = QLabel("Партий: 0")
+        bottom.addWidget(self.lbl_count)
+        bottom.addStretch()
+
+        btn_load = QPushButton("▶ Загрузить партию на доску")
+        btn_load.clicked.connect(self._load_selected)
+        bottom.addWidget(btn_load)
+
+        btn_close = QPushButton("Закрыть")
+        btn_close.clicked.connect(self.accept)
+        bottom.addWidget(btn_close)
+        lay.addLayout(bottom)
+
+    def choose_directory(self):
+        d = QFileDialog.getExistingDirectory(self, "Выбрать каталог архива")
+        if d:
+            self.main_win.load_archive_dir(d)
+
+    def update_archive_view(self, ar):
+        if ar is None:
+            self.lbl_path.setText("Архив не найден")
+            return
+        self.lbl_path.setText(os.path.abspath(ar.dir))
+        self.apply_filter()
+
+    def apply_filter(self):
+        ar = self.main_win.archive
+        if ar is None:
+            self.table.setRowCount(0)
+            self.lbl_count.setText("Партий: 0")
+            return
+
+        res_idx = self.cb_result.currentIndex()
+        res_filter = {1: 1, 2: 0, 3: -1}.get(res_idx, None)
+
+        term_data = self.cb_term.currentData()
+        min_p = self.spin_min_plies.value()
+        max_p = self.spin_max_plies.value()
+
+        mask = np.ones(ar.g["result"].shape[0], dtype=bool)
+        if res_filter is not None:
+            mask &= (ar.g["result"] == res_filter)
+        if term_data is not None:
+            mask &= (ar.g["term"] == term_data)
+        if min_p > 0:
+            mask &= (ar.g["plies"] >= min_p)
+        if max_p < 500:
+            mask &= (ar.g["plies"] <= max_p)
+
+        self.filtered_ids = np.flatnonzero(mask)
+        n = len(self.filtered_ids)
+        self.lbl_count.setText(f"Отобрано: {n:,} из {len(mask):,} партий")
+
+        # Показываем первые 2000 во избежание лагов таблицы
+        show_n = min(n, 2000)
+        self.table.blockSignals(True)
+        self.table.setRowCount(show_n)
+
+        for row in range(show_n):
+            gid = int(self.filtered_ids[row])
+            it = int(ar.g["iter"][gid])
+            r = int(ar.g["result"][gid])
+            pl = int(ar.g["plies"][gid])
+            t = int(ar.g["term"][gid])
+            src = int(ar.g["source"][gid])
+
+            r_str = "1-0" if r > 0 else ("0-1" if r < 0 else "½-½")
+            t_str = A.TERM_NAMES.get(t, str(t)) if A else str(t)
+            s_str = A.SOURCE_NAMES.get(src, str(src)) if A else str(src)
+
+            item_id = QTableWidgetItem(str(gid))
+            item_it = QTableWidgetItem(str(it))
+            item_res = QTableWidgetItem(r_str)
+            item_pl = QTableWidgetItem(f"{pl} (ход {pl//2 + 1})")
+            item_t = QTableWidgetItem(t_str)
+            item_src = QTableWidgetItem(s_str)
+
+            if r > 0:
+                item_res.setForeground(QColor("#4ea863"))
+            elif r < 0:
+                item_res.setForeground(QColor("#e0614a"))
+            else:
+                item_res.setForeground(QColor("#9e9e9e"))
+
+            for c, itm in enumerate([item_id, item_it, item_res, item_pl, item_t, item_src]):
+                if c in (0, 1, 2):
+                    itm.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, c, itm)
+
+        self.table.blockSignals(False)
+
+    def _row_double_clicked(self, row, _):
+        if 0 <= row < len(self.filtered_ids):
+            gid = int(self.filtered_ids[row])
+            self.load_game.emit(gid)
+            self.accept()
+
+    def _load_selected(self):
+        sel = self.table.selectedRanges()
+        if not sel:
+            return
+        row = sel[0].topRow()
+        if 0 <= row < len(self.filtered_ids):
+            gid = int(self.filtered_ids[row])
+            self.load_game.emit(gid)
+            self.accept()
 
 
 # ───────────────────────────── Promotion dialog ───────────────────────────
@@ -837,8 +1137,6 @@ class PromotionDialog(QDialog):
 # ───────────────────────────── Board widget ───────────────────────────────
 
 class BoardWidget(QWidget):
-    """10x8 board: square-aspect rendering, piece outlines, arrows, dots."""
-
     def __init__(self, main):
         super().__init__()
         self.main = main
@@ -848,7 +1146,7 @@ class BoardWidget(QWidget):
         self.selected = None
         self.flipped = False
         self.last_move = None
-        self.analysis = []          # full ranked move list from the search
+        self.analysis = []
 
     def set_position(self, history, last_move):
         eng = CapablancaEngine()
@@ -914,13 +1212,6 @@ class BoardWidget(QWidget):
         for color, ptype, sq in self.engine.get_pieces():
             self._draw_piece(p, self.sq_rect(int(sq)), color, ptype, cell)
 
-        # Which analysis arrows to show: when a piece is focused (selected and
-        # it has analysed moves) — only that piece's moves; otherwise the
-        # global top moves. Clicking the piece again clears the focus.
-        # Crucially, every arrow keeps its *global* rank — the colour and
-        # weight of move #4 from the full list stay the same even when we
-        # filter down to one piece. (Otherwise "second-best piece move" would
-        # steal the colour of the global second-best, which is misleading.)
         if self.selected is not None:
             shown_with_rank = [(g, d) for g, d in enumerate(self.analysis)
                                if decode_move(d["move"])[0] == self.selected]
@@ -943,12 +1234,6 @@ class BoardWidget(QWidget):
                     p.setBrush(QColor(0, 0, 0, 55))
                     p.drawEllipse(c, cell * 0.10, cell * 0.10)
 
-        # Two passes (Nibbler-style): all arrows first, then all labels on top.
-        # Otherwise a later arrow can be drawn over an earlier arrow's label.
-        # Also: at most one label per destination square — if two moves end on
-        # the same square, only the higher-ranked one keeps its badge.
-        # Worst-first draw order so the best move's shaft and source disc end
-        # up on top instead of being covered by faded lower-rank arrows.
         label_targets = set()
         for g, d in reversed(shown_with_rank):
             color = RANK_COLORS[g] if g < len(RANK_COLORS) else GREY
@@ -978,28 +1263,20 @@ class BoardWidget(QWidget):
         p.drawText(rect, Qt.AlignCenter, glyph)
 
     def _draw_arrow(self, p, d, color, cell, rank, n_shown):
-        """Arrow only — no label. Width and alpha scale by rank so the best
-        move dominates visually (Nibbler hierarchy)."""
         f, t, _ = decode_move(d["move"])
         s = self.sq_rect(f).center()
         e = self.sq_rect(t).center()
         ang = np.arctan2(e.y() - s.y(), e.x() - s.x())
-        # rank 0 — full strength, each subsequent rank fades by 25% alpha and
-        # 20% width. With 5 ranks the worst is still legible (~40% alpha).
         alpha = max(0.35, 1.0 - rank * 0.15)
         wf    = max(0.30, 1.0 - rank * 0.18)
         c = QColor(color)
         c.setAlpha(int(255 * alpha))
         width = max(3.0, cell * 0.18 * wf)
         head  = cell * 0.34 * wf
-        # Stop the arrow just short of the target square center so the corner
-        # badge stays readable instead of being half-eaten by the arrowhead.
         tip  = QPointF(e.x() - np.cos(ang) * head * 0.20,
                        e.y() - np.sin(ang) * head * 0.20)
         base = QPointF(tip.x() - np.cos(ang) * head,
                        tip.y() - np.sin(ang) * head)
-        # Small disc at the source — useful when multiple pieces can move to
-        # the same square; you see *which* piece this arrow belongs to.
         p.setPen(Qt.NoPen)
         p.setBrush(c)
         src_r = max(3.0, cell * 0.07 * wf)
@@ -1013,10 +1290,8 @@ class BoardWidget(QWidget):
         p.drawPolygon(QPolygonF([tip, p1, p2]))
 
     def _draw_arrow_label(self, p, d, color, cell, rank):
-        """Winrate badge anchored to the target square's center — never overlaps
-        with arrow shafts because it lives on the destination, not the line."""
         if rank > 2:
-            return  # only top three get a readable percentage
+            return
         _, t, _ = decode_move(d["move"])
         center = self.sq_rect(t).center()
         wr = (d["q"] + 1.0) / 2.0
@@ -1032,8 +1307,6 @@ class BoardWidget(QWidget):
         p.setBrush(dark)
         p.setPen(QPen(color.lighter(140), 1))
         p.drawRoundedRect(box, 4, 4)
-        p.setPen(QColor("#ffffff"))
-        p.drawText(box, Qt.AlignCenter, label)
         p.setPen(QColor("#ffffff"))
         p.drawText(box, Qt.AlignCenter, label)
 
@@ -1059,9 +1332,9 @@ class BoardWidget(QWidget):
                 self.main.try_human_move(move)
                 return
         if sq == self.selected:
-            self.selected = None             # second click — back to normal
+            self.selected = None
         elif any(decode_move(m)[0] == sq for m in self.legal_moves):
-            self.selected = sq               # focus this piece's moves
+            self.selected = sq
         else:
             self.selected = None
         self.update()
@@ -1083,22 +1356,27 @@ class NibblerGUI(QMainWindow):
         self.search = None
         self.search_started = 0.0
 
-        self.history = []            # full move list (linear)
-        self.cursor = 0              # plies shown (0..len(history))
-        self.evals = {}              # ply -> white winrate
-        self.snapshots = {}          # ply -> last analysis payload for that ply
-        self.ttable = {}             # persistent search DAG — reused across moves
+        # Архив и дебютная книга
+        self.archive = None
+        self.games_moves = None
+        self.book = None
+        self.archive_loader = None
+        self.archive_dialog = None
+
+        self.history = []
+        self.cursor = 0
+        self.evals = {}
+        self.snapshots = {}
+        self.ttable = {}
         self.mode = "analyze"
-        self.analysis_on = False     # off until ▶ / Space — no auto-search on open
-        # Подсказки на СВОЁМ ходу. Анализ при этом может работать: он нужен,
-        # чтобы движок отвечал, и чтобы после партии был разбор. Скрывается
-        # только показ — стрелки, список ходов, полоса и оценка в строке.
+        self.analysis_on = False
         self.hints_on = True
-        self.contempt = 0.0          # LC0-style draw bias in PUCT selection
+        self.contempt = 0.0
 
         self._build_ui()
         self._build_shortcuts()
         self._autoload()
+        self._auto_find_archive()
         self.refresh()
 
     # ---- UI construction ----
@@ -1145,6 +1423,11 @@ class NibblerGUI(QMainWindow):
         btn_game = QPushButton("♟ Открыть партию")
         btn_game.clicked.connect(self.load_game)
         lay.addWidget(btn_game)
+
+        btn_arch = QPushButton("📦 Архив партий")
+        btn_arch.setStyleSheet("font-weight: bold; color: #5b9bd5;")
+        btn_arch.clicked.connect(self.open_archive_dialog)
+        lay.addWidget(btn_arch)
         lay.addWidget(self._vline())
 
         lay.addWidget(QLabel("Режим:"))
@@ -1170,36 +1453,22 @@ class NibblerGUI(QMainWindow):
         lay.addWidget(self.spin_play)
         lay.addWidget(self._vline())
 
-        # c_puct: higher → wider search (alternatives get more visits), lower
-        # → deeper into the best line. LC0 training default 1.745; for analysis
-        # 2.5-3.0 is comfortable. Spinbox в ‰ для целочисленного шага.
         lay.addWidget(QLabel("c_puct:"))
         self.spin_cpuct = QSpinBox()
         self.spin_cpuct.setRange(500, 5000)
         self.spin_cpuct.setSingleStep(100)
         self.spin_cpuct.setValue(1745)
         self.spin_cpuct.setSuffix("‰")
-        self.spin_cpuct.setToolTip(
-            "Параметр исследования PUCT.\n"
-            "Меньше → MCTS уходит вглубь лучшей линии.\n"
-            "Больше → больше визитов на альтернативные ходы.\n"
-            "Обучение: 1745. Анализ: 2500-3000.")
         self.spin_cpuct.valueChanged.connect(self._cpuct_changed)
         lay.addWidget(self.spin_cpuct)
         lay.addWidget(self._vline())
 
-        # Contempt: -100..+100 → -1.0..+1.0 (integer for QSpinBox).
-        # +N → MCTS избегает ничьих (агрессивная игра); -N → охотнее соглашается на ничью.
         lay.addWidget(QLabel("Contempt:"))
         self.spin_contempt = QSpinBox()
         self.spin_contempt.setRange(-100, 100)
         self.spin_contempt.setSingleStep(5)
         self.spin_contempt.setValue(0)
         self.spin_contempt.setSuffix("%")
-        self.spin_contempt.setToolTip(
-            "Сдвиг оценки ничьей в селекции PUCT.\n"
-            "+ значения → играть на выигрыш (избегать ничьих).\n"
-            "− значения → принимать ничейные линии.")
         self.spin_contempt.valueChanged.connect(self._contempt_changed)
         lay.addWidget(self.spin_contempt)
         lay.addWidget(self._vline())
@@ -1211,9 +1480,6 @@ class NibblerGUI(QMainWindow):
 
         self.chk_hints = QCheckBox("Подсказки на моём ходу")
         self.chk_hints.setChecked(self.hints_on)
-        self.chk_hints.setToolTip(
-            "Снять — и на своём ходу не видно ни стрелок, ни оценки.\n"
-            "Ходы движка и разбор после партии остаются как были.")
         self.chk_hints.toggled.connect(self._toggle_hints)
         lay.addWidget(self.chk_hints)
 
@@ -1240,10 +1506,33 @@ class NibblerGUI(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
 
-        lay.addWidget(QLabel("Анализ текущей позиции:"))
+        # Вкладки: Анализ MCTS vs Дебютная книга
+        self.right_tabs = QTabWidget()
+
+        # Tab 1: MCTS InfoBox
+        tab_mcts = QWidget()
+        tl_mcts = QVBoxLayout(tab_mcts)
+        tl_mcts.setContentsMargins(0, 4, 0, 0)
         self.infobox = InfoBox()
         self.infobox.play_move.connect(self.try_human_move)
-        lay.addWidget(self.infobox)
+        tl_mcts.addWidget(self.infobox)
+        tl_mcts.addStretch()
+        self.right_tabs.addTab(tab_mcts, "🧠 MCTS Анализ")
+
+        # Tab 2: Book Explorer
+        tab_book = QWidget()
+        tl_book = QVBoxLayout(tab_book)
+        tl_book.setContentsMargins(0, 4, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: 0; background: transparent; }")
+        self.book_box = BookBox()
+        self.book_box.play_move.connect(self.try_human_move)
+        scroll.setWidget(self.book_box)
+        tl_book.addWidget(scroll)
+        self.right_tabs.addTab(tab_book, "📖 Книга WDL")
+
+        lay.addWidget(self.right_tabs, 3)
 
         lay.addWidget(QLabel("Проанализированные позиции:"))
         self.table = QTableWidget(0, 5)
@@ -1261,7 +1550,7 @@ class NibblerGUI(QMainWindow):
         hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table.cellClicked.connect(self._table_clicked)
         self._table_plies = []
-        lay.addWidget(self.table, 1)
+        lay.addWidget(self.table, 2)
 
         nav = QHBoxLayout()
         for txt, fn in [("⏮", lambda: self.seek_ply(0)),
@@ -1285,14 +1574,67 @@ class NibblerGUI(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_F), self, self.flip_board)
         QShortcut(QKeySequence(Qt.Key_Space), self, self._toggle_analysis)
 
+    # ---- archive handling ----
+    def _auto_find_archive(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        cands = [
+            os.path.join(base, "archive"),
+            os.path.join(base, "checkpoints_v11", "archive"),
+            os.path.join(base, "..", "archive"),
+        ]
+        for c in cands:
+            if os.path.isdir(c):
+                self.load_archive_dir(c)
+                break
+
+    def open_archive_dialog(self):
+        if self.archive_dialog is None:
+            self.archive_dialog = ArchiveDialog(self, self)
+            self.archive_dialog.load_game.connect(self.load_archive_game)
+        self.archive_dialog.update_archive_view(self.archive)
+        self.archive_dialog.show()
+
+    def load_archive_dir(self, directory):
+        self.statusBar().showMessage(f"Загрузка архива: {directory}...")
+        self.archive_loader = ArchiveLoaderThread(directory)
+        self.archive_loader.progress.connect(lambda msg: self.statusBar().showMessage(msg))
+        self.archive_loader.loaded.connect(self._on_archive_loaded)
+        self.archive_loader.error.connect(
+            lambda err: QMessageBox.warning(self, "Ошибка архива", err))
+        self.archive_loader.start()
+
+    def _on_archive_loaded(self, ar, games_moves, book):
+        self.archive = ar
+        self.games_moves = games_moves
+        self.book = book
+        if self.archive_dialog is not None and self.archive_dialog.isVisible():
+            self.archive_dialog.update_archive_view(ar)
+        self.statusBar().showMessage(
+            f"Архив загружен: {len(ar.g['result']):,} партий, "
+            f"{len(book):,} позиций в книге дебютов.")
+        self.refresh()
+
+    def load_archive_game(self, game_id):
+        if self.games_moves is None or game_id >= len(self.games_moves):
+            return
+        moves = self.games_moves[game_id]
+        if not moves:
+            QMessageBox.information(self, "Пустая партия", "В этой партии нет ходов.")
+            return
+        self.stop_search()
+        self.history = list(moves)
+        self.cursor = 0
+        self.evals.clear()
+        self.snapshots.clear()
+        self.refresh()
+        r = int(self.archive.g["result"][game_id])
+        r_str = "1-0 (Белые)" if r > 0 else ("0-1 (Чёрные)" if r < 0 else "½-½ (Ничья)")
+        self.statusBar().showMessage(
+            f"Загружена партия #{game_id} из архива ({r_str}, {len(moves)} полуходов). "
+            f"Стрелки ◀ ▶ для просмотра.")
+
     # ---- game loading ----
     def load_game(self):
-        """Открыть сыгранную партию и листать её стрелками.
-
-        Формат нарочно нетребовательный: берутся любые ходы вида e2e4 (с буквой
-        превращения, если есть), а номера, заголовки PGN и комментарии
-        пропускаются. Так читается и наш собственный протокол, и PGN, который
-        пишет play_fsf.py."""
         path, _ = QFileDialog.getOpenFileName(
             self, "Открыть партию", "",
             "Партия (*.pgn *.txt *.uci);;Все файлы (*)")
@@ -1306,8 +1648,7 @@ class NibblerGUI(QMainWindow):
 
         tokens = re.findall(r"\b[a-j](?:10|[1-9])[a-j](?:10|[1-9])[qrbnacQRBNAC]?\b", text)
         if not tokens:
-            QMessageBox.warning(self, "Пусто",
-                                "В файле не нашлось ходов вида e2e4.")
+            QMessageBox.warning(self, "Пусто", "В файле не нашлось ходов вида e2e4.")
             return
 
         eng = CapablancaEngine()
@@ -1336,8 +1677,7 @@ class NibblerGUI(QMainWindow):
         self.cursor = 0
         self.refresh()
         self.statusBar().showMessage(
-            f"Загружена партия: {len(moves)} полуходов. "
-            f"Стрелки — вперёд и назад, Home и End — в начало и конец.")
+            f"Загружена партия: {len(moves)} полуходов. Стрелки — вперёд и назад.")
 
     # ---- model loading ----
     def load_weights(self):
@@ -1353,11 +1693,6 @@ class NibblerGUI(QMainWindow):
         self._load_onnx(path)
 
     def _onnx_from_checkpoint(self, pth):
-        """Convert a training checkpoint to ONNX so the GUI can play it.
-
-        The GUI itself needs only onnxruntime; PyTorch is pulled in here and
-        only here, when the user actually picks a .pth. The result is cached
-        next to the checkpoint, so re-opening the same net is instant."""
         dst = os.path.splitext(pth)[0] + ".onnx"
         if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(pth):
             return dst
@@ -1367,8 +1702,7 @@ class NibblerGUI(QMainWindow):
             QMessageBox.warning(
                 self, "Нужен PyTorch",
                 f"Чтобы открыть .pth, нужен PyTorch в этом окружении:\n\n{e}\n\n"
-                "Либо конвертируй заранее:\n"
-                "    python export_onnx.py чекпоинт.pth сеть.onnx")
+                "Либо конвертируй заранее:\n    python export_onnx.py чекпоинт.pth сеть.onnx")
             return None
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -1382,12 +1716,6 @@ class NibblerGUI(QMainWindow):
         return dst
 
     def _autoload(self):
-        """Load capablanca.onnx sitting next to the program, if present, so a
-        packaged build opens ready to analyse without touching a dialog.
-
-        In a PyInstaller build `__file__` points inside the bundle, which is a
-        temporary directory the user never sees — the net has to be looked for
-        next to the executable instead."""
         if getattr(sys, "frozen", False):
             base = os.path.dirname(os.path.abspath(sys.executable))
         else:
@@ -1398,22 +1726,12 @@ class NibblerGUI(QMainWindow):
 
     def _load_onnx(self, path):
         try:
-            # Старая сессия держит свою память на карте, пока жива. Ссылку из
-            # потока поиска надо снять до создания новой, иначе две сессии
-            # какое-то время сосуществуют и занятое на карте удваивается.
             self.stop_search()
             self.mcts = None
-            # nn_cache_max=150_000 ≈ 4 GB RAM ceiling (each entry holds the
-            # 7000-prob policy + scalars). The old default 600 000 could grow
-            # to ~17 GB on long analysis sessions, which is what users see as
-            # "RAM full and not released".
-            # 150 000 позиций × 28 КБ ≈ 4.2 ГБ ОЗУ — для настольной программы
-            # многовато; 64 000 (≈1.8 ГБ) хватает на переиспользование дерева
-            # внутри партии, а на попадания в кэш влияет слабо.
             self.mcts = OnnxEngine(path, c_puct=1.745, batch_size=96,
                                    nn_cache=True, nn_cache_max=64_000)
             self.net_path = path
-            self.ttable.clear()          # old stats came from the previous net
+            self.ttable.clear()
             dev = "GPU · CUDA" if self.mcts.gpu else "CPU"
             self.statusBar().showMessage(
                 f"Сеть загружена: {os.path.basename(path)}  ·  {dev}")
@@ -1432,8 +1750,6 @@ class NibblerGUI(QMainWindow):
         self.refresh()
 
     def hints_hidden(self):
-        """Скрывать ли показ анализа: игра против движка, мой ход, живая
-        позиция. Разбор сыгранного (курсор в истории) не трогаем."""
         return (not self.hints_on
                 and self.mode in ("play_white", "play_black")
                 and self.cursor == len(self.history)
@@ -1446,26 +1762,13 @@ class NibblerGUI(QMainWindow):
         self.refresh()
 
     def _contempt_changed(self, val):
-        # Spinbox carries percent; PUCT formula wants a scalar in roughly [-1, 1].
         self.contempt = val / 100.0
-        # Stats accumulated under the previous contempt are still correct (Q/D
-        # are stored unscaled) — the change takes effect on the next selection.
 
     def _cpuct_changed(self, val):
-        # Spinbox carries thousandths to allow integer steps. Updates the
-        # OnnxEngine attribute that SearchThread reads at construction time —
-        # the running search keeps its own snapshot, change applies to the next.
         if self.mcts is not None:
             self.mcts.c_puct = val / 1000.0
 
     def _prune_ttable(self, move_history):
-        """Drop ttable entries unreachable from the current position.
-
-        Walks the search DAG from the position the next search starts at and
-        keeps only those nodes. Sub-trees behind other (no-longer-relevant)
-        move orders go away — frees memory without throwing away the work the
-        next search will actually reuse. Cheap: O(reachable nodes).
-        """
         try:
             engine = CapablancaEngine()
             for m in move_history:
@@ -1502,8 +1805,6 @@ class NibblerGUI(QMainWindow):
         self.evals = {}
         self.snapshots = {}
         self.ttable.clear()
-        # Кэш сети держит по 28 КБ на позицию (7000 вероятностей политики).
-        # После партии это её позиции, новой они не нужны, а память держат.
         if self.mcts is not None:
             self.mcts.clear_nn_cache()
         self.refresh()
@@ -1539,20 +1840,15 @@ class NibblerGUI(QMainWindow):
         if self.mode == "selfplay":
             return
         if self.cursor == len(self.history) and self.engine_should_move():
-            return                       # not the human's turn
+            return
         if m not in self.board.engine.get_legal_moves_int():
             return
         self.push_move(m)
 
     def push_move(self, m, by="human"):
-        # Снимок берём ДО инкремента: он относится к позиции, из которой
-        # ход сделан, и ниже по функции всё, что впереди курсора, стирается.
         snapshot = self.snapshots.get(self.cursor)
         if getattr(self, "logger", None) is None:
             self.logger = GameLogger(self.mode, getattr(self, "net_path", None))
-        # Запись партии не должна ронять партию. Своя же правка логгера уже
-        # уронила игру на середине через AttributeError — цена ошибки здесь
-        # строка в статусе, а не потерянная позиция.
         try:
             n_legal = len(self.board.engine.get_legal_moves_int())
             self.logger.add(self.cursor, by, m, snapshot, n_legal)
@@ -1562,8 +1858,6 @@ class NibblerGUI(QMainWindow):
         del self.history[self.cursor:]
         self.history.append(m)
         self.cursor += 1
-        # snapshot/eval of the position we just left (== cursor-1) is kept;
-        # anything strictly ahead belonged to a now-discarded line.
         for ply in list(self.evals):
             if ply >= self.cursor:
                 del self.evals[ply]
@@ -1580,35 +1874,30 @@ class NibblerGUI(QMainWindow):
             except TypeError:
                 pass
             self.search.running = False
-            # wait() returns as soon as the thread ends; the long cap only
-            # matters for a slow first GPU inference (cuDNN autotune).
             self.search.wait(10000)
             self.search = None
 
     def should_search(self):
-        """Whether a search should run for the currently viewed position."""
         if self.mcts is None or self.board.engine.is_game_over():
             return False
         if self.analysis_on:
             return True
-        # Analysis display is off, but in a real game versus the engine it
-        # must still answer the human's move.
         return (self.cursor == len(self.history) and self.engine_should_move()
                 and self.mode in ("play_white", "play_black"))
 
     def refresh(self):
-        """Rebuild the viewed position, show its snapshot, and search if needed.
-
-        The cached snapshot (if any) is shown immediately as a placeholder so
-        navigation feels instant; a live search then refines it. With analysis
-        turned off, snapshots are shown but no new search is started — except
-        that in Play mode the engine still replies to the human's move.
-        """
         self.stop_search()
         view = self.history[:self.cursor]
         last = (decode_move(view[-1])[:2] if view else None)
         self.board.set_position(view, last)
         self.board.analysis = []
+
+        # Обновление книги дебютов для текущей позиции
+        if self.book is not None:
+            k = position_key(self.board.engine)
+            self.book_box.set_book_data(self.book.get(k), has_archive=True)
+        else:
+            self.book_box.set_book_data(None, has_archive=False)
 
         over = self.board.engine.is_game_over()
         snap = self.snapshots.get(self.cursor)
@@ -1623,17 +1912,13 @@ class NibblerGUI(QMainWindow):
             try:
                 if lg is not None and lg.head["result"] is None:
                     lg.finish(r)
-                    msg += ("  ·  записано: games/"
-                            f"{os.path.basename(lg.txt_path)} и .json")
+                    msg += f"  ·  записано: games/{os.path.basename(lg.txt_path)}"
             except Exception as e:
                 msg += f"  ·  запись не сохранена: {e}"
             self.statusBar().showMessage(f"Партия окончена — {msg}")
         elif snap is not None:
-            self.apply_payload(snap, live=False)        # instant placeholder
+            self.apply_payload(snap, live=False)
         else:
-            # No completed-search snapshot — but the persistent search tree may
-            # still hold residual sims for this position, carried over by tree
-            # reuse. Show those instead of a bare "analysis stopped" message.
             node = (self.ttable.get(position_key(self.board.engine))
                     if self.mcts is not None else None)
             if node is not None and node.visits > 0:
@@ -1643,11 +1928,9 @@ class NibblerGUI(QMainWindow):
             else:
                 self.infobox.set_moves([])
                 self.eval_bar.set_winrate(self.evals.get(self.cursor, 0.5))
-                if (not over and self.mcts is not None
-                        and not self.should_search()):
+                if (not over and self.mcts is not None and not self.should_search()):
                     self.statusBar().showMessage(
-                        f"Позиция {self.cursor} · анализ остановлен — "
-                        f"▶ чтобы запустить")
+                        f"Позиция {self.cursor} · анализ остановлен — ▶ чтобы запустить")
 
         if not over and self.should_search():
             engine_turn = (self.cursor == len(self.history)
@@ -1655,7 +1938,7 @@ class NibblerGUI(QMainWindow):
             budget = (self.spin_play.value() if engine_turn
                       else self.spin_analyze.value())
             if len(self.ttable) > TT_MAX_NODES:
-                self._prune_ttable(view)     # keep current subtree, drop dead branches
+                self._prune_ttable(view)
             self.search = SearchThread(view, self.mcts, budget, self.ttable,
                                        contempt=self.contempt)
             self.search.update.connect(self.on_update)
@@ -1668,11 +1951,6 @@ class NibblerGUI(QMainWindow):
     _vram_cache = (0.0, "")
 
     def vram_note(self):
-        """Занятое процессом на карте, опрошенное не чаще раза в 5 секунд.
-
-        Нужно потому, что после одной партии GUI держал 14.6 ГБ. Причина —
-        memory-pattern ORT на каждый новый поток поиска, исправлено в
-        onnx_engine.py; цифра на экране — чтобы заметить, если вернётся."""
         now = time.time()
         if now - self._vram_cache[0] < 5.0:
             return self._vram_cache[1]
@@ -1693,7 +1971,6 @@ class NibblerGUI(QMainWindow):
         return note
 
     def apply_payload(self, payload, live):
-        """Render an analysis payload (live result or cached snapshot)."""
         moves = payload["moves"]
         stm = payload["stm"]
         hide = self.hints_hidden()
@@ -1703,34 +1980,25 @@ class NibblerGUI(QMainWindow):
 
         wr_stm = (payload["root_q"] + 1.0) / 2.0
         wr_white = wr_stm if stm == 0 else 1.0 - wr_stm
-        # Heuristic mate detection. The MLH head's `nn[1]` carries the network's
-        # draw belief for the top move and the per-move Q tells the winning side.
-        # Without proven mate bounds plumbed up to Python we infer it: if the top
-        # move's Q is near ±1 AND the moves-left estimate is short AND the draw
-        # belief is tiny, that's strongly a forced mate line.
+
         mate_in = None
         if moves:
             top = moves[0]
-            top_q = top["q"]                # winning side POV
-            nn = top.get("nn")              # (q, d, m_plies) tuple or None
+            top_q = top["q"]
+            nn = top.get("nn")
             top_d = nn[1] if nn else 0.5
             top_m_plies = nn[2] if (nn and len(nn) >= 3) else None
             if abs(top_q) > 0.92 and top_d < 0.15:
-                # MLH carries plies left for the leaf side; convert to full moves.
-                # If absent, fall back to a coarse guess from |Q|. Cap at 30 to
-                # avoid nonsensical "M99" when the heuristic gets noisy.
                 if top_m_plies is not None and top_m_plies > 0:
                     n = max(1, int(round(top_m_plies / 2)))
                 else:
                     n = max(1, int(round((1.0 - abs(top_q)) * 40)))
                 n = min(n, 30)
-                # Sign: top_q > 0 → side-to-move mates. Convert to white POV.
                 if top_q > 0:
                     mate_in = +n if stm == 0 else -n
                 else:
                     mate_in = -n if stm == 0 else +n
-        # Оценку в self.evals кладём всегда — она нужна графику и разбору
-        # после партии. Прячем только показ.
+
         if hide:
             self.eval_bar.set_eval(0.5, None)
         else:
@@ -1745,8 +2013,7 @@ class NibblerGUI(QMainWindow):
             self.statusBar().showMessage(
                 f"Ход: {side}{self.vram_note()}  ·  "
                 f"узлов: {payload['sims']:,} (♻ {reused:,})  ·  "
-                f"{fresh / elapsed:.0f}/с  ·  слияний транспозиций: "
-                f"{payload['merges']:,}" +
+                f"{fresh / elapsed:.0f}/с  ·  слияний: {payload['merges']:,}" +
                 ("" if hide else f"  ·  оценка (белые): {wr_white * 100:.1f}%"))
         else:
             self.statusBar().showMessage(
@@ -1757,19 +2024,16 @@ class NibblerGUI(QMainWindow):
         if payload.get("game_over"):
             return
         if payload.get("ply") is not None and payload["ply"] != self.cursor:
-            return                       # опоздавшая посылка от прошлой позиции
+            return
         new_ply = self.cursor not in self.snapshots
-        self.snapshots[self.cursor] = payload      # cache before any move
+        self.snapshots[self.cursor] = payload
         self.apply_payload(payload, live=True)
-        # График — тоже подсказка: последняя точка выдаёт оценку текущей
-        # позиции. На своём ходу с выключенными подсказками её не рисуем.
+
         shown = self.evals
         if self.hints_hidden():
             shown = {k: v for k, v in self.evals.items() if k != self.cursor}
         self.graph.set_data(shown, self.cursor, len(self.history))
 
-        # During continuous analysis only the current row changes — a full
-        # rebuild every tick would flicker, so refresh just that row.
         if new_ply:
             self._rebuild_table()
         elif self.cursor in self._table_plies:
@@ -1800,7 +2064,7 @@ class NibblerGUI(QMainWindow):
                 item.setBackground(QColor(ACCENT))
                 item.setForeground(QColor("#ffffff"))
             elif played != "—" and best != "—" and played != best:
-                item.setForeground(QColor("#d98a1f"))     # deviated from top
+                item.setForeground(QColor("#d98a1f"))
             self.table.setItem(row, col, item)
 
     def _rebuild_table(self):
@@ -1841,6 +2105,10 @@ QTableWidget::item {{ padding: 3px; }}
 QTableWidget::item:selected {{ background: {ACCENT}; color: #fff; }}
 QHeaderView::section {{ background: {BG3}; color: #b9b9b9; border: 0;
                         border-right: 1px solid #444; padding: 4px; }}
+QTabWidget::pane {{ border: 1px solid #444; background: {BG2}; border-radius: 4px; }}
+QTabBar::tab {{ background: {BG3}; color: #aaa; padding: 6px 12px; border-top-left-radius: 4px;
+                border-top-right-radius: 4px; margin-right: 2px; }}
+QTabBar::tab:selected {{ background: {BG2}; color: {FG}; font-weight: bold; border-top: 2px solid {ACCENT}; }}
 QStatusBar {{ background: {BG2}; color: #b9b9b9; }}
 """
 

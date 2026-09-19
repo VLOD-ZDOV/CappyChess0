@@ -854,6 +854,10 @@ class Config:
     #   1) No threshold calibration — false-positives (winning/drawn position, resigned) go undetected
     #   2) Network doesn't learn to defend in tough positions (resigns cut off data)
     # 0.10 = 10% of games played to completion, rest with resign.
+    # Доля партий, играемых БЕЗ права сдаться. Нужна вдвойне: такие партии дают
+    # эндшпили, которых сеть иначе не видит (матом кончается 8% партий, сдачей
+    # 82%), и по ним же меряется доля ложных сдач. Цена — партии в них втрое
+    # длиннее: сдача обрывает партию в среднем за 137 полуходов до конца.
     resign_playthrough: float = 0.10
     # Каталог архива самоигры. Пусто — архив не ведётся (поведение как раньше).
     archive_dir: str = ""
@@ -1623,12 +1627,18 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             extra += " | ничьи: " + ", ".join(
                 f"{names.get(k, '?')} {v}" for k, v in sorted(draw_kind.items()))
         if park_after or park_tail:
+            # отложено — партий снято с пула НЕДОИГРАННЫМИ за эту итерацию;
+            # подхвачено — сколько таких партий (из прошлых итераций) сели в
+            # слоты и доигрываются сейчас; в очереди — сколько ждёт прямо сейчас.
             extra = (f" | отложено {parked_n}, подхвачено {resumed_n}, "
-                     f"в очереди {len(_PARKED_GAMES)}")
-        print(f"  Партий {done}/{cfg.games_per_iter}: {pos_count} positions | "
-              f"W={total_w} (мат {mate_w}, resign {resign_w}, timeout {timeout_w}) · "
-              f"B={total_b} (мат {mate_b}, resign {resign_b}, timeout {timeout_b}) · "
-              f"D={total_d} (по правилам {draws}, timeout {timeout_d}){sanity}{extra}")
+                     f"ждут {len(_PARKED_GAMES)}")
+        # «timeout» читалось как победа по часам, которых в самоигре нет. На деле
+        # это упор в max_game_length: партию обрывают на 300-м полуходе и исход
+        # присуждают подсчётом материала. Называем вещи своими именами.
+        print(f"  Партий {done}/{cfg.games_per_iter}: {pos_count} позиций | "
+              f"W={total_w} (мат {mate_w}, сдача {resign_w}, лимит {timeout_w}) · "
+              f"B={total_b} (мат {mate_b}, сдача {resign_b}, лимит {timeout_b}) · "
+              f"D={total_d} (по правилам {draws}, лимит {timeout_d}){sanity}{extra}")
 
     for i in range(slots):
         _take(i)
