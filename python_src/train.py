@@ -172,6 +172,12 @@ class FairyStockfishWrapper:
         )
         self._send("uci");          self._wait("uciok")
         self._send("setoption name UCI_Variant value capablanca")
+        # Без сети движок считает классикой и слабее себя же на +417 Elo
+        # (замер 19.09, 22 победы из 24). Файл лежит рядом с бинарником.
+        _net = os.path.join(os.path.dirname(os.path.abspath(path)),
+                            "capablanca-bb644ef32758.nnue")
+        if os.path.exists(_net):
+            self._send(f"setoption name EvalFile value {_net}")
         if skill is not None:
             self._send(f"setoption name Skill Level value {int(skill)}")
         if elo is not None:

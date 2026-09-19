@@ -1,6 +1,7 @@
 import os
 import time
 import pickle
+import os
 import subprocess
 import numpy as np
 import torch
@@ -115,6 +116,10 @@ class FairyStockfishWrapper:
         self.send("uci")
         self._wait_for("uciok")
         self.send("setoption name UCI_Variant value capablanca")
+        _net = os.path.join(os.path.dirname(os.path.abspath(path)),
+                            "capablanca-bb644ef32758.nnue")
+        if os.path.exists(_net):
+            self.send(f"setoption name EvalFile value {_net}")
         self.send("isready")
         self._wait_for("readyok")
 

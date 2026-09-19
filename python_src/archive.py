@@ -57,7 +57,12 @@ SOURCE_SELFPLAY = 0
 SOURCE_MATCH = 1        # сеть против сети, 800 симуляций, сдачи нет
 SOURCE_FSF = 2          # сеть против движка
 SOURCE_HUMAN = 3        # партия человека, загружена из PGN — политики нет
-SOURCE_NAMES = {0: "самоигра", 1: "матч сетей", 2: "против движка", 3: "человек"}
+# Позиция из полного перебора дебюта: это НЕ партия, исхода у неё нет, в
+# root_q лежит оценка движка. Из статистики книги такие записи исключаются,
+# иначе 800 тысяч мнимых ничьих затопят настоящие исходы.
+SOURCE_BOOK = 4
+SOURCE_NAMES = {0: "самоигра", 1: "матч сетей", 2: "против движка",
+                3: "человек", 4: "перебор дебюта"}
 
 # Столбцы позиции и их типы. Держим списком, чтобы читатель и писатель не
 # разъезжались.
@@ -246,7 +251,7 @@ class Archive:
 
     def games_where(self, result=None, term=None, min_plies=None, max_plies=None,
                     plies=None, moves=None, playthrough=None, iters=None,
-                    false_resign=None, decisive=None):
+                    false_resign=None, decisive=None, source=None):
         """Маска по партиям.
 
         result      +1 / 0 / -1 либо список
@@ -268,6 +273,7 @@ class Archive:
         _in("result", result)
         _in("term", term)
         _in("iter", iters)
+        _in("source", source)
         if playthrough is not None:
             m &= self.g["playthrough"] == int(bool(playthrough))
         if decisive:
@@ -380,6 +386,10 @@ class Archive:
         Возвращает: ключ позиции → {"n", "w","d","l", "side",
         "moves": {ход_в_координатах_доски: {"n","w","d","l"}}}.
         """
+        if mask is None:
+            mask = np.ones(self.p["game"].shape[0], dtype=bool)
+        # Записи перебора исхода не имеют — в статистике они были бы ничьими.
+        mask = mask & (self.g["source"][self.p["game"]] != SOURCE_BOOK)
         idx, keys = self.position_keys(mask)
         side = self.p["side"][idx]
         raw = self.p["move_raw"][idx]
