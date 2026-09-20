@@ -44,3 +44,6 @@ python_src/bt5.txt
 
 # Сеть NNUE для движка: 101 МБ, качается с fairy-stockfish.github.io/nnue/
 *.nnue
+release63/
+python_src/ab_random/
+python_src/ps_speed/

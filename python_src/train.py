@@ -755,6 +755,9 @@ class Config:
     fast_sim_fraction: float = 0.75
     playout_cap_train_only_full: bool = True
     c_puct: float = 1.25
+    opening_plies: int = 0            # форсировать первые N полуходов перебором
+    random_plies: int = 0             # случайных полуходов поверх переборных
+    random_plies_fraction: float = 0.5
     temperature_moves: int = 50       # more exploration early in the game
     temperature: float = 1.0          # tau for first temperature_moves moves (1.0 = proportional to visit counts)
     temperature_late: float = 0.0     # tau after temperature_moves: 0.0 = hard argmax (better mating)
@@ -1454,6 +1457,24 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
     ply = [0] * slots        # полуходов в ЭТОЙ партии, с её первого хода
     stint = [0] * slots      # полуходов с момента, как партия села в этот слот
     live = [False] * slots
+    opening_line: List[Optional[list]] = [None] * slots
+    rand_until = [0] * slots   # до какого полухода партия ходит случайно
+
+    # Книга стартов: полный перебор первых N полуходов. Партия k играет k-ю
+    # линию, так что при games_per_iter = len(openings) дерево покрывается
+    # ровно один раз за итерацию, без повторов и без случайности.
+    openings: list = []
+    if cfg.opening_plies > 0:
+        lvl = [[]]
+        for _ in range(cfg.opening_plies):
+            nxt = []
+            for seq in lvl:
+                e = CapablancaEngine()
+                for m in seq:
+                    e.make_move_int(m)
+                nxt.extend(seq + [m] for m in e.get_legal_moves_int())
+            lvl = nxt
+        openings = lvl
 
     placed = 0               # партий посажено в слоты за итерацию (бюджет)
     started = 0              # из них начатых с нуля
@@ -1489,6 +1510,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             enable_resign[i] = g["enable_resign"]
             would_resign[i] = g["would_resign"]
             ply[i] = g["ply"]
+            opening_line[i] = g.get("opening")
+            rand_until[i] = g.get("rand_until", 0)
             resumed_n += 1
         else:
             engines[i] = CapablancaEngine()
@@ -1499,6 +1522,11 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             enable_resign[i] = np.random.random() >= cfg.resign_playthrough
             would_resign[i] = None
             ply[i] = 0
+            opening_line[i] = openings[started % len(openings)] if openings else None
+            _ob = len(opening_line[i]) if opening_line[i] else 0
+            rand_until[i] = (_ob + cfg.random_plies
+                             if cfg.random_plies > 0
+                             and np.random.random() < cfg.random_plies_fraction else 0)
             started += 1
         placed += 1
         resigned[i] = False
@@ -1517,6 +1545,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             "enable_resign": enable_resign[i],
             "would_resign": would_resign[i],
             "ply": ply[i],
+            "opening": opening_line[i],
+            "rand_until": rand_until[i],
         })
         parked_n += 1
 
@@ -1782,6 +1812,14 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                 else:
                     probs = np.ones(len(legal)) / len(legal)
                 move = int(np.random.choice(legal, p=probs))
+
+            # Книга стартов подменяет СЫГРАННЫЙ ход, но не цель обучения:
+            # позиция и распределение визитов уже записаны выше, и они честные.
+            ol = opening_line[game_idx]
+            if ol is not None and gply < len(ol):
+                move = int(ol[gply])
+            elif gply < rand_until[game_idx]:
+                move = int(np.random.choice(legal))
 
             # Канонический индекс выбранного хода — цель future-головы для
             # соседних позиций.
@@ -2931,6 +2969,16 @@ if __name__ == "__main__":
                         help="Отключить playout cap (учить на всех позициях)")
     parser.add_argument("--games",               type=int,   default=128)
     parser.add_argument("--mcts-batch",          type=int,   default=128)
+    parser.add_argument("--opening-plies",        type=int,   default=0,
+                        help="Форсировать первые N полуходов полным перебором: "
+                             "партия k играет k-ю линию. 0 = выключено")
+    parser.add_argument("--random-plies",         type=int,   default=0,
+                        help="Случайных полуходов сразу после переборных")
+    parser.add_argument("--random-plies-fraction", type=float, default=0.5,
+                        help="Доля партий, получающих случайные полуходы")
+    parser.add_argument("--search-seed",          type=int,   default=-1,
+                        help="Зерно Rust-поиска. Без него самоигра невоспроизводима "
+                             "и A/B невозможен. -1 = как раньше, от часов")
     parser.add_argument("--temperature",          type=float, default=1.0,
                         help="Температура выборки хода (tau) в первые --temperature-moves ходов")
     parser.add_argument("--temperature-late",     type=float, default=0.0,
@@ -3153,6 +3201,10 @@ if __name__ == "__main__":
         mcts_batch=args.mcts_batch,
         temperature=args.temperature,
         temperature_late=args.temperature_late,
+        opening_plies=args.opening_plies,
+        random_plies=args.random_plies,
+        random_plies_fraction=args.random_plies_fraction,
+        search_seed=(None if args.search_seed < 0 else args.search_seed),
         temperature_moves=args.temperature_moves,
         mcts_parallel_sims=args.mcts_parallel_sims,
         compile_inference=args.compile_inference,
