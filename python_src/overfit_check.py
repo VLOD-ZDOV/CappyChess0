@@ -22,6 +22,7 @@
 """
 import argparse, sys
 import numpy as np, torch, torch.nn.functional as F
+import os, shutil, tempfile
 import buffer_io
 from model import build_net_from_state_dict, CapablancaNet, split_weights, pick_state_dict
 from train import unpack_policy, value_draw_to_wdl
@@ -47,6 +48,35 @@ def age_order(d):
     if not full:
         return np.arange(n), "не заполнен, порядок естественный"
     return np.roll(np.arange(n), -(ptr % n)), f"кольцо, старейшая строка {ptr % n:,}"
+
+
+def _load_ends(path, need):
+    """Буфер, урезанный до кусков с обоих краёв: хватит на `need` строк с каждого."""
+    src, kind = buffer_io.resolve(path)
+    if kind == "file":
+        d = buffer_io.read_archive(src)
+        return d, d["values"].shape[0]
+    chunks = buffer_io.list_chunks(src)
+    if not chunks:
+        raise FileNotFoundError(f"в {src} нет кусков буфера")
+    def take(seq):
+        got, out = 0, []
+        for it, p in seq:
+            out.append((it, p)); got += buffer_io.chunk_rows(p)
+            if got >= need: break
+        return out
+    total = sum(buffer_io.chunk_rows(p) for _, p in chunks)
+    keep = {p: it for it, p in take(chunks)}
+    keep.update({p: it for it, p in take(list(reversed(chunks)))})
+    if len(keep) == len(chunks):
+        return buffer_io.load_arrays(src), total
+    tmp = tempfile.mkdtemp(prefix="ofc_")
+    for p in keep:
+        os.symlink(os.path.abspath(p), os.path.join(tmp, os.path.basename(p)))
+    try:
+        return buffer_io.load_arrays(tmp), total
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def load(path, dev):
@@ -88,14 +118,17 @@ def main():
     a = ap.parse_args()
 
     dev = a.device if (a.device != "cuda" or torch.cuda.is_available()) else "cpu"
-    d = buffer_io.load_arrays(a.buffer)   # файл или каталог кусков
+    # Нужны только N самых старых и N самых свежих строк, а load_arrays тянет
+    # весь буфер: на миллионе позиций это 16 ГБ ради 3072 строк. Берём только
+    # куски с краёв — через каталог со ссылками, чтобы не трогать разбор формата.
+    d, n_total = _load_ends(a.buffer, a.n)
     n = d["values"].shape[0]
     N = min(a.n, n // 3)
     order, how = age_order(d)
     old = slice_rows(d, order[:N])
     new = slice_rows(d, order[-N:])
 
-    print(f"{n:,} позиций в буфере ({how}), по {N} самых старых и самых свежих\n")
+    print(f"{n_total:,} позиций в буфере, по {N} самых старых и самых свежих\n")
     print(f"{'чекпоинт':<28} {'policy старые':>13} {'свежие':>8} "
           f"{'value старые':>13} {'свежие':>8} {'разрыв':>7}")
     for p in a.checkpoints:
