@@ -106,6 +106,29 @@ GAME_COLS = {
 }
 
 
+# Открытые писатели — чтобы обработчик сигнала мог их закрыть. Иначе убитый
+# посреди итерации процесс оставлял boards_*.f16.tmp без meta, и вся сыгранная
+# с начала итерации самоигра пропадала.
+_OPEN = []
+
+
+def close_open_writers():
+    """Закрыть все архивы, открытые ЭТИМ процессом. Возвращает (файлов, строк).
+    Зовётся из обработчика сигнала, поэтому ошибки глотает."""
+    saved = rows = 0
+    for w in list(_OPEN):
+        if w._pid != os.getpid():
+            continue
+        try:
+            n = w.close()
+            if n:
+                saved += 1
+                rows += n
+        except Exception:
+            pass
+    return saved, rows
+
+
 class ArchiveWriter:
     """Пишет одну итерацию. Доски дописываются сразу, столбцы копятся в списках
     (они мелкие) и уходят в meta одним куском в close()."""
@@ -123,6 +146,9 @@ class ArchiveWriter:
         self.pol_idx = []
         self.pol_val = []
         self.rows = 0
+        self._pid = os.getpid()
+        self._closed = False
+        _OPEN.append(self)
         # Имена игроков (чекпоинтов). Хранятся строками один раз, в партиях
         # лежат индексы — иначе имя повторялось бы у каждой позиции.
         self.names = list(names or [])
@@ -171,7 +197,18 @@ class ArchiveWriter:
     def close(self):
         """Дописать meta и сделать файлы видимыми. Пустая итерация не
         оставляет за собой ничего."""
+        if self._closed:
+            return 0
+        self._closed = True
+        if self in _OPEN:
+            _OPEN.remove(self)
         self._f.close()
+        # Сигнал может прийти между записью доски и добавлением её столбцов:
+        # тогда строк в файле на одну больше, чем в колонках. Режем по общему.
+        n_cols = min([len(v) for v in self.pos.values()] + [len(self.pol_idx)])
+        if n_cols < self.rows:
+            os.truncate(self._tmp, n_cols * self.board_len * 2)
+            self.rows = n_cols
         if self.rows == 0:
             os.remove(self._tmp)
             return 0
@@ -497,6 +534,9 @@ def idx_to_move(idx, side):
     return (f << 10) | (t << 3)
 
 
+PROMO_CHARS = [None, None, 'n', 'b', 'r', 'q', 'a', 'c']
+
+
 def move_to_uci(m):
     """Ход в координатах доски → строка вида e2e4 / f7f8q. Доска 10 клеток в
     ширину, поэтому поле = ряд*10 + вертикаль."""
@@ -507,4 +547,7 @@ def move_to_uci(m):
     f = (m >> 10) & 0x7F
     s = (f"{chr(ord('a') + f % 10)}{f // 10 + 1}"
          f"{chr(ord('a') + t % 10)}{t // 10 + 1}")
-    return s + " nbrqac"[promo] if 0 < promo < 7 else s
+    # Код превращения = индекс фигуры ПЛЮС ОДИН (2 конь … 7 канцлер), поэтому
+    # строка начинается с двух пустых мест. Сдвинутая на единицу таблица
+    # называла коня слоном, а канцлера теряла молча.
+    return s + PROMO_CHARS[promo] if 0 < promo < len(PROMO_CHARS) else s
