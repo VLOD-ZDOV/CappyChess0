@@ -11,6 +11,7 @@ falls back to CPU. See `export_onnx.py` for producing the `.onnx` file and the
 README packaging section for bundling.
 """
 
+import hashlib
 from collections import OrderedDict
 
 import numpy as np
@@ -45,7 +46,8 @@ class OnnxEngine:
     """
 
     def __init__(self, onnx_path, c_puct=1.745, batch_size=96,
-                 nn_cache=True, nn_cache_max=600_000):
+                 nn_cache=True, nn_cache_max=20_000, device="auto"):
+        """device: "auto" — CUDA, если есть, иначе процессор; "cuda"; "cpu"."""
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         # GUI запускает каждый поиск на новом потоке, а memory-pattern ORT
@@ -60,10 +62,10 @@ class OnnxEngine:
         # 1024, и после большого батча она такой и остаётся до конца работы.
         # kSameAsRequested берёт ровно столько, сколько попросили.
         cuda_opts = {"arena_extend_strategy": "kSameAsRequested"}
+        providers = (["CPUExecutionProvider"] if device == "cpu" else
+                     [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"])
         self.session = ort.InferenceSession(
-            onnx_path, sess_options=so,
-            providers=[("CUDAExecutionProvider", cuda_opts),
-                       "CPUExecutionProvider"])
+            onnx_path, sess_options=so, providers=providers)
 
         active = self.session.get_providers()
         self.gpu = "CUDAExecutionProvider" in active
@@ -131,11 +133,13 @@ class OnnxEngine:
         if not self.nn_cache_enabled:
             return self._run(batch)
 
-        # Cache key: caller-supplied position hash if available, else raw bytes.
+        # Ключ — хеш входа, а не сами байты: вход весит 44 КБ, и с политикой
+        # (28 КБ) запись занимала ~72 КБ; 600 тыс. записей по умолчанию — 43 ГБ.
         if hashes is not None and len(hashes) == n:
             keys = list(hashes)
         else:
-            keys = [batch[i].tobytes() for i in range(n)]
+            keys = [hashlib.blake2b(batch[i].tobytes(), digest_size=16).digest()
+                    for i in range(n)]
 
         pol = np.empty((n, POLICY_SIZE), np.float32)
         qv = np.empty(n, np.float32)

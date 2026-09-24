@@ -55,12 +55,20 @@ class ModelEMA:
         import torch
         src = model._orig_mod if hasattr(model, '_orig_mod') else model
         with torch.no_grad():
+            fs, fv, os_, ov = [], [], [], []
             for k, v in src.state_dict().items():
                 if k not in self.shadow: continue
                 if self.shadow[k].dtype.is_floating_point:
-                    self.shadow[k].lerp_(v.detach().to(self.shadow[k].dtype), 1.0 - self.decay)
+                    fs.append(self.shadow[k])
+                    fv.append(v.detach().to(self.shadow[k].dtype))
                 else:
-                    self.shadow[k].copy_(v.detach())
+                    os_.append(self.shadow[k])
+                    ov.append(v.detach())
+            # Одним foreach вместо сотни мелких ядер: тот же lerp, побитно.
+            if fs:
+                torch._foreach_lerp_(fs, fv, 1.0 - self.decay)
+            for s, v in zip(os_, ov):
+                s.copy_(v)
 
     def apply_to(self, model):
         src = model._orig_mod if hasattr(model, '_orig_mod') else model
@@ -782,6 +790,9 @@ class Config:
     # слотов осталось меньше половины: в этом режиме лист стоит вдвое дороже.
     park_tail: bool = False
     mcts_batch: int = 128
+    # Групп партий по mcts_batch в каждой, со своим деревом: пока карта считает
+    # пачку одной, процессор готовит другую. 1 = прежний последовательный цикл.
+    selfplay_groups: int = 1
     mcts_parallel_sims: int = 32  # leaves per MCTS step (more = fewer round-trips Python↔GPU)
     # torch.compile mode for inference net: None / 'default' / 'reduce-overhead' / 'max-autotune'.
     # None = no compilation (fast start). 'reduce-overhead' = CUDA graphs, up to 50% speedup on Blackwell.
@@ -1221,39 +1232,247 @@ def build_optimizer(net, cfg, device):
 
 # ── Replay Buffer ─────────────────────────────────────────────────────────────
 
+class _RowsView:
+    """Старый интерфейс `buffer.data`: последовательность кортежей CompactSample,
+    собираемых из массивов по запросу. Индексы — физические строки кольца."""
+
+    def __init__(self, buf):
+        self._buf = buf
+
+    def __len__(self):
+        return self._buf._n
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self._buf.row(j) for j in range(*i.indices(self._buf._n))]
+        i = int(i)
+        if i < 0:
+            i += self._buf._n
+        if not 0 <= i < self._buf._n:
+            raise IndexError(i)
+        return self._buf.row(i)
+
+    def __iter__(self):
+        return (self._buf.row(j) for j in range(self._buf._n))
+
+    def __reduce__(self):
+        return (list, (list(self),))
+
+
 class ReplayBuffer:
+    """Кольцо позиций в предвыделенных массивах, а не списком кортежей.
+
+    Доски хранятся битами: все плоскости кодировщика, кроме halfmove/100,
+    бинарные, и 1M позиций занимают 1.5 ГБ вместо 22 ГБ. Строки, где
+    бинарная плоскость всё-таки не 0/1 (или -0.0), лежат целиком в _raw_boards,
+    так что хранение без потерь для любой доски той же длины. Батч собирается
+    векторно и распаковывается уже на карте (collate_indices)."""
+
+    _HM_PLANE = CapablancaNet.HISTORY_LEN * CapablancaNet.PLANES_PER_BOARD + 1
+    _SQ = CapablancaNet.BOARD_H * CapablancaNet.BOARD_W
+    BOARD_LEN = CapablancaNet.INPUT_PLANES * _SQ
+    _HM0, _HM1 = _HM_PLANE * _SQ, (_HM_PLANE + 1) * _SQ
+    _NBITS = BOARD_LEN - _SQ
+    _NBYTES = (_NBITS + 7) // 8
+    _F16_ONE = np.float16(1.0).view(np.uint16)
+
     def __init__(self, max_size: int):
         self.max_size = max_size
-        self.data: List[Sample] = []
+        # np.zeros не трогает страницы: пустой буфер на 1M памяти не ест.
+        self._bits = np.zeros((max_size, self._NBYTES), dtype=np.uint8)
+        self._hm = np.zeros((max_size, self._SQ), dtype=np.float16)
+        self._raw_boards = {}
+        self._pol_k = 0
+        self._pol_idx = np.zeros((max_size, 0), dtype=np.int16)
+        self._pol_val = np.zeros((max_size, 0), dtype=np.float16)
+        self._pol_n = np.zeros(max_size, dtype=np.int32)
+        # float64: цель WDL считается в double из того, что лежало в кортеже,
+        # а там бывает и python float — округление до f32 здесь дало бы другой батч.
+        self._value = np.zeros(max_size, dtype=np.float64)
+        self._mlh = np.zeros(max_size, dtype=np.float64)
+        self._future = np.zeros(max_size, dtype=np.int64)
+        self._draw = np.zeros(max_size, dtype=np.float64)
+        self._board_shape = (self.BOARD_LEN,)
+        self._n = 0
+        self._trimmed = False
         # Parallel float32 array for fast stratification by value.
-        # Updated incrementally in push() — O(1) per element, not O(N) at sampling.
         self._val_arr = np.zeros(max_size, dtype=np.float32)
+        # Сколько раз строку брали в батч. Считается с начала процесса: строки,
+        # загруженные с диска, стартуют с нуля, и до оборота буфера число занижено.
+        self._draws = np.zeros(max_size, dtype=np.uint32)
         self._ptr = 0
         self._full = False
 
-    def push(self, samples: List[Sample]):
-        for s in samples:
-            self._ptr = self._ptr % self.max_size  # guard against loading with different max_size
+    # ── хранение ─────────────────────────────────────────────────────────────
+
+    def _grow_policy(self, k: int):
+        if k <= self._pol_k:
+            return
+        k = max(64, -(-k // 32) * 32)
+        idx = np.zeros((self.max_size, k), dtype=np.int16)
+        val = np.zeros((self.max_size, k), dtype=np.float16)
+        if self._pol_k:
+            idx[:self._n, :self._pol_k] = self._pol_idx[:self._n]
+            val[:self._n, :self._pol_k] = self._pol_val[:self._n]
+        self._pol_idx, self._pol_val, self._pol_k = idx, val, k
+
+    def _store(self, rows, boards, pol_idx, pol_val, pol_n, value, mlh, future, draw):
+        """Записать строки в физические позиции `rows` (без повторов).
+        boards: (m, BOARD_LEN) float16; pol_*: (m, k) с дополнением, pol_n — длины."""
+        b = np.ascontiguousarray(boards, dtype=np.float16).reshape(len(rows), -1)
+        if b.shape[1] != self.BOARD_LEN:
+            raise ValueError(f"доска {b.shape[1]} элементов, ожидалось {self.BOARD_LEN}")
+        u = b.view(np.uint16)
+        binary = np.concatenate([u[:, :self._HM0], u[:, self._HM1:]], axis=1)
+        ok = ((binary == 0) | (binary == self._F16_ONE)).all(axis=1)
+        self._bits[rows] = np.packbits(binary != 0, axis=1)
+        self._hm[rows] = b[:, self._HM0:self._HM1]
+        if self._raw_boards:
+            for r in rows:
+                self._raw_boards.pop(int(r), None)
+        for j in np.flatnonzero(~ok):
+            self._raw_boards[int(rows[j])] = b[j].copy()
+        self._grow_policy(pol_idx.shape[1])
+        k = pol_idx.shape[1]
+        self._pol_idx[rows] = 0
+        self._pol_val[rows] = 0
+        self._pol_idx[rows, :k] = pol_idx
+        self._pol_val[rows, :k] = pol_val
+        self._pol_n[rows] = pol_n
+        self._value[rows] = value
+        self._mlh[rows] = mlh
+        self._future[rows] = future
+        self._draw[rows] = draw
+        self._val_arr[rows] = value
+        self._draws[rows] = 0
+
+    def _next_rows(self, m: int) -> np.ndarray:
+        """Те же физические позиции, что дал бы поштучный push старого буфера."""
+        rows = np.empty(m, dtype=np.int64)
+        for j in range(m):
+            self._ptr = self._ptr % self.max_size
             if not self._full:
-                self.data.append(s)
-                if len(self.data) == self.max_size:
+                rows[j] = self._n
+                self._n += 1
+                if self._n == self.max_size:
                     self._full = True
             else:
-                self.data[self._ptr] = s
-            self._val_arr[self._ptr] = float(s[2])
+                rows[j] = self._ptr
             self._ptr = (self._ptr + 1) % self.max_size
+        return rows
+
+    def _push_block(self, boards, pol_idx, pol_val, pol_n, value, mlh, future, draw):
+        m = len(value)
+        if m == 0:
+            return
+        rows = self._next_rows(m)
+        # Кольцо короче блока: в физическую позицию пишется последняя из строк.
+        _, last = np.unique(rows[::-1], return_index=True)
+        keep = np.sort(m - 1 - last)
+        if len(keep) < m:
+            rows = rows[keep]
+            boards, pol_idx, pol_val = boards[keep], pol_idx[keep], pol_val[keep]
+            pol_n, value, mlh = pol_n[keep], value[keep], mlh[keep]
+            future, draw = future[keep], draw[keep]
+        self._store(rows, boards, pol_idx, pol_val, pol_n, value, mlh, future, draw)
+
+    @staticmethod
+    def _samples_to_arrays(samples):
+        m = len(samples)
+        k = max((len(s[1][0]) for s in samples), default=0)
+        boards = np.stack([np.asarray(s[0], dtype=np.float16).reshape(-1) for s in samples])
+        pol_idx = np.zeros((m, k), dtype=np.int16)
+        pol_val = np.zeros((m, k), dtype=np.float16)
+        pol_n = np.zeros(m, dtype=np.int32)
+        for j, s in enumerate(samples):
+            idx, val = s[1]
+            kk = len(idx)
+            pol_n[j] = kk
+            if kk:
+                pol_idx[j, :kk] = idx
+                pol_val[j, :kk] = val
+        value = np.array([float(s[2]) for s in samples], dtype=np.float64)
+        mlh = np.array([float(s[3]) if len(s) > 3 else 0.0 for s in samples],
+                       dtype=np.float64)
+        future = np.array([int(s[4]) if len(s) > 4 else -1 for s in samples],
+                          dtype=np.int64)
+        draw = np.array([float(s[5]) if len(s) > 5 else -1.0 for s in samples],
+                        dtype=np.float64)
+        return boards, pol_idx, pol_val, pol_n, value, mlh, future, draw
+
+    def push(self, samples: List[Sample]):
+        if samples and self._board_shape == (self.BOARD_LEN,):
+            self._board_shape = tuple(np.shape(samples[0][0]))
+        for a in range(0, len(samples), 4096):
+            self._push_block(*self._samples_to_arrays(samples[a:a + 4096]))
+
+    def push_arrays(self, a: dict):
+        """Строки архива buffer_io (read_archive) — без кортежей в середине."""
+        boards = a["boards"]
+        n = boards.shape[0]
+        if n == 0:
+            return
+        self._board_shape = tuple(boards.shape[1:])
+        draws = a.get("draws")
+        for s in range(0, n, 4096):
+            e = min(n, s + 4096)
+            pi = a["pol_idx"][s:e]
+            self._push_block(
+                boards[s:e].reshape(e - s, -1),
+                np.where(pi >= 0, pi, 0).astype(np.int16),
+                np.where(pi >= 0, a["pol_val"][s:e], 0).astype(np.float16),
+                (pi >= 0).sum(axis=1).astype(np.int32),
+                a["values"][s:e].astype(np.float64),
+                a["mlhs"][s:e].astype(np.float64),
+                a["futures"][s:e].astype(np.int64),
+                (draws[s:e].astype(np.float64) if draws is not None
+                 else np.full(e - s, -1.0)))
+
+    def _board_rows(self, rows) -> np.ndarray:
+        rows = np.asarray(rows, dtype=np.int64)
+        bits = np.unpackbits(self._bits[rows], axis=1, count=self._NBITS)
+        out = np.empty((len(rows), self.BOARD_LEN), dtype=np.float16)
+        out[:, :self._HM0] = bits[:, :self._HM0]
+        out[:, self._HM0:self._HM1] = self._hm[rows]
+        out[:, self._HM1:] = bits[:, self._HM0:]
+        if self._raw_boards:
+            for j, r in enumerate(rows):
+                raw = self._raw_boards.get(int(r))
+                if raw is not None:
+                    out[j] = raw
+        return out
+
+    def row(self, i: int) -> Sample:
+        k = int(self._pol_n[i])
+        return (self._board_rows([i])[0].reshape(self._board_shape),
+                (self._pol_idx[i, :k].copy(), self._pol_val[i, :k].copy()),
+                float(self._value[i]),
+                float(self._mlh[i]), int(self._future[i]), float(self._draw[i]))
+
+    @property
+    def data(self):
+        return _RowsView(self)
+
+    @data.setter
+    def data(self, samples):
+        """Старые пути (pickle) присваивают список целиком: строка i — позиция i."""
+        samples = list(samples)
+        self._trimmed = len(samples) > self.max_size
+        if self._trimmed:
+            samples = samples[-self.max_size:]
+        self._n = 0
+        self._raw_boards = {}
+        self._full = False
+        self._ptr = 0
+        self.push(samples)
 
     def rebuild_val_arr(self):
-        """Rebuild _val_arr from data after loading. Cap to max_size: a buffer
-        file saved with a larger --buffer-max would otherwise index past _val_arr
-        (and break the ring-buffer invariant)."""
-        if len(self.data) > self.max_size:
-            self.data = self.data[-self.max_size:]
+        """Совместимость со старым интерфейсом: _val_arr ведётся при записи.
+        Остался только разворот после присваивания data длиннее кольца."""
+        if self._trimmed:
             self._ptr = 0
             self._full = True
-        n = min(len(self.data), self.max_size)
-        for i in range(n):
-            self._val_arr[i] = float(self.data[i][2])
+            self._trimmed = False
 
     def save_npz(self, path: str):
         """Whole buffer as one archive, ring in physical order with meta
@@ -1262,49 +1481,69 @@ class ReplayBuffer:
         buffer_io.write_samples(path, self.data, [self._ptr, int(self._full)])
 
     def load_npz(self, path: str):
-        """Reverse of save_npz — rebuilds the list-of-tuples representation."""
         a = buffer_io.read_archive(path)
         saved_ptr, saved_full = int(a["meta"][0]), bool(a["meta"][1])
         n = a["boards"].shape[0]
-        self.data = buffer_io.arrays_to_samples(a)
         # Файл хранит кольцо в физическом порядке: у заполненного буфера самая
         # старая позиция — на сохранённом ptr. Разворачиваем в порядок по
         # возрасту и решаем, заполнен ли буфер, по ТЕКУЩЕМУ max_size, а не по
-        # флагу из файла. Раньше full и ptr брались из файла как есть, и
-        # продолжение заполненного буфера на 200k с --buffer-max побольше
-        # не росло, а перезаписывало старое по кругу и падало с IndexError,
-        # как только ptr доходил до конца списка (~7 итераций).
+        # флагу из файла (иначе продолжение с --buffer-max побольше не росло,
+        # а перезаписывало старое по кругу).
+        order = np.arange(n)
         if saved_full and n:
             k = saved_ptr % n
-            self.data = self.data[k:] + self.data[:k]
-        self._full = len(self.data) >= self.max_size
-        self._ptr = len(self.data) % self.max_size
-        self.rebuild_val_arr()
+            order = np.concatenate([order[k:], order[:k]])
+        if n > self.max_size:
+            order = order[-self.max_size:]
+        self._n, self._ptr, self._full, self._raw_boards = 0, 0, False, {}
+        rows = {f: a[f][order] for f in buffer_io._ROWS if f in a}
+        self.push_arrays(rows)
+        self._full = self._n >= self.max_size
+        self._ptr = self._n % self.max_size
 
     def load_chunks(self, d: str):
         """Push every chunk oldest first; the ring keeps the newest max_size."""
         for _, path in buffer_io.list_chunks(d):
-            self.push(buffer_io.arrays_to_samples(buffer_io.read_archive(path)))
+            self.push_arrays(buffer_io.read_archive(path))
+
+    # ── выборка ──────────────────────────────────────────────────────────────
+
+    def sample_indices(self, batch_size: int) -> np.ndarray:
+        n = self._n
+        if n == 0:
+            return np.zeros(0, dtype=np.int64)
+        indices = np.random.choice(n, batch_size, replace=True)
+        np.add.at(self._draws, indices, 1)
+        return indices
 
     def sample(self, batch_size: int) -> List[Sample]:
-        n = len(self.data)
-        if n == 0:
-            return []
-        indices = np.random.choice(n, batch_size, replace=True)
-        return [self.data[i] for i in indices]
+        return [self.row(i) for i in self.sample_indices(batch_size)]
 
-    def sample_balanced(self, batch_size: int) -> List[Sample]:
+    def draw_stats(self):
+        """(среднее по буферу, среднее у старейших 5%). Старейшие — это строки
+        на выходе из буфера, их число и есть проходов за жизнь позиции."""
+        n = self._n
+        if n == 0:
+            return 0.0, 0.0
+        k = max(1, n // 20)
+        if self._full:
+            idx = (self._ptr + np.arange(k)) % self.max_size
+        else:
+            idx = np.arange(k)
+        return float(self._draws[:n].mean()), float(self._draws[idx].mean())
+
+    def sample_balanced_indices(self, batch_size: int) -> np.ndarray:
         """Sample with win/draw/loss balancing (approximately 33/33/33).
 
-        Uses _val_arr for O(N) vector search without a Python loop over data.
         If one class is missing — balances over available classes.
         Overfit protection: if a bin is small (rare class), cap duplicates —
         each element at most ~3 times per batch. Otherwise 10 wins out of 50K positions
         would get replicated thousands of times per epoch.
+        Draws from np.random in exactly the order the list-based version did.
         """
-        n = len(self.data)
+        n = self._n
         if n == 0:
-            return []
+            return np.zeros(0, dtype=np.int64)
         vals = self._val_arr[:n]
         win_idx  = np.where(vals > 0.15)[0]
         draw_idx = np.where((vals >= -0.15) & (vals <= 0.15))[0]
@@ -1312,12 +1551,12 @@ class ReplayBuffer:
 
         bins = [b for b in [win_idx, draw_idx, loss_idx] if len(b) > 0]
         if len(bins) < 2:
-            return self.sample(batch_size)
+            return self.sample_indices(batch_size)
 
         # If the smallest bin is too small — balancing is useless, fall back to plain sample
         min_bin = min(len(b) for b in bins)
         if min_bin < 50:
-            return self.sample(batch_size)
+            return self.sample_indices(batch_size)
 
         per_bin = batch_size // len(bins)
         result = []
@@ -1325,16 +1564,76 @@ class ReplayBuffer:
             # Cap: no more than len(b)*3 duplicates from one bin
             take = min(per_bin, len(b) * 3)
             local_idx = np.random.randint(0, len(b), take)
-            result.extend([self.data[int(b[i])] for i in local_idx])
+            result.extend(int(b[i]) for i in local_idx)
         # Top up from the large bin (usually draw) if small bins were capped
         big_bin = max(bins, key=len)
         while len(result) < batch_size:
-            result.append(self.data[int(big_bin[np.random.randint(len(big_bin))])])
+            result.append(int(big_bin[np.random.randint(len(big_bin))]))
+        # Список, а не массив: np.random.shuffle тратит случайность одинаково,
+        # но так порядок гарантированно тот же, что у старой выборки кортежей.
         np.random.shuffle(result)
-        return result[:batch_size]
+        return np.asarray(result[:batch_size], dtype=np.int64)
+
+    def sample_balanced(self, batch_size: int) -> List[Sample]:
+        return [self.row(i) for i in self.sample_balanced_indices(batch_size)]
+
+    def collate_indices(self, indices, device):
+        """Батч по физическим строкам — те же тензоры, что _collate_batch над
+        кортежами этих строк, но биты досок и разреженная политика едут на
+        карту как есть (~0.9 МБ вместо ~37 МБ) и раскрываются там."""
+        idx = np.asarray(indices, dtype=np.int64)
+        B = len(idx)
+        dev = torch.device(device)
+        bits = torch.from_numpy(self._bits[idx]).to(dev, non_blocking=True)
+        hm = torch.from_numpy(self._hm[idx]).to(dev, non_blocking=True)
+        k = int(self._pol_n[idx].max()) if B else 0
+        pol_idx = torch.from_numpy(self._pol_idx[idx, :k]).to(dev, non_blocking=True).long()
+        pol_val = torch.from_numpy(self._pol_val[idx, :k]).to(dev, non_blocking=True)
+
+        shifts = torch.arange(7, -1, -1, device=dev, dtype=torch.uint8)
+        planes = ((bits.unsqueeze(-1) >> shifts) & 1).reshape(B, -1)[:, :self._NBITS]
+        planes = planes.to(torch.float32)
+        boards = torch.cat([planes[:, :self._HM0], hm.to(torch.float32),
+                            planes[:, self._HM0:]], dim=1)
+        raw = [(j, self._raw_boards[int(r)]) for j, r in enumerate(idx)
+               if int(r) in self._raw_boards] if self._raw_boards else []
+        if raw:
+            rj = torch.as_tensor([j for j, _ in raw], device=dev)
+            boards[rj] = torch.from_numpy(np.stack([b for _, b in raw])).to(dev).float()
+        boards = boards.reshape(B, CapablancaNet.INPUT_PLANES,
+                                CapablancaNet.BOARD_H, CapablancaNet.BOARD_W)
+
+        # Дополнение уходит в индекс 0 с нулём: scatter_add прибавляет 0.0 и
+        # не может затереть настоящее значение в той же клетке.
+        policies = torch.zeros(B, 7000, dtype=torch.float32, device=dev)
+        if k:
+            policies.scatter_add_(1, pol_idx, pol_val.to(torch.float32))
+
+        # value_draw_to_wdl / value_to_wdl по всем строкам сразу, в double.
+        v = np.clip(self._value[idx], -1.0, 1.0)
+        d = self._draw[idx]
+        has_d = ~(d < 0.0)
+        dc = np.clip(d, 0.0, 1.0)
+        pos = lambda x: np.where(x > 0.0, x, 0.0)
+        w1, l1, d1 = pos((1.0 - dc + v) / 2.0), pos((1.0 - dc - v) / 2.0), pos(dc)
+        s = w1 + d1 + l1
+        tiny = s <= 1e-8
+        s_safe = np.where(tiny, 1.0, s)
+        wdl_d = np.stack([w1 / s_safe, d1 / s_safe, l1 / s_safe], axis=1)
+        wdl_d[tiny] = (0.0, 1.0, 0.0)
+        wdl_v = np.stack([pos(v), pos(1.0 - np.abs(v)), pos(-v)], axis=1)
+        wdl = np.where(has_d[:, None], wdl_d, wdl_v).astype(np.float32)
+
+        return (
+            boards,
+            policies,
+            torch.from_numpy(wdl).to(dev, non_blocking=True),
+            torch.from_numpy(self._mlh[idx].astype(np.float32)).to(dev, non_blocking=True),
+            torch.from_numpy(self._future[idx]).to(dev, non_blocking=True),
+        )
 
     def __len__(self):
-        return len(self.data)
+        return self._n
 
 
 # ── Policy diversity diagnostics ──────────────────────────────────────────────
@@ -1440,7 +1739,17 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             cfg.archive_dir, iteration,
             int(np.asarray(CapablancaEngine().get_board_tensor()).size))
 
-    slots = max(1, min(cfg.mcts_batch, cfg.games_per_iter))
+    # Группы: у каждой своё дерево и своя пачка на карту. Пока карта считает
+    # пачку одной группы, процессор собирает листья и делает ходы в другой.
+    # Каждая группа — прежний пул из mcts_batch партий, поиск в партии тот же.
+    n_groups = max(1, int(getattr(cfg, "selfplay_groups", 1)))
+    slots = max(1, min(cfg.mcts_batch * n_groups, cfg.games_per_iter))
+    n_groups = min(n_groups, slots)
+    bounds = [slots * g // n_groups for g in range(n_groups + 1)]
+    group_of = [0] * slots
+    for g in range(n_groups):
+        for i in range(bounds[g], bounds[g + 1]):
+            group_of[i] = g
     park_after = max(0, int(cfg.park_after_plies))
     park_tail = bool(cfg.park_tail)
 
@@ -1704,28 +2013,30 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         _take(i)
     if not any(live):
         return all_samples
-    # Переиспользование дерева: один RustMCTS на весь пул. После сыгранного хода
-    # make_move(slot, move) сдвигает корень в выбранного ребёнка и сохраняет
-    # поддерево — 2-3x качества поиска за ту же цену. Освободившийся слот
-    # получает новое дерево через reset_game, деревья соседей не страдают.
+    # Переиспользование дерева: после сыгранного хода make_move(slot, move)
+    # сдвигает корень в выбранного ребёнка и сохраняет поддерево — 2-3x
+    # качества поиска за ту же цену. Освободившийся слот получает новое дерево
+    # через reset_game, деревья соседей не страдают. Номер партии в дереве
+    # группы — локальный: слот минус начало группы.
     # Зерно поиска. В обучении его нет — самоигра должна быть разной каждую
     # итерацию. Тест и A/B передают число и получают повторимый прогон.
-    rust_mcts_reuse = mcts.new_tree(engines, seed=getattr(cfg, "search_seed", None))
+    _seed = getattr(cfg, "search_seed", None)
+    trees = [mcts.new_tree(engines[bounds[g]:bounds[g + 1]],
+                           seed=None if _seed is None else _seed + g)
+             for g in range(n_groups)]
 
-    while any(live):
-        # Playout Cap Randomization: доля ходов ищется укороченным поиском.
-        # Решение общее на шаг пула — партии всё равно ищут независимо.
-        use_full_search = np.random.random() >= cfg.fast_sim_fraction
-        current_sims = cfg.simulations if use_full_search else cfg.fast_simulations
-
-        # collect → infer → apply (+ ранний выход по KLD) живёт в UltraFastMCTS,
-        # чтобы самоигра, матчи и диагностика гоняли один и тот же цикл.
-        mcts.run_search(rust_mcts_reuse, current_sims)
-        sparse_pols = rust_mcts_reuse.get_policies_sparse()
-        raw_vals  = rust_mcts_reuse.get_values()
-        raw_draws = rust_mcts_reuse.get_draws()
+    def _play_group(g: int, use_full_search: bool) -> None:
+        """Поиск группы g окончен: записать позиции, сделать ходы, досадить слоты."""
+        nonlocal reported
+        tree = trees[g]
+        lo, hi = bounds[g], bounds[g + 1]
+        sparse_pols = tree.get_policies_sparse()
+        # Доказанный границами исход. -1 = ничего не доказано, не вмешиваемся.
+        proven_moves = tree.get_best_moves()
+        raw_vals  = tree.get_values()
+        raw_draws = tree.get_draws()
         gumbel = cfg.policy_target_mode == "gumbel"
-        child_stats = rust_mcts_reuse.get_root_children_stats() if gumbel else None
+        child_stats = tree.get_root_children_stats() if gumbel else None
         values_np = np.array(raw_vals,  dtype=np.float32)
         draws_np  = np.array(raw_draws, dtype=np.float32)
 
@@ -1734,22 +2045,22 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         freed: List[int] = []
         to_park: List[int] = []
 
-        for game_idx in [i for i in range(slots) if live[i]]:
+        for game_idx in [i for i in range(lo, hi) if live[i]]:
             eng = engines[game_idx]
             legal = eng.get_legal_moves_int()
             if not legal:
-                rust_mcts_reuse.set_game_finished(game_idx)
+                tree.set_game_finished(game_idx - lo)
                 freed.append(game_idx)
                 continue
 
             side = eng.side_to_move()
-            pol_idx_raw, pol_val_raw = sparse_pols[game_idx]
+            pol_idx_raw, pol_val_raw = sparse_pols[game_idx - lo]
             pol_lookup = {
                 int(idx): float(val)
                 for idx, val in zip(pol_idx_raw, pol_val_raw)
             }
-            root_v_raw = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
-            root_d_raw = float(draws_np[game_idx]) if game_idx < len(draws_np) else 0.0
+            root_v_raw = float(values_np[game_idx - lo]) if game_idx - lo < len(values_np) else 0.0
+            root_d_raw = float(draws_np[game_idx - lo]) if game_idx - lo < len(draws_np) else 0.0
             keep_position = (
                 (not cfg.playout_cap_train_only_full) or use_full_search
             )
@@ -1758,8 +2069,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             # полноценны. Кодирование доски стоит 22 мкс — около 0.1% итерации.
             if keep_position or arch is not None:
                 board_np = np.asarray(eng.get_board_tensor(), dtype=np.float32)
-                if gumbel and game_idx < len(child_stats):
-                    c_idx, c_pri, c_vis, c_q = child_stats[game_idx]
+                if gumbel and game_idx - lo < len(child_stats):
+                    c_idx, c_pri, c_vis, c_q = child_stats[game_idx - lo]
                     g_idx, g_val = gumbel_improved_policy(
                         c_idx, c_pri, c_vis, c_q, root_v_raw)
                     pol_sparse = (
@@ -1813,6 +2124,18 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     probs = np.ones(len(legal)) / len(legal)
                 move = int(np.random.choice(legal, p=probs))
 
+            # Доказанный мат бьёт счётчик визитов (правило lc0
+            # GetBestChildrenNoTemperature): ему хватает трёх посещений, чтобы
+            # быть доказанным, и по одним визитам он проигрывал ходу, который
+            # крутили двести раз. Замер: 9 потерянных выигрышей из 12.
+            # Цель обучения не трогаем — подменяется только сыгранный ход.
+            _pm = int(proven_moves[game_idx - lo]) if game_idx - lo < len(proven_moves) else -1
+            if _pm >= 0:
+                for _cand in legal:
+                    if eng.move_int_to_policy_idx(_cand) == _pm:
+                        move = int(_cand)
+                        break
+
             # Книга стартов подменяет СЫГРАННЫЙ ход, но не цель обучения:
             # позиция и распределение визитов уже записаны выше, и они честные.
             ol = opening_line[game_idx]
@@ -1828,12 +2151,12 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             histories[game_idx][-1][7] = int(move)
 
             eng.make_move_int(move)
-            rust_mcts_reuse.make_move(game_idx, move)  # переиспользование дерева
+            tree.make_move(game_idx - lo, move)  # переиспользование дерева
             ply[game_idx] += 1
             stint[game_idx] += 1
 
             if eng.is_game_over():
-                rust_mcts_reuse.set_game_finished(game_idx)
+                tree.set_game_finished(game_idx - lo)
                 freed.append(game_idx)
                 continue
 
@@ -1842,8 +2165,8 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
             # Порог считается и в доигрываемых партиях тоже: там он ничего не
             # прекращает, но запоминает, где сдача случилась БЫ.
             if ply[game_idx] >= cfg.resign_min_move:
-                q = float(values_np[game_idx]) if game_idx < len(values_np) else 0.0
-                d = float(draws_np[game_idx])  if game_idx < len(draws_np)  else 0.0
+                q = float(values_np[game_idx - lo]) if game_idx - lo < len(values_np) else 0.0
+                d = float(draws_np[game_idx - lo])  if game_idx - lo < len(draws_np)  else 0.0
                 p_loss = max(0.0, min(1.0, (1.0 - q - d) / 2.0))
                 _wdl_thr = (cfg.resign_wdl_early
                             if iteration < cfg.resign_warmup_iters
@@ -1864,7 +2187,7 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                         resigned[game_idx] = True
                         # Rust не видит сдачу — без этого мёртвая партия
                         # продолжает выедать листья из каждой пачки на карту.
-                        rust_mcts_reuse.set_game_finished(game_idx)
+                        tree.set_game_finished(game_idx - lo)
                         freed.append(game_idx)
                         continue
                     if would_resign[game_idx] is None:
@@ -1886,19 +2209,19 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
                     adj = None
             if adj is not None:
                 adjudicated[game_idx] = adj
-                rust_mcts_reuse.set_game_finished(game_idx)
+                tree.set_game_finished(game_idx - lo)
                 freed.append(game_idx)
                 continue
 
             if ply[game_idx] >= cfg.max_game_length:
                 # Лимит длины: исход по материалу, как и раньше.
-                rust_mcts_reuse.set_game_finished(game_idx)
+                tree.set_game_finished(game_idx - lo)
                 freed.append(game_idx)
                 continue
 
             if park_after and stint[game_idx] >= park_after:
                 # Отложить: партия жива, но держит слот слишком долго.
-                rust_mcts_reuse.set_game_finished(game_idx)
+                tree.set_game_finished(game_idx - lo)
                 to_park.append(game_idx)
 
         # Хвост итерации: новых партий больше нет, пул наполовину опустел, и
@@ -1908,10 +2231,10 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         # долив слотов держит пул полным, пока новые партии не кончились.
         if (park_tail and started >= cfg.games_per_iter and not _PARKED_GAMES
                 and not to_park):
-            still_live = [i for i in range(slots) if live[i] and i not in freed]
-            if 0 < len(still_live) <= max(1, slots // 2):
+            still_live = [i for i in range(lo, hi) if live[i] and i not in freed]
+            if 0 < len(still_live) <= max(1, (hi - lo) // 2):
                 for i in still_live:
-                    rust_mcts_reuse.set_game_finished(i)
+                    tree.set_game_finished(i - lo)
                 to_park.extend(still_live)
 
         for game_idx in freed:
@@ -1921,10 +2244,46 @@ def generate_games(net: nn.Module, cfg: Config, device: torch.device, iteration:
         for game_idx in freed + to_park:
             live[game_idx] = False
             if _take(game_idx):
-                rust_mcts_reuse.reset_game(game_idx, engines[game_idx])
+                tree.reset_game(game_idx - lo, engines[game_idx])
         if done - reported >= slots:
             reported = done
             _report()
+
+    def _group_live(g: int) -> bool:
+        return any(live[bounds[g]:bounds[g + 1]])
+
+    def _start(g: int):
+        # Playout Cap Randomization: доля ходов ищется укороченным поиском.
+        # Решение общее на шаг группы — партии всё равно ищут независимо.
+        full = np.random.random() >= cfg.fast_sim_fraction
+        sims = cfg.simulations if full else cfg.fast_simulations
+        return mcts.search_steps(trees[g], sims, slot=g), full
+
+    # Поиск группы — генератор (см. UltraFastMCTS.search_steps): next() ждёт
+    # ответ карты на прошлую пачку, разносит его, собирает и ставит в очередь
+    # следующую. Карта в это время уже считает пачку соседней группы.
+    # С одной группой это ровно прежний последовательный цикл.
+    running: List = [None] * n_groups
+    while any(live):
+        for g in range(n_groups):
+            if running[g] is None:
+                if not _group_live(g):
+                    continue
+                running[g] = _start(g)
+            try:
+                next(running[g][0])
+            except StopIteration:
+                full = running[g][1]
+                running[g] = None
+                _play_group(g, full)
+                if _group_live(g):
+                    running[g] = _start(g)
+                    try:
+                        next(running[g][0])
+                    except StopIteration:
+                        # Поиск без единой пачки (все корни решены) — ходы
+                        # сделает следующий заход по кругу.
+                        running[g] = (iter(()), running[g][1])
 
     if done > reported:
         _report()
@@ -2072,17 +2431,12 @@ def train_epoch(net: nn.Module, optimizer: torch.optim.Optimizer,
     steps = 0
 
     for step_idx in range(effective_steps):
-        samples = (buffer.sample_balanced(cfg.batch_size) if cfg.value_balance
-                   else buffer.sample(cfg.batch_size))
-        boards, policies, values, mlh_targets, future_targets = _collate_batch(samples)
-
+        idx = (buffer.sample_balanced_indices(cfg.batch_size) if cfg.value_balance
+               else buffer.sample_indices(cfg.batch_size))
         # NCHW: the net runs NCHW (channels_last is slower here — see model build
         # site above), so feed plain contiguous input.
-        boards = boards.to(device, non_blocking=True)
-        policies = policies.to(device, non_blocking=True)
-        values = values.to(device, non_blocking=True)  # WDL: (batch, 3)
-        mlh_targets = mlh_targets.to(device, non_blocking=True)  # (batch,) in [0,1]
-        future_targets = future_targets.to(device, non_blocking=True)  # (batch,) int64
+        boards, policies, values, mlh_targets, future_targets = \
+            buffer.collate_indices(idx, device)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -2238,7 +2592,7 @@ def train(cfg: Config = None):
     print(f"🚀 Тренировка на {device}")
     print(f"   Модель:        {cfg.num_channels}ch × {cfg.num_res_blocks} blocks")
     print(f"   Self-play:     {cfg.games_per_iter} игр/итер, {cfg.simulations} симуляций/ход")
-    print(f"   MCTS batch:    {cfg.mcts_batch}  parallel_sims={cfg.mcts_parallel_sims}")
+    print(f"   MCTS batch:    {cfg.mcts_batch}  parallel_sims={cfg.mcts_parallel_sims}  групп={cfg.selfplay_groups}")
     print(f"   Train batch:   {cfg.batch_size} × до {cfg.train_steps} шагов (≤1 эпохи буфера)")
     print(f"   LR:            {cfg.learning_rate:.2e}  weight_decay={cfg.weight_decay}")
     print(f"   Precision:     BF16 + TF32\n")
@@ -2415,17 +2769,24 @@ def train(cfg: Config = None):
     if cfg.latest_dir:
         os.makedirs(cfg.latest_dir, exist_ok=True)
         ram_latest = _ram_latest_path(cfg)
-        main_pid = os.getpid()
+    main_pid = os.getpid()
 
-        def _flush_latest_and_exit(signum, frame):
-            # Forked helpers inherit the handler; only the trainer copies.
-            if os.getpid() == main_pid and os.path.exists(ram_latest):
+    def _flush_and_exit(signum, frame):
+        # Forked helpers inherit the handler; only the trainer saves.
+        if os.getpid() == main_pid:
+            if ram_latest and os.path.exists(ram_latest):
                 _copy_atomic(ram_latest, disk_latest, ".signal.tmp")
                 print(f"\n  💾 {signal.Signals(signum).name}: latest.pth "
                       f"перенесён на диск", flush=True)
-            os._exit(128 + signum)
-        signal.signal(signal.SIGTERM, _flush_latest_and_exit)
-        signal.signal(signal.SIGINT, _flush_latest_and_exit)
+            # Архив копит meta в памяти и кладёт её только в close(): без этого
+            # всё сыгранное с начала итерации пропадало вместе с процессом.
+            files, rows = archive_mod.close_open_writers()
+            if files:
+                print(f"  💾 архив дописан: {files} файл(ов), {rows:,} позиций",
+                      flush=True)
+        os._exit(128 + signum)
+    signal.signal(signal.SIGTERM, _flush_and_exit)
+    signal.signal(signal.SIGINT, _flush_and_exit)
 
     start_iter = 0
     ckpts = sorted([f for f in os.listdir(cfg.checkpoint_dir) if f.endswith(".pth")])
@@ -2840,6 +3201,9 @@ def train(cfg: Config = None):
         print(f"     future_loss = {metrics.get('future_loss', 0.0):.4f}")
         print(f"     total_loss  = {metrics['loss']:.4f}")
         print(f"     lr          = {current_lr:.2e}")
+        d_mean, d_old = buffer.draw_stats()
+        warn = "  ⚠️  выше 5 — заучивание" if d_old > 7.0 else ""
+        print(f"     проходов    = {d_mean:.2f} в среднем, {d_old:.2f} у старейших 5%{warn}")
 
         if collapsed:
             print(f"\n  ⚠️  Рекомендация: перезапустить с --reset-buffer --reset-scheduler\n")
@@ -2969,6 +3333,8 @@ if __name__ == "__main__":
                         help="Отключить playout cap (учить на всех позициях)")
     parser.add_argument("--games",               type=int,   default=128)
     parser.add_argument("--mcts-batch",          type=int,   default=128)
+    parser.add_argument("--selfplay-groups",     type=int,   default=1,
+                        help="групп партий по --mcts-batch: конвейер CPU↔GPU в самоигре")
     parser.add_argument("--opening-plies",        type=int,   default=0,
                         help="Форсировать первые N полуходов полным перебором: "
                              "партия k играет k-ю линию. 0 = выключено")
@@ -3083,6 +3449,12 @@ if __name__ == "__main__":
     parser.add_argument("--resign-playthrough",    type=float, default=0.10,
                         help="Доля игр без resign для калибровки (LC0-style). "
                              "0.10 = 10%% играем до конца. (default: 0.10)")
+    parser.add_argument("--resign-wdl-threshold", type=float, default=0.85,
+                        help="Сдача, если P(проигрыша) выше этого. Срабатывает "
+                             "раньше порога по Q: при D≈0 значение 0.85 равно "
+                             "Q < -0.70 (default: 0.85)")
+    parser.add_argument("--resign-wdl-early", type=float, default=0.95,
+                        help="То же на ранних итерациях (default: 0.95)")
     parser.add_argument("--resign-threshold-early", type=float, default=-0.99,
                         help="Порог сдачи на ранних итерациях (default: -0.99)")
     parser.add_argument("--resign-warmup-iters",  type=int,   default=30,
@@ -3199,6 +3571,7 @@ if __name__ == "__main__":
         playout_cap_train_only_full=args.playout_cap_train_only_full,
         games_per_iter=args.games,
         mcts_batch=args.mcts_batch,
+        selfplay_groups=args.selfplay_groups,
         temperature=args.temperature,
         temperature_late=args.temperature_late,
         opening_plies=args.opening_plies,
@@ -3266,6 +3639,8 @@ if __name__ == "__main__":
         fsf_value_alpha=args.fsf_value_alpha,
         resign_threshold=args.resign_threshold,
         resign_threshold_early=args.resign_threshold_early,
+        resign_wdl_threshold=args.resign_wdl_threshold,
+        resign_wdl_early=args.resign_wdl_early,
         resign_warmup_iters=args.resign_warmup_iters,
         resign_consec=args.resign_consec,
         resign_min_move=args.resign_min_move,

@@ -83,6 +83,7 @@ def main():
     ap.add_argument("--restricted-policy", action="store_true")
     ap.add_argument("--abs-pos-embed", action="store_true")
     ap.add_argument("--wide-value", action="store_true")
+    ap.add_argument("--attn-policy", action="store_true")
     ap.add_argument("--no-future", dest="enable_future", action="store_false")
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--steps-per-epoch", type=int, default=900)
@@ -108,7 +109,7 @@ def main():
         swiglu=True, qk_norm=True, use_rmsnorm=True, qkv_bias=False,
         enable_future=a.enable_future,
         restricted_policy=a.restricted_policy, abs_pos_embed=a.abs_pos_embed,
-        wide_value=a.wide_value).to(dev)
+        wide_value=a.wide_value, attn_policy=a.attn_policy).to(dev)
     print(f"студент:  {describe_arch(student)}")
     with torch.no_grad():
         c, s = warm_start(student, tsd)

@@ -2,6 +2,7 @@
 use pyo3::prelude::*;
 use numpy::{PyArray1, PyArray2, PyReadonlyArray2, PyReadonlyArray1, IntoPyArray, PyUntypedArrayMethods};
 use ndarray::Array2;
+use rayon::prelude::*;
 
 type BB = u128;
 const BOARD_MASK: BB = (1u128 << 80) - 1;
@@ -59,6 +60,41 @@ fn knight_attacks(sq: u32) -> BB {
     ATTACK_TABLES.get_or_init(init_attack_tables).0[sq as usize]
 }
 
+// Лучи на пустой доске, по направлениям DIRS. Первый блокер ищется одной
+// инструкцией (tz/lz) вместо пошагового обхода — это половина цены gen_legal.
+const DIRS: [i32; 8] = [10, 1, 11, 9, -10, -1, -9, -11];  // первые 4 растут по индексу
+static RAYS: OnceLock<[[BB; 80]; 8]> = OnceLock::new();
+
+fn init_rays() -> [[BB; 80]; 8] {
+    let mut r = [[0u128; 80]; 8];
+    for (d, &delta) in DIRS.iter().enumerate() {
+        for sq in 0u32..80 { r[d][sq as usize] = ray_attacks(sq, 0, delta); }
+    }
+    r
+}
+
+#[inline(always)]
+fn slide(rays: &[[BB; 80]; 8], d: usize, sq: u32, occ: BB) -> BB {
+    let ray = rays[d][sq as usize];
+    let blk = ray & occ;
+    if blk == 0 { return ray; }
+    let b = if d < 4 { blk.trailing_zeros() } else { 127 - blk.leading_zeros() };
+    ray ^ rays[d][b as usize]
+}
+
+#[inline(always)]
+fn rook_fast(rays: &[[BB; 80]; 8], sq: u32, occ: BB) -> BB {
+    slide(rays, 0, sq, occ) | slide(rays, 1, sq, occ) | slide(rays, 4, sq, occ) | slide(rays, 5, sq, occ)
+}
+
+#[inline(always)]
+fn bishop_fast(rays: &[[BB; 80]; 8], sq: u32, occ: BB) -> BB {
+    slide(rays, 2, sq, occ) | slide(rays, 3, sq, occ) | slide(rays, 6, sq, occ) | slide(rays, 7, sq, occ)
+}
+
+#[inline(always)]
+fn rays() -> &'static [[BB; 80]; 8] { RAYS.get_or_init(init_rays) }
+
 fn ray_attacks(sq: u32, occupancy: BB, delta: i32) -> BB {
     let mut attacks: BB = 0;
     let mut current = sq as i32 + delta;
@@ -79,8 +115,14 @@ fn ray_attacks(sq: u32, occupancy: BB, delta: i32) -> BB {
     attacks
 }
 
-fn bishop_attacks(sq: u32, occ: BB) -> BB { ray_attacks(sq, occ, 11) | ray_attacks(sq, occ, 9) | ray_attacks(sq, occ, -9) | ray_attacks(sq, occ, -11) }
-fn rook_attacks(sq: u32, occ: BB) -> BB { ray_attacks(sq, occ, 10) | ray_attacks(sq, occ, -10) | ray_attacks(sq, occ, 1) | ray_attacks(sq, occ, -1) }
+#[cfg(test)]
+fn bishop_attacks_slow(sq: u32, occ: BB) -> BB { ray_attacks(sq, occ, 11) | ray_attacks(sq, occ, 9) | ray_attacks(sq, occ, -9) | ray_attacks(sq, occ, -11) }
+#[cfg(test)]
+fn rook_attacks_slow(sq: u32, occ: BB) -> BB { ray_attacks(sq, occ, 10) | ray_attacks(sq, occ, -10) | ray_attacks(sq, occ, 1) | ray_attacks(sq, occ, -1) }
+#[inline]
+fn bishop_attacks(sq: u32, occ: BB) -> BB { bishop_fast(rays(), sq, occ) }
+#[inline]
+fn rook_attacks(sq: u32, occ: BB) -> BB { rook_fast(rays(), sq, occ) }
 fn queen_attacks(sq: u32, occ: BB) -> BB { bishop_attacks(sq, occ) | rook_attacks(sq, occ) }
 fn archbishop_attacks(sq: u32, occ: BB) -> BB { bishop_attacks(sq, occ) | knight_attacks(sq) }
 fn chancellor_attacks(sq: u32, occ: BB) -> BB { rook_attacks(sq, occ) | knight_attacks(sq) }
@@ -132,7 +174,56 @@ impl Board {
         att
     }
 
-    fn in_check(&self, color: usize) -> bool { (self.pieces[color][KING] & self.attacks_by(1 - color)) != 0 }
+    // Эквивалент `pieces[color][KING] & attacks_by(1 - color) != 0`, но лучи
+    // пускаются от короля, а не от всех фигур соперника (атаки симметричны).
+    fn in_check(&self, color: usize) -> bool {
+        let kings = self.pieces[color][KING];
+        if kings == 0 { return false; }
+        Self::attacked_by_set(&self.pieces[1 - color], 1 - color, kings, self.occupancy(), !0)
+    }
+
+    // Бьёт ли сторона `them` (фигуры `t`, из которых вычтено `keep == 0`)
+    // хоть одно поле из `targets` при занятости `occ`.
+    #[inline(always)]
+    fn attacked_by_set(t: &[BB; 8], them: usize, targets: BB, occ: BB, keep: BB) -> bool {
+        let pawns = t[PAWN] & keep;
+        let pawn_att = if them == 0 { white_pawn_attacks(pawns) } else { black_pawn_attacks(pawns) };
+        if pawn_att & targets != 0 { return true; }
+        let r = rays();
+        let n_like = (t[KNIGHT] | t[ARCH] | t[CHANC]) & keep;
+        let b_like = (t[BISHOP] | t[ARCH] | t[QUEEN]) & keep;
+        let r_like = (t[ROOK] | t[CHANC] | t[QUEEN]) & keep;
+        let k = t[KING] & keep;
+        for sq in bb_iter(targets) {
+            if knight_attacks(sq) & n_like != 0 { return true; }
+            if king_attacks(sq) & k != 0 { return true; }
+            if b_like != 0 && bishop_fast(r, sq, occ) & b_like != 0 { return true; }
+            if r_like != 0 && rook_fast(r, sq, occ) & r_like != 0 { return true; }
+        }
+        false
+    }
+
+    // Тот же ответ, что `clone + apply_move + !in_check(side)`, без копии доски.
+    // Рокировка и взятие на проходе снимают больше одной фигуры — для них
+    // остаётся честный путь через apply_move.
+    fn move_is_legal(&self, f: u32, t: u32, p: Option<usize>) -> bool {
+        let us = self.side;
+        let fbb = 1u128 << f; let tbb = 1u128 << t;
+        let kings = self.pieces[us][KING];
+        let is_king = kings & fbb != 0;
+        let is_ep = self.pieces[us][PAWN] & fbb != 0 && self.ep_square == Some(t as u8);
+        let castle = is_king && (t as i32 - f as i32).abs() == 3;
+        if is_ep || castle || kings.count_ones() > 1 {
+            let mut b = self.clone(); b.apply_move(f, t, p); return !b.in_check(us);
+        }
+        if kings == 0 { return true; }
+        let target = if is_king { tbb } else { kings };
+        let occ = (self.occupancy() & !fbb) | tbb;
+        !Self::attacked_by_set(&self.pieces[1 - us], 1 - us, target, occ, !tbb)
+    }
+
+    #[cfg(test)]
+    fn in_check_slow(&self, color: usize) -> bool { (self.pieces[color][KING] & self.attacks_by(1 - color)) != 0 }
 
     fn gen_pseudo_legal(&self) -> Vec<(u32, u32, Option<usize>)> {
         let mut moves = Vec::with_capacity(128);
@@ -221,8 +312,13 @@ impl Board {
     }
 
     fn gen_legal(&self) -> Vec<(u32, u32, Option<usize>)> {
+        self.gen_pseudo_legal().into_iter().filter(|&(f, t, p)| self.move_is_legal(f, t, p)).collect()
+    }
+
+    #[cfg(test)]
+    fn gen_legal_slow(&self) -> Vec<(u32, u32, Option<usize>)> {
         self.gen_pseudo_legal().into_iter().filter(|&(f, t, p)| {
-            let mut b = self.clone(); b.apply_move(f, t, p); !b.in_check(self.side)
+            let mut b = self.clone(); b.apply_move(f, t, p); !b.in_check_slow(self.side)
         }).collect()
     }
 
@@ -406,12 +502,7 @@ fn flip_sq(sq: u32) -> u32 { (7 - sq / 10) * 10 + (sq % 10) }
 /// Flip all bits in a bitboard.
 fn flip_bb(bb: BB) -> BB {
     let mut out: BB = 0;
-    let mut b = bb;
-    while b != 0 {
-        let sq = b.trailing_zeros();
-        b &= b - 1;
-        out |= 1u128 << flip_sq(sq);
-    }
+    for r in 0..8u32 { out |= ((bb >> (10 * r)) & 0x3FF) << (10 * (7 - r)); }
     out
 }
 
@@ -452,10 +543,15 @@ fn boards_to_tensor(history: &[Board], rep_flags: &[bool],
 /// Vec + memcpy per leaf. Hot path: `collect_leaves_into_buf`.
 fn boards_to_tensor_into(out: &mut Vec<f32>, history: &[Board], rep_flags: &[bool],
                          current_side: usize, halfmove: u32, castling: u8) {
-    // Sparse writes below rely on the region being zero-initialised first.
     let base0 = out.len();
     out.resize(base0 + TOTAL_INPUT_PLANES * 80, 0.0);
-    let t = &mut out[base0..];
+    boards_to_tensor_slice(&mut out[base0..], history, rep_flags, current_side, halfmove, castling);
+}
+
+/// `t` должен быть заранее обнулён: пишутся только ненулевые значения.
+fn boards_to_tensor_slice(t: &mut [f32], history: &[Board], rep_flags: &[bool],
+                          current_side: usize, halfmove: u32, castling: u8) {
+    let t = &mut t[..TOTAL_INPUT_PLANES * 80];
     let do_flip = current_side == 1;
 
     for h in 0..HISTORY_LEN {
@@ -546,6 +642,7 @@ impl CapablancaEngine {
     }
     pub fn copy(&self) -> Self { self.clone() }
     pub fn side_to_move(&self) -> usize { self.board.side }
+    pub fn is_check(&self) -> bool { self.board.in_check(self.board.side) }
 
     /// List of pieces on the board in RAW (non-canonical) coordinates.
     /// Returns Vec<(color, piece_type, square)>:
@@ -902,6 +999,41 @@ mod tests {
         assert_eq!(root_repeat.rep_count_at_leaf(root_repeat.root, &start), 2);
         assert!(!root_repeat.is_repetition_at_leaf(root_repeat.root, &start),
             "root must never expand as a 2-fold terminal — that empties the policy");
+    }
+
+    #[test]
+    fn test_fast_movegen_matches_slow() {
+        // Случайные партии: быстрые лучи, in_check и gen_legal обязаны совпасть
+        // с пошаговыми эталонами, включая порядок ходов (от него зависит
+        // сортировка детей при равных приорах).
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut positions = 0;
+        for _game in 0..300 {
+            let mut b = Board::start();
+            for _ply in 0..160 {
+                let occ = b.occupancy();
+                for sq in 0..80u32 {
+                    assert_eq!(bishop_attacks(sq, occ), bishop_attacks_slow(sq, occ));
+                    assert_eq!(rook_attacks(sq, occ), rook_attacks_slow(sq, occ));
+                }
+                for c in 0..2 { assert_eq!(b.in_check(c), b.in_check_slow(c)); }
+                let legal = b.gen_legal();
+                assert_eq!(legal, b.gen_legal_slow());
+                positions += 1;
+                if legal.is_empty() { break; }
+                let k = (xorshift64(&mut rng) * legal.len() as f64) as usize % legal.len();
+                let (f, t, p) = legal[k];
+                b.apply_move(f, t, p);
+            }
+        }
+        // Флип плоскостей: быстрый сдвиг рядов против поклеточного.
+        for _ in 0..10000 {
+            let bb = ((xorshift64(&mut rng).to_bits() as u128) << 64 | xorshift64(&mut rng).to_bits() as u128) & BOARD_MASK;
+            let mut slow: BB = 0;
+            for sq in bb_iter(bb) { slow |= 1u128 << flip_sq(sq); }
+            assert_eq!(flip_bb(bb), slow);
+        }
+        assert!(positions > 10000);
     }
 
     #[test]
@@ -1458,6 +1590,10 @@ fn dirichlet_noise(alpha: f64, n: usize, rng: &mut u64) -> Vec<f64> {
 }
 
 struct SingleMcts {
+    // Диагностика веток выхода select(): [терминал, нераскрытый, БЕЗ ДЕТЕЙ].
+    // Третья ветка возвращает None не откатывая ничего — если поиск встал,
+    // виновата она.
+    dbg: [u64; 3],
     arena: Arena,
     root: usize,
     root_board: Board,
@@ -1499,6 +1635,31 @@ struct SingleMcts {
     // and spending GPU batch slots on them. With a 60%+ resign rate that is a
     // large share of every batch.
     finished: bool,
+    // is_over() зовётся на каждом шаге и гоняет gen_legal корня; корень и
+    // position_history меняет только make_move, он кэш и сбрасывает.
+    over_cache: Option<bool>,
+}
+
+/// Выбранный лист до кодирования: history[0] — сам лист.
+struct LeafEnc { history: Vec<Board>, rep: Vec<bool> }
+
+// Партии пула независимы, поэтому выбор листьев и применение выводов сети идут
+// по партиям параллельно. Свой пул, а не глобальный rayon: число потоков не
+// должно зависеть от того, кто ещё в процессе пользуется rayon.
+// Потоки пула не переживают fork: дочерний процесс, получивший пул родителя,
+// повис бы навсегда. Поэтому пул привязан к pid и в потомке строится заново.
+static POOL: std::sync::Mutex<Option<(u32, &'static rayon::ThreadPool)>> = std::sync::Mutex::new(None);
+fn pool() -> &'static rayon::ThreadPool {
+    let mut g = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let pid = std::process::id();
+    if let Some((p, pool)) = *g { if p == pid { return pool; } }
+    let n = std::env::var("CAPA_MCTS_THREADS").ok().and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8));
+    let pool: &'static rayon::ThreadPool = Box::leak(Box::new(
+        rayon::ThreadPoolBuilder::new().num_threads(n.max(1))
+            .thread_name(|i| format!("mcts-{i}")).build().expect("rayon pool")));
+    *g = Some((pid, pool));
+    pool
 }
 
 fn compute_board_hash(b: &Board) -> u64 {
@@ -1551,6 +1712,7 @@ impl SingleMcts {
             position_history,
             root_history,
             kld_prev_snapshot: None,
+            dbg: [0; 3],
             move_start_visits: 0,
             contempt: 0.0,
             c_puct: C_PUCT_V,
@@ -1558,6 +1720,7 @@ impl SingleMcts {
             add_dirichlet: true,
             rep_search_perslot: false,
             finished: false,
+            over_cache: None,
         }
     }
 
@@ -1733,12 +1896,15 @@ impl SingleMcts {
             };
             if is_terminal {
                 // Terminal: m = 0 (game over), plies_from_leaf incremented in backup
+                self.dbg[0] += 1;
                 self.backup(idx, terminal_v, terminal_d, terminal_m);
                 return None;
             }
+            let is_exp = self.arena.get(idx).is_expanded;
+            let no_kids = self.arena.get(idx).children.is_empty();
+            if !is_exp { self.dbg[1] += 1; return Some(idx); }
+            if no_kids { self.dbg[2] += 1; return None; }
             let node = self.arena.get(idx);
-            if !node.is_expanded { return Some(idx); }
-            if node.children.is_empty() { return None; }
 
             let parent_visits = (self.arena.get(idx).visits + self.arena.get(idx).virtual_loss).max(1);
             let sqrt_n = (parent_visits as f32).sqrt();
@@ -2080,13 +2246,12 @@ impl SingleMcts {
         second + sims_remaining < best
     }
 
-    // Collect leaves and append encoded tensors directly into the caller's
-    // flat batch buffer. This avoids one extra full-buffer copy per MCTS step.
-    fn collect_leaves_append(&mut self, parallel: usize, _rng: &mut u64,
-                             out: &mut Vec<f32>) -> usize {
+    // Выбор листьев без кодирования: кодирование идёт отдельным параллельным
+    // проходом прямо в общий буфер пачки.
+    fn select_leaves(&mut self, parallel: usize) -> Vec<LeafEnc> {
         self.pending.clear();
         self.pending_boards.clear();
-        let mut count = 0usize;
+        let mut out = Vec::with_capacity(parallel);
         for _ in 0..parallel {
             if let Some(leaf) = self.select() {
                 if self.arena.get(leaf).is_terminal { continue; }
@@ -2104,16 +2269,12 @@ impl SingleMcts {
                     }
                     rf
                 };
-                boards_to_tensor_into(
-                    out, &history, &rep_flags,
-                    leaf_board.side, leaf_board.halfmove_clock, leaf_board.castling,
-                );
                 self.pending_boards.push(leaf_board);
                 self.pending.push(leaf);
-                count += 1;
+                out.push(LeafEnc { history, rep: rep_flags });
             }
         }
-        count
+        out
     }
 
     // Inference results are applied via the flat-slice path below; the old
@@ -2153,6 +2314,43 @@ impl SingleMcts {
                 self.propagate_bounds_from(leaf);
             }
         }
+    }
+
+    /// Лучший корневой ход по правилу lc0 (search.cc:727 GetBestChildrenNoTemperature):
+    /// СНАЧАЛА класс исхода, и только внутри класса — визиты. Доказанный мат
+    /// набирает три посещения и по одним визитам проигрывает ходу, который
+    /// крутили двести раз, — так терялось 9 доказанных выигрышей из 12.
+    /// Среди выигрышей берётся кратчайший по m, среди проигрышей — длиннейший.
+    /// Возвращает индекс политики или -1.
+    fn best_move_idx(&self) -> i32 {
+        let root = self.arena.get(self.root);
+        if root.children.is_empty() { return -1; }
+        // 2 = доказанный выигрыш, 1 = неизвестно, 0 = доказанный проигрыш
+        let rank = |c: &MctsNode| -> u8 {
+            if c.upper == -1 { 2 } else if c.lower == 1 { 0 } else { 1 }
+        };
+        // Если ничего не доказано — вернуть -1 и не вмешиваться: иначе подмена
+        // затёрла бы выборку с температурой в дебюте.
+        if !root.children.iter().any(|&ci| rank(self.arena.get(ci)) != 1) { return -1; }
+        let mut best: Option<usize> = None;
+        for &ci in &root.children {
+            let b = match best { Some(b) => b, None => { best = Some(ci); continue } };
+            let (c, o) = (self.arena.get(ci), self.arena.get(b));
+            let (rc, ro) = (rank(c), rank(o));
+            let better = if rc != ro { rc > ro }
+                else if rc == 2 { c.m < o.m }              // кратчайший выигрыш
+                else if rc == 0 { c.m > o.m }              // длиннейший проигрыш
+                else if c.visits != o.visits { c.visits > o.visits }
+                else if c.visits > 0 { -c.q() > -o.q() }
+                else { c.prior > o.prior };
+            if better { best = Some(ci); }
+        }
+        let c = self.arena.get(best.unwrap());
+        let m = c.move_from_parent;
+        let pv = m & 0b111;
+        let pr = if pv == 0 { None } else { Some((pv - 1) as usize) };
+        let idx = Board::move_to_idx((m >> 10) & 0x7F, (m >> 3) & 0x7F, pr, self.root_board.side);
+        if idx < POLICY_SIZE_MCTS { idx as i32 } else { -1 }
     }
 
     fn get_policy_sparse(&self) -> (Vec<i32>, Vec<f32>) {
@@ -2237,6 +2435,13 @@ impl SingleMcts {
     }
 
     fn is_over(&mut self) -> bool {
+        if let Some(v) = self.over_cache { return v; }
+        let v = self.is_over_uncached();
+        self.over_cache = Some(v);
+        v
+    }
+
+    fn is_over_uncached(&self) -> bool {
         if self.root_board.halfmove_clock >= 100 { return true; }
         if self.root_board.is_insufficient_material() { return true; }
         // Three-fold repetition: current position already in history (pushed in make_move),
@@ -2292,6 +2497,7 @@ impl SingleMcts {
         let f  = (m_int >> 10) & 0x7F;
         let p  = if pv == 0 { None } else { Some((pv - 1) as usize) };
         self.root_board.apply_move(f, t, p);
+        self.over_cache = None;
         let new_side = self.root_board.side as u8;
 
         let child_idx = self.arena.get(self.root).children.iter()
@@ -2529,33 +2735,41 @@ impl RustMCTS {
     /// (for honest sims_remaining estimation in best_move_is_decided).
     #[pyo3(signature = (target_sims_per_game=0))]
     pub fn collect_leaves<'py>(&mut self, py: Python<'py>, target_sims_per_game: i32) -> Bound<'py, PyArray2<f32>> {
-        let mut new_counts = vec![0usize; self.games.len()];
         let cols = TOTAL_INPUT_PLANES * 80;
-        let mut flat: Vec<f32> = Vec::with_capacity(
-            self.games.len().saturating_mul(self.parallel_sims).saturating_mul(cols)
-        );
-        let mut total = 0usize;
-
-        for (g, game) in self.games.iter_mut().enumerate() {
-            if game.finished || game.is_over() { continue; }
-            // Accumulating tree reuse: count remaining from sims DONE THIS MOVE,
-            // not from full root.visits. Otherwise visits inherited via tree reuse
-            // artificially deflate sims_remaining → best_move_is_decided cuts off search
-            // prematurely ("choking"). target_sims_per_game=0 = don't use early-stop.
-            let visits_so_far = game.arena.get(game.root).visits;
-            if target_sims_per_game > 0 {
-                let sims_done_this_move = (visits_so_far - game.move_start_visits).max(0);
-                let sims_remaining = (target_sims_per_game - sims_done_this_move).max(0);
-                if game.best_move_is_decided(sims_remaining) { continue; }
-            }
-            // Append directly into the shared flat tensor buffer. This avoids
-            // one full copy of all input planes per MCTS step.
-            let count = game.collect_leaves_append(
-                self.parallel_sims, &mut self.rng, &mut flat
-            );
-            new_counts[g] = count;
-            total += count;
-        }
+        let parallel = self.parallel_sims;
+        let games = &mut self.games;
+        let (per_game, flat) = py.detach(|| pool().install(|| {
+            let per_game: Vec<Vec<LeafEnc>> = games.par_iter_mut().map(|game| {
+                if game.finished || game.is_over() { return Vec::new(); }
+                // Accumulating tree reuse: count remaining from sims DONE THIS MOVE,
+                // not from full root.visits. Otherwise visits inherited via tree reuse
+                // artificially deflate sims_remaining → best_move_is_decided cuts off search
+                // prematurely ("choking"). target_sims_per_game=0 = don't use early-stop.
+                let visits_so_far = game.arena.get(game.root).visits;
+                if target_sims_per_game > 0 {
+                    let sims_done_this_move = (visits_so_far - game.move_start_visits).max(0);
+                    let sims_remaining = (target_sims_per_game - sims_done_this_move).max(0);
+                    if game.best_move_is_decided(sims_remaining) { return Vec::new(); }
+                }
+                game.select_leaves(parallel)
+            }).collect();
+            let leaves: Vec<&LeafEnc> = per_game.iter().flatten().collect();
+            let n = leaves.len() * cols;
+            let mut flat: Vec<f32> = Vec::with_capacity(n);
+            flat.spare_capacity_mut()[..n].par_chunks_mut(cols).zip(leaves.par_iter())
+                .for_each(|(chunk, l)| {
+                    chunk.fill(std::mem::MaybeUninit::new(0.0));
+                    // SAFETY: весь кусок только что инициализирован.
+                    let t: &mut [f32] = unsafe { &mut *(chunk as *mut [std::mem::MaybeUninit<f32>] as *mut [f32]) };
+                    let b = &l.history[0];
+                    boards_to_tensor_slice(t, &l.history, &l.rep, b.side, b.halfmove_clock, b.castling);
+                });
+            // SAFETY: все n элементов записаны выше.
+            unsafe { flat.set_len(n); }
+            (per_game, flat)
+        }));
+        let new_counts: Vec<usize> = per_game.iter().map(|v| v.len()).collect();
+        let total: usize = new_counts.iter().sum();
 
         // Python reads these counts via get_current_batch_counts() right after
         // collect_leaves and passes them back into apply_inference_buffered, so
@@ -2611,6 +2825,7 @@ impl RustMCTS {
     /// apply_inference with explicit batch_counts for correct double-buffering.
     pub fn apply_inference_buffered(
         &mut self,
+        py: Python<'_>,
         policies: PyReadonlyArray2<f32>,
         values: PyReadonlyArray1<f32>,
         draws: PyReadonlyArray1<f32>,
@@ -2640,9 +2855,9 @@ impl RustMCTS {
 
         let mut offset = 0;
         let mut break_at: Option<usize> = None;
+        let mut jobs: Vec<Option<usize>> = vec![None; self.games.len()];
         for (g, &count) in batch_counts.iter().enumerate() {
             if count == 0 { continue; }
-            let start = offset * policy_size;
             let end   = (offset + count) * policy_size;
             if end > pol_flat.len() {
                 eprintln!(
@@ -2652,16 +2867,38 @@ impl RustMCTS {
                 break_at = Some(g);
                 break;
             }
-            let rng = &mut self.rng;
-            self.games[g].apply_inference_flat(
-                &pol_flat[start..end], policy_size,
-                &val[offset..offset + count],
-                &drw[offset..offset + count],
-                &mlh[offset..offset + count],
-                rng,
-            );
+            if g < jobs.len() { jobs[g] = Some(offset); }
             offset += count;
         }
+        let run = |game: &mut SingleMcts, off: usize, count: usize, rng: &mut u64| {
+            game.apply_inference_flat(
+                &pol_flat[off * policy_size..(off + count) * policy_size], policy_size,
+                &val[off..off + count], &drw[off..off + count], &mlh[off..off + count], rng,
+            );
+        };
+        // Шум Дирихле берётся из общего rng только при раскрытии корня. Такие
+        // партии идут последовательно в прежнем порядке — поток случайных чисел
+        // тот же, что без параллелизма; остальным rng не нужен.
+        let needs_rng = |game: &SingleMcts| game.add_dirichlet
+            && !game.arena.get(game.root).is_expanded && game.pending.contains(&game.root);
+        for g in 0..self.games.len() {
+            if let Some(off) = jobs[g] {
+                if needs_rng(&self.games[g]) {
+                    run(&mut self.games[g], off, batch_counts[g], &mut self.rng);
+                    jobs[g] = None;
+                }
+            }
+        }
+        let games = &mut self.games;
+        py.detach(|| pool().install(|| {
+            games.par_iter_mut().zip(jobs.par_iter()).enumerate().for_each(|(g, (game, job))| {
+                if let Some(off) = *job {
+                    let mut unused = 0x9e3779b97f4a7c15u64;
+                    run(game, off, batch_counts[g], &mut unused);
+                    debug_assert_eq!(unused, 0x9e3779b97f4a7c15u64);
+                }
+            });
+        }));
         if let Some(g) = break_at {
             let n = self.games.len();
             self.drain_pending_vloss(g, n);
@@ -2690,6 +2927,38 @@ impl RustMCTS {
 
     /// Per-root-child stats for the Gumbel completed-Q policy target.
     /// One (policy_idxs, priors, visits, q_parent) tuple per game. Read-only.
+    /// Лучший ход на КАЖДУЮ игру с учётом доказанных исходов. Цель обучения
+    /// при этом остаётся распределением визитов — подменяется только сыгранный
+    /// ход, как это делает книга стартов.
+    pub fn get_best_moves(&self) -> Vec<i32> {
+        self.games.iter().map(|g| g.best_move_idx()).collect()
+    }
+
+    /// Помечен ли корень терминальным (доказан границами) и границы детей:
+    /// upper == -1 у ребёнка = ребёнок проигрывает = МЫ выигрываем этим ходом.
+    pub fn get_root_proof(&self) -> Vec<(bool, Vec<i32>, Vec<i8>, Vec<i8>, Vec<i32>)> {
+        self.games.iter().map(|g| {
+            let r = g.arena.get(g.root);
+            let mut idxs = Vec::new(); let mut lo = Vec::new();
+            let mut up = Vec::new(); let mut vis = Vec::new();
+            for &ci in &r.children {
+                let c = g.arena.get(ci);
+                let m = c.move_from_parent;
+                let pv = m & 0b111;
+                let pr = if pv == 0 { None } else { Some((pv - 1) as usize) };
+                idxs.push(Board::move_to_idx((m >> 10) & 0x7F, (m >> 3) & 0x7F, pr,
+                                             g.root_board.side) as i32);
+                lo.push(c.lower); up.push(c.upper); vis.push(c.visits);
+            }
+            (r.is_terminal, idxs, lo, up, vis)
+        }).collect()
+    }
+
+    /// Счётчики веток выхода select(): [терминал, нераскрытый, без детей].
+    pub fn get_select_exits(&self) -> Vec<(u64, u64, u64)> {
+        self.games.iter().map(|g| (g.dbg[0], g.dbg[1], g.dbg[2])).collect()
+    }
+
     pub fn get_root_children_stats(&self) -> Vec<(Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>)> {
         self.games.iter().map(|g| g.get_root_children_stats()).collect()
     }

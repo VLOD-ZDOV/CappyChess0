@@ -22,10 +22,13 @@ FSF = os.path.join(HERE, "fairy-stockfish-largeboard_x86-64-bmi2")
 NET = os.path.join(HERE, "capablanca-bb644ef32758.nnue")
 
 
+_PROMO = [None, None, 'n', 'b', 'r', 'q', 'a', 'c']   # код = индекс фигуры + 1
+
+
 def uci(m):
     f, t, p = (m >> 10) & 0x7F, (m >> 3) & 0x7F, m & 0b111
     s = f"{chr(97+f%10)}{f//10+1}{chr(97+t%10)}{t//10+1}"
-    return s + " nbrqac"[p] if p else s
+    return s + _PROMO[p] if 0 < p < len(_PROMO) else s
 
 
 def enumerate_lines(plies):

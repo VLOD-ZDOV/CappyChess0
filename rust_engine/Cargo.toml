@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.28", features = ["extension-module", "generate-import-lib"] }
 numpy = "0.28"
+rayon = "1.10"
 ndarray = "0.16"
 
 [profile.release]

@@ -185,6 +185,8 @@ def play_batch(
     ptemp_black: float = None,
     policy_only_after_white: int = None,
     policy_only_after_black: int = None,
+    adjudicate_q: float = 0.0,
+    adjudicate_plies: int = 4,
     arch=None,
 ) -> List[float]:
     """
@@ -216,6 +218,8 @@ def play_batch(
     move_counts = [0] * num_games
     histories = [[] for _ in range(num_games)]  # for verbose and PGN
     arch_rows = [[] for _ in range(num_games)]  # позиции для архива
+    adj_streak = [0] * num_games      # знак = кто выигрывает, модуль = длина серии
+    adjudicated = [False] * num_games
 
     # One persistent tree per network, both tracking the real game. Every move
     # is applied to both, so each search resumes from the sub-tree the previous
@@ -249,12 +253,26 @@ def play_batch(
             # Sparse root policy: one entry per visited legal move instead of a dense
             # 7000-float vector per game per ply.
             sparse_pols = tree.get_policies_sparse()
+            # Доказанный границами исход; -1 = ничего не доказано.
+            proven_moves = tree.get_best_moves()
 
         # Архив: доска и ПОЛНОЕ распределение визитов на 800 симуляциях. Поиск
         # их уже посчитал ради выбора хода — оставалось только не выбрасывать.
-        if arch is not None and not bare:
+        if (arch is not None or adjudicate_q > 0) and not bare:
             vals = np.asarray(tree.get_values(), dtype=np.float32)
             draws_np = np.asarray(tree.get_draws(), dtype=np.float32)
+        if adjudicate_q > 0 and not bare:
+            # Оценка корня приводится к взгляду БЕЛЫХ, поэтому серия из N
+            # полуходов означает, что обе сети подряд согласны с приговором.
+            for gi in active:
+                q = float(vals[gi]) if gi < len(vals) else 0.0
+                qw = q if side == 0 else -q
+                if qw >= adjudicate_q:
+                    adj_streak[gi] = adj_streak[gi] + 1 if adj_streak[gi] > 0 else 1
+                elif qw <= -adjudicate_q:
+                    adj_streak[gi] = adj_streak[gi] - 1 if adj_streak[gi] < 0 else -1
+                else:
+                    adj_streak[gi] = 0
 
         for gi in active:
             if bare:
@@ -266,6 +284,12 @@ def play_batch(
             else:
                 pol_idx, pol_val = sparse_pols[gi]
                 lookup = {int(i): float(v) for i, v in zip(pol_idx, pol_val)}
+                # Доказанный мат бьёт число визитов (правило lc0): ему хватает
+                # трёх посещений, и по счётчику он проигрывал ходу с двумя
+                # сотнями. В архив ниже идёт честное распределение визитов.
+                _pm = int(proven_moves[gi]) if gi < len(proven_moves) else -1
+                if _pm >= 0:
+                    lookup = {_pm: 1.0}
             if arch is not None and not bare:
                 pi, pv = sparse_pols[gi]
                 # Индексы ходов считаются ДО хода: move_int_to_policy_idx
@@ -301,6 +325,9 @@ def play_batch(
             eng = engines[gi]
             if eng.is_game_over():
                 results[gi] = eng.game_result()
+            elif adjudicate_q > 0 and abs(adj_streak[gi]) >= adjudicate_plies:
+                results[gi] = 1.0 if adj_streak[gi] > 0 else -1.0
+                adjudicated[gi] = True
             elif move_counts[gi] >= max_moves:
                 results[gi] = 0.0 if timeout_as_draw else eng.material_result()
             else:
@@ -324,6 +351,8 @@ def play_batch(
                     term = (archive_mod.TERM_MATE if abs(r) > 0.5
                             else archive_mod.DRAW_REASON_TO_TERM.get(
                                 eng.draw_reason(), archive_mod.TERM_DRAW_RULE))
+                elif adjudicated[gi]:
+                    term = archive_mod.TERM_ADJUDICATED
                 else:
                     term = archive_mod.TERM_LIMIT
                 g_id = arch.add_game(
@@ -401,6 +430,8 @@ def run_match(
     ptemp_b: float = None,
     policy_only_after: int = None,
     policy_only_after_b: int = None,
+    adjudicate_q: float = 0.0,
+    adjudicate_plies: int = 4,
     arch=None,
 ) -> Dict:
     """
@@ -435,6 +466,7 @@ def run_match(
                       ptemp_white=ptemp, ptemp_black=ptemp_b,
                       policy_only_after_white=policy_only_after,
                       policy_only_after_black=policy_only_after_b,
+                      adjudicate_q=adjudicate_q, adjudicate_plies=adjudicate_plies,
                       arch=arch)
     for r in res1:
         if r > 0:   wins_a += 1
@@ -458,7 +490,14 @@ def run_match(
                       parallel_sims=(parallel_sims_b if parallel_sims_b is not None
                                      else parallel_sims),
                       parallel_sims_black=parallel_sims,
-                      c_puct_white=c_puct_b, c_puct_black=c_puct, arch=arch)
+                      c_puct_white=c_puct_b, c_puct_black=c_puct,
+                      fpu_white=fpu_b, fpu_black=fpu,
+                      ptemp_white=(ptemp_b if ptemp_b is not None else 1.0),
+                      ptemp_black=ptemp,
+                      policy_only_after_white=policy_only_after_b,
+                      policy_only_after_black=policy_only_after,
+                      adjudicate_q=adjudicate_q, adjudicate_plies=adjudicate_plies,
+                      arch=arch)
     for r in res2:
         # r — result for white (= B), convert to result for A
         r_a = -r
@@ -628,6 +667,14 @@ def main():
                         help="Показывать первые 10 ходов каждой партии")
     parser.add_argument("--pgn-dir",      type=str, default=None,
                         help="Папка для сохранения PGN партий (напр. games/)")
+    parser.add_argument("--adjudicate-q", type=float, default=0.0,
+                        help="Присудить победу, если оценка корня держится выше "
+                             "этого порога подряд --adjudicate-plies полуходов "
+                             "(0 = выключено). В матче две трети партий иначе "
+                             "упираются в лимит и съедают 72%% времени")
+    parser.add_argument("--adjudicate-plies", type=int, default=4,
+                        help="Сколько полуходов подряд держится приговор "
+                             "(default: 4 — по два хода каждой стороны)")
     parser.add_argument("--timeout-as-draw", action="store_true", default=False,
                         help="Таймаут = ничья (0.0) вместо оценки по материалу")
     parser.add_argument("--compile-inference", type=str, default="default",
@@ -753,6 +800,8 @@ def main():
             timeout_as_draw=args.timeout_as_draw,
             compile_mode=compile_mode,
             kld_threshold=args.kld,
+            adjudicate_q=args.adjudicate_q,
+            adjudicate_plies=args.adjudicate_plies,
             arch=archive_writer,
         )
         match_results.append(result)
@@ -768,4 +817,14 @@ def main():
 
 
 if __name__ == "__main__":
+    import signal as _signal
+
+    def _save_archive_and_exit(signum, frame):
+        files, rows = archive_mod.close_open_writers()
+        if files:
+            print(f"\n  💾 {_signal.Signals(signum).name}: архив дописан, "
+                  f"{rows:,} позиций", flush=True)
+        os._exit(128 + signum)
+    _signal.signal(_signal.SIGTERM, _save_archive_and_exit)
+    _signal.signal(_signal.SIGINT, _save_archive_and_exit)
     main()

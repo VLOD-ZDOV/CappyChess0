@@ -172,11 +172,12 @@ python -u train.py \
     --transformer-blocks 10 --transformer-heads 8 --ffn-mult 4 \
     --swiglu --qk-norm --rmsnorm --no-qkv-bias \
     --restricted-policy --abs-pos-embed --wide-value --no-future \
-    --games 384 --mcts-batch 128 --mcts-parallel-sims 8 \
+    --games 384 --mcts-batch 16 --selfplay-groups 2 --mcts-parallel-sims 8 \
     --simulations 400 --fast-simulations 100 \
     --batch-size 512 --train-steps 40 \
     --buffer-max 1000000 --lr 2e-4 \
     --value-q-weight 0.25 --no-value-balance \
+    --resign-wdl-threshold 0.95 \
     --save-every 10 --latest-dir /tmp --checkpoint-dir checkpoints
 ```
 
@@ -196,6 +197,20 @@ on its own:
   numbered archives and a copy on Ctrl+C or `kill`, so a stopped run resumes
   from exactly where it was.
 
+Two more are about speed and data quality:
+
+- **`--selfplay-groups 2`** splits the games into two groups, each with its own
+  search tree. While the GPU evaluates one group's batch, the CPU backs up and
+  selects leaves in the other. The GPU stays busy ~97% of the time instead of
+  ~83%, which is +21% positions per second; every game is searched exactly as
+  before. `--mcts-batch` is then the batch *per group*: `16` with two groups
+  keeps the same 32 games in flight as `--mcts-batch 32` without them.
+- **`--resign-wdl-threshold 0.95`** — resignation fires on the loss probability
+  *or* on Q, and the loss probability wins: with draws near zero the old 0.85
+  means Q < −0.70, so `--resign-threshold` alone never mattered. At 0.85 about
+  8% of verdicts in played-out games were wrong (half of them games the
+  resigning side went on to win); at 0.95 it is 0–2%.
+
 On Windows drop the backslashes and put it on one line, or use a backtick `` ` ``
 for line continuation.
 
@@ -213,7 +228,12 @@ Three settings wreck training *quietly* — no crash, just a weaker network:
   and loses strength while its training loss falls towards zero. Watch the
   ratio over a long run: as the network improves its games get shorter, so the
   same `--games` yields fewer positions and the ratio creeps up — raise
-  `--games` to bring it back.
+  `--games` to bring it back. `train.py` prints the real count every
+  iteration (`проходов = … в среднем, … у старейших 5%`) and warns above 7. It
+  matters most when a run starts from an **empty buffer**: nothing is evicted
+  while it fills, so early positions are drawn many times more than the ratio
+  suggests — a fresh run overfitted to 2x in 20 iterations that way. Seed it
+  with an older run's buffer instead.
 - **Architecture flags must match exactly when resuming.** The network is
   rebuilt from the flags and weights are loaded with `strict=False`, so a
   mismatch does not raise — it silently drops tensors.
@@ -442,6 +462,15 @@ blocks** (8 attention heads).
 - **Add-dirichlet toggle.** Self-play turns it on (exploration); eval / FSF /
   lagged play turn it off for a deterministic measurement of the network's
   actual choice.
+- **Proven results are played.** Terminal bounds propagate up the tree, and
+  the move is chosen by proof class first — shortest proven win, longest proven
+  loss — and only then by visits (Lc0's rule). Without it the search proved a
+  mate in three visits and still played the move with two hundred.
+- **Pipelined self-play** (`--selfplay-groups`) — see *Train* above.
+- **Parallel tree work.** Leaf selection, input encoding and backup run across
+  games on a Rust thread pool (`CAPA_MCTS_THREADS`, default `min(8, cores)`);
+  sliding-piece rays come from lookup tables and check is tested from the king.
+  The Rust side went from ~5.5% of a self-play cycle to ~1.6%.
 
 ---
 
@@ -450,25 +479,34 @@ blocks** (8 attention heads).
 The analysis GUI (`python_src/gui.py`) loads a single `.onnx` graph and runs
 through `onnxruntime`. No PyTorch dependency at inference time.
 
+- **Vector pieces**, sharp at any size and on HiDPI screens; Archbishop and
+  Chancellor are drawn as knight+bishop and knight+rook.
 - **Two-pass arrow rendering** — Nibbler-style. All arrows drawn first,
   labels on top in a second pass. Width and alpha scale with rank, so the
-  best move visually dominates. Labels are anchored to the destination
-  square (not over the shaft) and never overlap on crossing arrows.
-- **Mate display** in the side eval bar. When the top move's Q is near ±1
-  and the network's draw probability is low, the bar shows `M<n>` /
-  `-M<n>` in white POV instead of a percentage.
+  best move visually dominates.
+- **Analysis lines** with N / P / Q / draw% and the main line marked with
+  `+` for check and `#` for mate. Hovering a line previews it on the board as
+  numbered arrows. "Mate" is shown only when the search tree confirms it.
+- **Board input**: click-click or drag, mouse wheel steps through the game,
+  and a promotion is picked on the board itself, Nibbler-style — a column of
+  pieces on the promotion file; Esc or a click elsewhere cancels.
+- **Move list** with white's expected score after each move and the engine's
+  preferred move; the winrate graph is clickable.
+- **GPU or CPU**: "Считать на" selector in the toolbar, or `--cpu` on the
+  command line.
+- **Archive browser and opening explorer** over the whole self-play archive,
+  with sorting and filters; a million-game archive loads in seconds with
+  bounded memory.
+- **Command line**: `gui.py [net.onnx|net.pth] [game.pgn] [--archive DIR] [--cpu]`.
 - **Tree reuse across moves.** The transposition table persists between
   searches; when a new search starts at a position already in the table, it
   picks up the accumulated statistics.
 - **Smart prune**, not `clear`. When the ttable exceeds 500 000 nodes, only
   the sub-tree reachable from the current position is kept. The rest is
   dropped — no work the next search would have reused is lost.
-- **Bounded NN cache** (~150 000 entries by default, ~4 GB RAM ceiling).
-  Long sessions no longer balloon memory usage.
 - **c_puct and contempt sliders** in the toolbar. For analysis, raise
   c_puct to 2.5-3.0 to widen the search; flip contempt positive to bias
   away from draws.
-- **Live PV** per move (10 plies deep) inside the info box.
 
 ---
 

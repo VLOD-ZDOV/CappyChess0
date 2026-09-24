@@ -237,6 +237,7 @@ class UltraFastMCTS:
         self._kld_total_calls = 0       # total search calls
         self._kld_sims_saved = 0        # total sims saved
         self._kld_sims_requested = 0    # total sims requested
+        self._slot_bufs: dict = {}      # slot -> (in, pol_out, qdm_out, event), см. _launch
 
     def clear_nn_cache(self) -> None:
         """Clears the cache — must be called after network weights are updated."""
@@ -321,6 +322,89 @@ class UltraFastMCTS:
 
         return self._infer_raw_nn(tensors)
 
+    def _stage_input(self, tensors, buf=None):
+        """Leaves → padded device tensor. buf — pinned staging buffer to use
+        (default: the shared one). Returns (x, n)."""
+        n = tensors.shape[0]
+        # Pad to a stable bucket so torch.compile sees a bounded set of input
+        # shapes. In eager mode the GPU is compute-bound and throughput is
+        # linear in batch size, so pad only to the next multiple of `ps`.
+        ps = self._parallel_sims
+        target = _bucket_size(n, ps, pow2=self._compile_mode is not None)
+        n_pad = target - n
+        arr = np.ascontiguousarray(
+            tensors.reshape(n, INPUT_PLANES, BOARD_H, BOARD_W)
+        )
+        if buf is None:
+            buf = self.pinned_buf
+        if target <= buf.shape[0]:
+            b = buf[:target]
+            # copy_(fp32) casts to buf's dtype (BF16 on CUDA, FP32 on CPU).
+            b[:n].copy_(torch.from_numpy(arr))
+            if n_pad > 0:
+                # Padding rows are discarded after inference: duplicate existing
+                # rows in place instead of np.concatenate on every step.
+                filled = n
+                while filled < target:
+                    take = min(filled, target - filled)
+                    b[filled:filled + take].copy_(b[:take])
+                    filled += take
+            return b.to(self.device, non_blocking=True), n
+        # Pinned buffer exceeded. Match the buffer dtype so we never feed BF16
+        # into FP32 weights on CPU.
+        if n_pad > 0:
+            pad_idx = np.arange(n_pad) % n
+            arr = np.concatenate([arr, arr[pad_idx]], axis=0)
+        target_dtype = (torch.float16 if self._trt else
+                        torch.bfloat16) if self._has_cuda else torch.float32
+        cpu_t = torch.from_numpy(arr).to(target_dtype)
+        return cpu_t.to(self.device, non_blocking=True), n
+
+    def _forward_post(self, x):
+        """Forward + postprocessing on the device. Returns float32 device
+        tensors (policies, q, d, m) over the padded batch; m/d may be None."""
+        if self._trt or self._bf16_weights or not self._has_cuda:
+            # TRT: FP16 engine; BF16 weights + BF16 input; CPU: all FP32.
+            out = self.net(x)
+        else:
+            # FP32 weights on CUDA: autocast runs matmul/conv in BF16 on the fly.
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                out = self.net(x)
+
+        # Output variants: (policy, wdl, mlh, future) / (policy, wdl, mlh) /
+        # (policy, wdl) for old checkpoints. future is not needed at inference.
+        if isinstance(out, tuple) and len(out) == 4:
+            logits, values, mlh_raw, _ = out
+        elif isinstance(out, tuple) and len(out) == 3:
+            logits, values, mlh_raw = out
+        else:
+            logits, values = out
+            mlh_raw = None
+
+        # nan_to_num on the GPU instead of `.isnan().any()` guards: those forced
+        # a device→host sync on every batch. zeros → uniform softmax / neutral value.
+        logits_f = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        values_f = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
+
+        if self._policy_temp != 1.0:
+            # Температура на логитах до softmax, а не степень вероятностей.
+            logits_f = logits_f / self._policy_temp
+        policies = torch.softmax(logits_f, dim=1)
+
+        if values_f.shape[-1] == 3:
+            wdl_probs = torch.softmax(values_f, dim=1)
+            q = wdl_probs[:, 0] - wdl_probs[:, 2]
+            d = wdl_probs[:, 1]
+        else:
+            q = values_f.view(-1)
+            d = None
+        m = None
+        if mlh_raw is not None:
+            # sigmoid raw → ∈ [0, 1] (доля оставшейся партии).
+            mlh_f = torch.nan_to_num(mlh_raw.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            m = torch.sigmoid(mlh_f).view(-1)
+        return policies, q, d, m
+
     @torch.no_grad()
     def _infer_raw_nn(self, tensors):
         """Direct batched NN call without cache. tensors: ndarray (N, FLAT_SIZE).
@@ -330,108 +414,61 @@ class UltraFastMCTS:
             empty_p = np.empty((0, POLICY_SIZE), dtype=np.float32)
             empty_v = np.empty((0,), dtype=np.float32)
             return empty_p, empty_v, empty_v.copy(), empty_v.copy()
-
-        # Pad to a stable bucket so torch.compile sees a bounded set of input
-        # shapes. Strict power-of-two buckets waste too much compute on
-        # partially-finished game batches, so _bucket_size uses a coarse grid.
-        ps = self._parallel_sims
-        # Power-of-two buckets only matter when torch.compile/CUDA-graphs need
-        # shape stability. In eager mode (the only stable path on Blackwell) the
-        # GPU is compute-bound and throughput is linear in batch size, so we pad
-        # to the next multiple of `ps` instead — up to ~1.8x less wasted compute
-        # on under-filled calls.
-        target = _bucket_size(n, ps, pow2=self._compile_mode is not None)
-        n_pad = target - n
-
-        arr = np.ascontiguousarray(
-            tensors.reshape(n, INPUT_PLANES, BOARD_H, BOARD_W)
-        )
-        n_total = target
-
-        if n_total <= self.pinned_size:
-            buf = self.pinned_buf[:n_total]
-            # copy_(fp32) casts to buf's dtype (BF16 on CUDA, FP32 on CPU).
-            buf[:n].copy_(torch.from_numpy(arr))
-            if n_pad > 0:
-                # Padding rows are discarded after inference. Duplicate existing
-                # rows in-place instead of building a new numpy array with
-                # np.concatenate on every MCTS step.
-                filled = n
-                while filled < n_total:
-                    take = min(filled, n_total - filled)
-                    buf[filled:filled + take].copy_(buf[:take])
-                    filled += take
-            x = buf.to(self.device, non_blocking=True)
-        else:
-            # Fallback when pinned buffer is exceeded. Match the buffer dtype
-            # so we never feed BF16 into FP32 weights on CPU.
-            if n_pad > 0:
-                pad_idx = np.arange(n_pad) % n
-                arr = np.concatenate([arr, arr[pad_idx]], axis=0)
-            target_dtype = (torch.float16 if self._trt else
-                            torch.bfloat16) if self._has_cuda else torch.float32
-            cpu_t = torch.from_numpy(arr).to(target_dtype)
-            x = cpu_t.to(self.device, non_blocking=True)
-
-        # NCHW throughout — the net runs NCHW (channels_last is slower here), so
-        # no layout conversion; x stays contiguous from the pinned buffer.
-        if self._trt:
-            # Готовый движок: и вход, и веса в FP16, автокаст не нужен.
-            out = self.net(x)
-        elif self._bf16_weights:
-            # Both weights and input in BF16 — no autocast needed.
-            out = self.net(x)
-        elif self._has_cuda:
-            # FP32 weights on CUDA: autocast runs matmul/conv in BF16 on the fly.
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                out = self.net(x)
-        else:
-            # Pure CPU path: everything stays in FP32.
-            out = self.net(x)
-
-        # Support multiple network output variants:
-        #   - 4 outputs: (policy, wdl, mlh, future) — model with future head
-        #   - 3 outputs: (policy, wdl, mlh)          — model with MLH
-        #   - 2 outputs: (policy, wdl)               — old checkpoints
-        # future head is not needed at inference → ignored.
-        if isinstance(out, tuple) and len(out) == 4:
-            logits, values, mlh_raw, _ = out
-        elif isinstance(out, tuple) and len(out) == 3:
-            logits, values, mlh_raw = out
-        else:
-            logits, values = out
-            mlh_raw = None
-
-        # nan_to_num scrubs NaN/inf on the GPU (pointwise kernel, no host sync).
-        # The old `.isnan().any()` guards each forced a device→host sync on every
-        # inference batch — pure latency in the self-play hot loop. zeros → uniform
-        # softmax for logits and a neutral value, the same fallback as before.
-        logits_f = torch.nan_to_num(logits.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        values_f = torch.nan_to_num(values.float(), nan=0.0, posinf=0.0, neginf=0.0)
-
-        if self._policy_temp != 1.0:
-            # Заострение (T<1) или размывание (T>1) приоритета. Делается на
-            # логитах до softmax — это и есть температура, а не возведение
-            # вероятностей в степень с последующей нормировкой.
-            logits_f = logits_f / self._policy_temp
-        policies = torch.softmax(logits_f, dim=1).cpu().numpy()
-
-        if values_f.shape[-1] == 3:
-            wdl_probs = torch.softmax(values_f, dim=1)
-            q_values  = (wdl_probs[:, 0] - wdl_probs[:, 2]).cpu().numpy()
-            d_values  = wdl_probs[:, 1].cpu().numpy()
-        else:
-            q_values = values_f.view(-1).cpu().numpy()
-            d_values = np.zeros_like(q_values)
-
-        # MLH: sigmoid raw → ∈ [0, 1] (normalized "fraction of game remaining").
-        if mlh_raw is not None:
-            mlh_f = torch.nan_to_num(mlh_raw.float(), nan=0.0, posinf=0.0, neginf=0.0)
-            m_values = torch.sigmoid(mlh_f).view(-1).cpu().numpy()
-        else:
-            m_values = np.zeros_like(q_values)
-
+        x, n = self._stage_input(tensors)
+        pol, q, d, m = self._forward_post(x)
+        policies = pol.cpu().numpy()
+        q_values = q.cpu().numpy()
+        d_values = d.cpu().numpy() if d is not None else np.zeros_like(q_values)
+        m_values = m.cpu().numpy() if m is not None else np.zeros_like(q_values)
         return policies[:n], q_values[:n], d_values[:n], m_values[:n]
+
+    def _can_async(self) -> bool:
+        # Кэш позиций и TensorRT идут прежним синхронным путём: кэшу нужен
+        # ответ сразу, а про поток исполнения движка TRT мы ничего не знаем.
+        return self._has_cuda and not self._trt and not self.nn_cache_enabled
+
+    @torch.no_grad()
+    def _launch(self, tensors, slot: int):
+        """Поставить пачку в очередь карты и вернуться, не дожидаясь ответа.
+
+        slot — номер собственного набора закреплённых буферов (вход и выходы).
+        Грабли: буфер слота переиспользуется только после _wait этого же
+        слота. Самоигра так и ходит — группа ждёт свой ответ, разносит его и
+        лишь потом ставит следующую пачку; два слота = две пачки в полёте."""
+        n = tensors.shape[0]
+        target = _bucket_size(n, self._parallel_sims,
+                              pow2=self._compile_mode is not None)
+        bufs = self._slot_bufs.get(slot)
+        if bufs is None or bufs[0].shape[0] < target:
+            cap = max(target, self.batch_size * self._parallel_sims)
+            cap = _bucket_size(cap, self._parallel_sims, pow2=True)
+            # Свой вход, а не общий pinned_buf: его берёт синхронный _infer.
+            bufs = (torch.empty((cap, INPUT_PLANES, BOARD_H, BOARD_W),
+                                pin_memory=True, dtype=torch.bfloat16),
+                    torch.empty((cap, POLICY_SIZE), dtype=torch.float32, pin_memory=True),
+                    torch.empty((cap, 3), dtype=torch.float32, pin_memory=True),
+                    torch.cuda.Event())
+            self._slot_bufs[slot] = bufs
+        in_buf, pol_out, qdm_out, ev = bufs
+        x, n = self._stage_input(tensors, in_buf)
+        pol, q, d, m = self._forward_post(x)
+        zeros = torch.zeros_like(q)
+        qdm = torch.stack([q, d if d is not None else zeros,
+                           m if m is not None else zeros], dim=1)
+        pol_out[:target].copy_(pol, non_blocking=True)
+        qdm_out[:target].copy_(qdm, non_blocking=True)
+        ev.record()
+        return slot, n
+
+    def _wait(self, handle):
+        """Дождаться пачки из _launch. Массивы — виды на закреплённые буферы
+        слота: действительны до следующего _launch в этот слот."""
+        slot, n = handle
+        _, pol_out, qdm_out, ev = self._slot_bufs[slot]
+        ev.synchronize()
+        qdm = qdm_out[:n].numpy()
+        return (pol_out[:n].numpy(), np.ascontiguousarray(qdm[:, 0]),
+                np.ascontiguousarray(qdm[:, 1]), np.ascontiguousarray(qdm[:, 2]))
 
     def raw_policies(self, engines: List) -> np.ndarray:
         """Политика сети БЕЗ поиска — один прогон на позицию.
@@ -472,19 +509,30 @@ class UltraFastMCTS:
         """Run one search on an existing tree: collect → infer → apply, with
         Lc0-style KLD early exit. Leaves the tree in place, so callers doing
         tree reuse (self-play, game_stats) drive the same loop as one-shot
-        callers instead of each keeping their own copy of it.
+        callers instead of each keeping their own copy of it."""
+        for _ in self.search_steps(rust_mcts, simulations, deadline):
+            pass
 
-        Inference is applied *immediately* after each collect_leaves, in the
-        same step. The old "double-buffered" variant deferred the apply by one
-        step, but collect_leaves clears Rust's `pending`, so the deferred apply
-        wrote the previous batch's NN outputs onto the new leaves.
-        """
+    def search_steps(self, rust_mcts, simulations: int, deadline: float = None,
+                     slot: int = 0):
+        """Тот же поиск, что run_search, но генератором: отдаёт управление
+        сразу после того, как пачка листьев ушла на карту. Пока карта считает,
+        вызывающий может собрать листья другого дерева (самоигра группами);
+        следующий next() дождётся ответа, разнесёт его и поставит новую пачку.
+        У каждого одновременно живого генератора должен быть свой slot.
+
+        Inference is applied *immediately* after its own collect_leaves: the
+        old "double-buffered" variant deferred the apply by one step, but
+        collect_leaves clears Rust's `pending`, so the deferred apply wrote the
+        previous batch's NN outputs onto the new leaves."""
         parallel = self._parallel_sims
         steps = max(1, (simulations + parallel - 1) // parallel)
         kld_enabled = self.kld_threshold > 0.0
         kld_min_steps = int(np.ceil(steps * self.kld_min_sims_frac))
+        async_ok = self._can_async()
         # Сколько симуляций реально сделано: заказ не равен факту, если сработал
         # срок или ранний выход по сходимости. Нужно для честного протокола партии.
+        sims_done = 0
         self.last_sims_done = 0
         if kld_enabled:
             rust_mcts.kld_reset_all()
@@ -492,18 +540,28 @@ class UltraFastMCTS:
         self._kld_sims_requested += simulations
 
         for step in range(steps):
-            # Жёсткий срок для игры по часам: судья выдаёт бюджет на ход, поиск
-            # обязан уложиться. Проверяем между пачками — прерывать пачку на
-            # полпути нельзя, Rust ждёт выводы сети обратно на свои листья.
+            # Жёсткий срок для игры по часам: проверяем между пачками — прерывать
+            # пачку на полпути нельзя, Rust ждёт выводы сети на свои листья.
             if deadline is not None and step > 0 and time.perf_counter() >= deadline:
                 break
             leaf_matrix = rust_mcts.collect_leaves(simulations)
             if leaf_matrix.shape[0] == 0:
-                break
-            self.last_sims_done += int(leaf_matrix.shape[0])
+                # Пустая пачка = все выборы пришли в ТЕРМИНАЛЫ, select() их уже
+                # откатил, и следующий заход пойдёт в другую ветку. break здесь
+                # убивал поиск целиком. Цикл ограничен steps.
+                continue
+            sims_done += int(leaf_matrix.shape[0])
+            self.last_sims_done = sims_done
             curr_counts = rust_mcts.get_current_batch_counts()
-            curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
-            p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
+            if async_ok:
+                handle = self._launch(leaf_matrix, slot)
+                del leaf_matrix
+                yield
+                p, v, d, m = self._wait(handle)
+            else:
+                curr_hashes = rust_mcts.get_leaf_hashes() if self.nn_cache_enabled else None
+                p, v, d, m = self._infer(leaf_matrix, hashes=curr_hashes)
+                yield
             rust_mcts.apply_inference_buffered(
                 np.ascontiguousarray(p, dtype=np.float32),
                 np.ascontiguousarray(v, dtype=np.float32),
@@ -522,6 +580,7 @@ class UltraFastMCTS:
                         self._kld_early_exits += 1
                         self._kld_sims_saved += (steps - step - 1) * parallel
                         break
+        self.last_sims_done = sims_done
 
     def search_games(self, engines: List, simulations: int = 80,
                      deadline: float = None) -> List[np.ndarray]:
