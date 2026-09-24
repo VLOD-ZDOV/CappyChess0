@@ -53,6 +53,13 @@ class Engine:
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         self._cmd("uci", "uciok")
         self.send("setoption name UCI_Variant value capablanca")
+        # Без EvalFile движок считает КЛАССИЧЕСКОЙ оценкой — это минус 417 Elo.
+        # Все остальные вызовы (gen_book4, train, play_fsf) сеть подключают;
+        # здесь её забыли, и корпус до 21.09 сгенерирован слабым движком.
+        _net = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "capablanca-bb644ef32758.nnue")
+        if os.path.exists(_net):
+            self.send(f"setoption name EvalFile value {_net}")
         self._cmd("isready", "readyok")
 
     def send(self, c):
