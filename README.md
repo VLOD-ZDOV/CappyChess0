@@ -201,9 +201,9 @@ Two more are about speed and data quality:
 
 - **`--selfplay-groups 2`** splits the games into two groups, each with its own
   search tree. While the GPU evaluates one group's batch, the CPU backs up and
-  selects leaves in the other. The GPU stays busy ~97% of the time instead of
-  ~83%, which is +21% positions per second; every game is searched exactly as
-  before. `--mcts-batch` is then the batch *per group*: `16` with two groups
+  selects leaves in the other. In a real 784-game run that is about +8%
+  positions per second (a 256-game bench showed +21%, so measure your own);
+  every game is searched exactly as before. `--mcts-batch` is then the batch *per group*: `16` with two groups
   keeps the same 32 games in flight as `--mcts-batch 32` without them.
 - **`--resign-wdl-threshold 0.95`** — resignation fires on the loss probability
   *or* on Q, and the loss probability wins: with draws near zero the old 0.85
