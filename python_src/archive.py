@@ -138,7 +138,16 @@ class ArchiveWriter:
         self.dir = directory
         self.iteration = int(iteration)
         self.board_len = int(board_len)
-        self._boards_path = os.path.join(directory, f"boards_{self.iteration:06d}.f16")
+        # Архив общий для всех линий: номер итерации в имени файла может быть уже
+        # занят другой линией, и os.replace молча затёр бы её партии. Номер в
+        # имени — только ключ пары boards/meta; настоящая итерация лежит в meta.
+        fid = self.iteration
+        while any(os.path.exists(os.path.join(directory, f"{pre}_{fid:06d}{ext}"))
+                  for pre, ext in (("boards", ".f16"), ("boards", ".f16.tmp"),
+                                   ("meta", ".npz"))):
+            fid += 10_000_000
+        self.file_id = fid
+        self._boards_path = os.path.join(directory, f"boards_{fid:06d}.f16")
         self._tmp = self._boards_path + ".tmp"
         self._f = open(self._tmp, "wb")
         self.pos = {k: [] for k in POS_COLS}
@@ -226,7 +235,7 @@ class ArchiveWriter:
             out[k] = np.asarray(self.pos[k], dtype=dt)
         for k, dt in GAME_COLS.items():
             out["g_" + k] = np.asarray(self.games[k], dtype=dt)
-        meta = os.path.join(self.dir, f"meta_{self.iteration:06d}.npz")
+        meta = os.path.join(self.dir, f"meta_{self.file_id:06d}.npz")
         tmp_meta = meta + ".tmp.npz"        # savez сам добавляет .npz, если его нет
         np.savez(tmp_meta, **out)
         # Сначала meta, потом доски: читатель перечисляет куски по boards_*, и
