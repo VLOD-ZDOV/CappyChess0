@@ -27,7 +27,81 @@ import os
 import re
 import numpy as np
 
-BOARDS_RE = re.compile(r"^boards_(\d+)\.f16$")
+BOARDS_RE = re.compile(r"^boards_(\d+)\.(f16|fb)$")
+
+# Упакованные доски (.fb): все плоскости кодировщика бинарные, кроме счётчика
+# полуходов (halfmove/100). Строка = биты бинарных плоскостей + 80 чисел float16
+# этой плоскости: 1540 байт вместо 22 240. Строки, где «бинарная» плоскость
+# всё-таки не 0/1 (или -0.0), лежат целиком в boards_N.fb.raw.npz — без потерь.
+_SQ = 80
+_HM0, _HM1 = (8 * 17 + 1) * _SQ, (8 * 17 + 2) * _SQ
+_F16_ONE = int(np.float16(1.0).view(np.uint16))
+FB_BOARD_LEN = 139 * _SQ                # упаковка знает только эту кодировку
+
+
+def _fb_layout(board_len):
+    nbits = board_len - _SQ
+    nbytes = (nbits + 7) // 8
+    return nbits, nbytes, nbytes + 2 * _SQ
+
+
+def pack_boards(b):
+    """(m, board_len) float16 → (строки uint8 (m, stride), номера строк-исключений)."""
+    b = np.ascontiguousarray(b, dtype=np.float16)
+    u = b.view(np.uint16)
+    binary = np.concatenate([u[:, :_HM0], u[:, _HM1:]], axis=1)
+    ok = ((binary == 0) | (binary == _F16_ONE)).all(axis=1)
+    bits = np.packbits(binary != 0, axis=1)
+    hm = np.ascontiguousarray(b[:, _HM0:_HM1]).view(np.uint8)
+    return np.concatenate([bits, hm], axis=1), np.flatnonzero(~ok)
+
+
+def unpack_boards(rows_u8, board_len):
+    nbits, nbytes, _ = _fb_layout(board_len)
+    bits = np.unpackbits(rows_u8[:, :nbytes], axis=1, count=nbits)
+    out = np.empty((rows_u8.shape[0], board_len), dtype=np.float16)
+    out[:, :_HM0] = bits[:, :_HM0]
+    out[:, _HM0:_HM1] = np.ascontiguousarray(rows_u8[:, nbytes:]).view(np.float16)
+    out[:, _HM1:] = bits[:, _HM0:]
+    return out
+
+
+class BoardFile:
+    """Доски одного куска по индексу строки, в любом формате: bf[i] или bf[[i, j]]."""
+
+    def __init__(self, meta_path, board_len):
+        base = meta_path.replace("meta_", "boards_")[:-len(".npz")]
+        self.path = next((base + e for e in (".fb", ".f16") if os.path.exists(base + e)), None)
+        if self.path is None:
+            raise FileNotFoundError(base)
+        self.board_len = board_len
+
+    def __getitem__(self, i):
+        if np.isscalar(i):
+            return read_board_rows(self.path, [int(i)], self.board_len)[0]
+        return read_board_rows(self.path, i, self.board_len)
+
+
+def read_board_rows(path, rows, board_len):
+    """Доски строк `rows` из файла кусков любого формата (.f16 или .fb)."""
+    rows = np.asarray(rows, dtype=np.int64)
+    if path.endswith(".f16"):
+        n = os.path.getsize(path) // (2 * board_len)
+        mm = np.memmap(path, dtype=np.float16, mode="r", shape=(n, board_len))
+        return np.asarray(mm[rows])
+    stride = _fb_layout(board_len)[2]
+    n = os.path.getsize(path) // stride
+    mm = np.memmap(path, dtype=np.uint8, mode="r", shape=(n, stride))
+    out = unpack_boards(np.asarray(mm[rows]), board_len)
+    raw = path + ".raw.npz"
+    if os.path.exists(raw):
+        with np.load(raw) as z:
+            where = {int(r): i for i, r in enumerate(z["rows"])}
+            for j, r in enumerate(rows):
+                i = where.get(int(r))
+                if i is not None:
+                    out[j] = z["boards"][i]
+    return out
 
 # Чем кончилась партия.
 TERM_MATE = 0
@@ -144,10 +218,15 @@ class ArchiveWriter:
         fid = self.iteration
         while any(os.path.exists(os.path.join(directory, f"{pre}_{fid:06d}{ext}"))
                   for pre, ext in (("boards", ".f16"), ("boards", ".f16.tmp"),
+                                   ("boards", ".fb"), ("boards", ".fb.tmp"),
                                    ("meta", ".npz"))):
             fid += 10_000_000
         self.file_id = fid
-        self._boards_path = os.path.join(directory, f"boards_{fid:06d}.f16")
+        self._packed = self.board_len == FB_BOARD_LEN
+        ext = ".fb" if self._packed else ".f16"
+        self._boards_path = os.path.join(directory, f"boards_{fid:06d}{ext}")
+        self._stride = _fb_layout(self.board_len)[2] if self._packed else 2 * self.board_len
+        self._raw = {}                       # строка → доска целиком (редкие исключения)
         self._tmp = self._boards_path + ".tmp"
         self._f = open(self._tmp, "wb")
         self.pos = {k: [] for k in POS_COLS}
@@ -190,7 +269,13 @@ class ArchiveWriter:
         b = np.asarray(board, dtype=np.float16)
         if b.size != self.board_len:
             raise ValueError(f"доска {b.size} элементов, ожидалось {self.board_len}")
-        self._f.write(b.tobytes())
+        if self._packed:
+            row, bad = pack_boards(b.reshape(1, -1))
+            if bad.size:
+                self._raw[self.rows] = b.reshape(-1).copy()
+            self._f.write(row.tobytes())
+        else:
+            self._f.write(b.tobytes())
         self.rows += 1
         self.pol_idx.append(np.asarray(pol_idx, dtype=np.int16))
         self.pol_val.append(np.asarray(pol_val, dtype=np.float16))
@@ -216,8 +301,9 @@ class ArchiveWriter:
         # тогда строк в файле на одну больше, чем в колонках. Режем по общему.
         n_cols = min([len(v) for v in self.pos.values()] + [len(self.pol_idx)])
         if n_cols < self.rows:
-            os.truncate(self._tmp, n_cols * self.board_len * 2)
+            os.truncate(self._tmp, n_cols * self._stride)
             self.rows = n_cols
+            self._raw = {r: v for r, v in self._raw.items() if r < n_cols}
         if self.rows == 0:
             os.remove(self._tmp)
             return 0
@@ -241,6 +327,11 @@ class ArchiveWriter:
         # Сначала meta, потом доски: читатель перечисляет куски по boards_*, и
         # пока этого файла нет, незаконченная пара ему не попадётся.
         os.replace(tmp_meta, meta)
+        if self._raw:
+            rr = sorted(self._raw)
+            np.savez(self._boards_path + ".raw.tmp.npz", rows=np.asarray(rr, dtype=np.int64),
+                     boards=np.stack([self._raw[r] for r in rr]))
+            os.replace(self._boards_path + ".raw.tmp.npz", self._boards_path + ".raw.npz")
         os.replace(self._tmp, self._boards_path)
         return n
 
@@ -261,6 +352,9 @@ class Archive:
         for si, name in enumerate(names):
             it = int(BOARDS_RE.match(name).group(1))
             meta_path = os.path.join(directory, f"meta_{it:06d}.npz")
+            # Кусок в процессе перевода в .fb лежит в обоих форматах — берём один.
+            if name.endswith(".f16") and os.path.exists(os.path.join(directory, f"boards_{it:06d}.fb")):
+                continue
             if not os.path.exists(meta_path):
                 continue
             with np.load(meta_path) as z:
@@ -377,16 +471,12 @@ class Archive:
         for si in np.unique(self._shard[idx]):
             sel = idx[self._shard[idx] == si]
             path = self.shards[si][1]
-            rows = os.path.getsize(path) // (2 * self.board_len)
-            mm = np.memmap(path, dtype=np.float16, mode="r",
-                           shape=(rows, self.board_len))
             local = self._row[sel]
             order = np.argsort(local)          # последовательное чтение с диска
             dest = np.flatnonzero(np.isin(idx, sel))
             for a in range(0, order.size, batch):
                 sl = order[a:a + batch]
-                out[dest[sl]] = mm[local[sl]]
-            del mm
+                out[dest[sl]] = read_board_rows(path, local[sl], self.board_len)
         return out
 
     def policy(self, mask):
