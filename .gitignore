@@ -47,3 +47,7 @@ python_src/bt5.txt
 release63/
 python_src/ab_random/
 python_src/ps_speed/
+
+# Общий архив партий (доски .fb, meta .npz)
+python_src/archive/
+*.fb
